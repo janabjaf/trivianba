@@ -16,14 +16,14 @@ class NBATrivia(commands.Cog):
         
         # Common team nicknames/short names mapping
         self.team_aliases = {
-            'cleveland cavaliers': ['cavs'],
-            'dallas mavericks': ['mavs'],
-            'minnesota timberwolves': ['wolves', 't-wolves', 'twolves'],
-            'philadelphia 76ers': ['sixers', '76ers'],
-            'portland trail blazers': ['blazers'],
+            'cleveland cavaliers': ['cavs', 'cle'],
+            'dallas mavericks': ['mavs', 'dal'],
+            'minnesota timberwolves': ['wolves', 't-wolves', 'twolves', 'min'],
+            'philadelphia 76ers': ['sixers', '76ers', 'phi'],
+            'portland trail blazers': ['blazers', 'por'],
             'oklahoma city thunder': ['okc', 'thunder'],
-            'san antonio spurs': ['spurs'],
-            'golden state warriors': ['gsw', 'dubs'],
+            'san antonio spurs': ['spurs', 'sas'],
+            'golden state warriors': ['gsw', 'dubs', 'warriors'],
             'los angeles lakers': ['lakers', 'lal'],
             'los angeles clippers': ['clippers', 'lac', 'clips'],
             'new york knicks': ['knicks', 'nyk'],
@@ -86,7 +86,13 @@ class NBATrivia(commands.Cog):
                     item = random.choice(self._teams)
                     
                     full_name_lower = item['full_name'].lower()
-                    correct_answers = [item['full_name'], item['nickname'], f"{item['city']} {item['nickname']}", item['abbreviation']]
+                    correct_answers = [
+                        item['full_name'], 
+                        item['nickname'], 
+                        f"{item['city']} {item['nickname']}", 
+                        item['abbreviation'],
+                        f"the {item['nickname']}"
+                    ]
                     
                     # Add common aliases if they exist
                     if full_name_lower in self.team_aliases:
@@ -102,15 +108,26 @@ class NBATrivia(commands.Cog):
                     item = random.choice(self._players)
                     # Allow Full Name, Last Name, and First Name (for unique famous players)
                     correct_answers = [item['full_name'], item['last_name'], item['first_name']]
-                    # Updated URL to a more reliable source/resolution
-                    image_url = f"https://cdn.nba.com/headshots/nba/latest/1040x760/{item['id']}.png"
+                    
+                    # Using the most robust and widely used headshot URL pattern
+                    image_url = f"https://ak-static.cms.nba.com/wp-content/uploads/headshots/nba/latest/260x190/{item['id']}.png"
+                    
+                    # Some clients/proxies prefer the direct CDN link if ak-static fails
+                    # We can also try a slightly different pattern that is more recent
+                    # image_url = f"https://cdn.nba.com/headshots/nba/latest/260x190/{item['id']}.png"
+                    
                     title = f"Round {round_num}: Who is this NBA Player?"
                     answer_display = item['full_name']
 
                 # Send Question Embed
                 embed = discord.Embed(title=title, color=discord.Color.red() if game_type == "player" else discord.Color.blue())
-                embed.set_image(url=image_url)
+                # Forcing the image URL to be a string and ensuring no hidden chars
+                embed.set_image(url=str(image_url).strip())
                 embed.set_footer(text="You have 15 seconds to answer!")
+                
+                # Add a direct link in the description as a fallback in case the image embed fails to render
+                embed.description = f"Click here if image doesn't load: [Image Link]({image_url})"
+                
                 await ctx.send(embed=embed)
 
                 # Wait for Answer
