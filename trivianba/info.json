@@ -1,0 +1,9 @@
+{
+    "author": ["jaffar21"],
+    "description": "NBA Trivia Cog for Red-DiscordBot. Guess teams and players!",
+    "install_msg": "Thanks for installing NBA Trivia! Run `[p]teamtrivia` or `[p]playertrivia` to start.",
+    "short": "NBA Trivia Game",
+    "min_bot_version": "3.5.0",
+    "requirements": ["nba_api", "unidecode"],
+    "end_user_data_statement": "This cog does not store any end user data."
+}
