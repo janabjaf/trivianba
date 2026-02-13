@@ -1,6 +1,8 @@
 import discord
 import random
 import asyncio
+import io
+import aiohttp
 from redbot.core import commands
 from nba_api.stats.static import teams, players
 from unidecode import unidecode
@@ -13,6 +15,7 @@ class NBATrivia(commands.Cog):
         self._teams = teams.get_teams()
         self._players = [p for p in players.get_players() if p['is_active']] 
         self.active_games = set()
+        self.session = aiohttp.ClientSession()
         
         # Common team nicknames/short names mapping
         self.team_aliases = {
@@ -48,6 +51,9 @@ class NBATrivia(commands.Cog):
             'sacramento kings': ['kings', 'sac']
         }
 
+    def cog_unload(self):
+        asyncio.create_task(self.session.close())
+
     def normalize(self, text):
         """Normalize text for comparison (lowercase, remove accents, strip)."""
         return unidecode(text).lower().strip()
@@ -59,6 +65,16 @@ class NBATrivia(commands.Cog):
             if self.normalize(ans) == content:
                 return True
         return False
+
+    async def get_image_file(self, url, filename):
+        try:
+            async with self.session.get(url, timeout=10) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.read()
+                return discord.File(io.BytesIO(data), filename=filename)
+        except Exception:
+            return None
 
     async def run_game(self, ctx, game_type="team"):
         channel_id = ctx.channel.id
@@ -101,6 +117,7 @@ class NBATrivia(commands.Cog):
                     image_url = f"https://a.espncdn.com/i/teamlogos/nba/500/{item['abbreviation'].lower()}.png"
                     title = f"Round {round_num}: Who is this NBA Team?"
                     answer_display = item['full_name']
+                    filename = "team.png"
                 else: # player
                     if not self._players:
                         await ctx.send("Error: No players data loaded.")
@@ -109,26 +126,29 @@ class NBATrivia(commands.Cog):
                     # Allow Full Name, Last Name, and First Name (for unique famous players)
                     correct_answers = [item['full_name'], item['last_name'], item['first_name']]
                     
-                    # Using the most robust and widely used headshot URL pattern
+                    # Using the most reliable URL that works in Discord embeds
                     image_url = f"https://ak-static.cms.nba.com/wp-content/uploads/headshots/nba/latest/260x190/{item['id']}.png"
-                    
-                    # Some clients/proxies prefer the direct CDN link if ak-static fails
-                    # We can also try a slightly different pattern that is more recent
-                    # image_url = f"https://cdn.nba.com/headshots/nba/latest/260x190/{item['id']}.png"
                     
                     title = f"Round {round_num}: Who is this NBA Player?"
                     answer_display = item['full_name']
+                    filename = "player.png"
 
+                # Download and Send Image directly
+                image_file = await self.get_image_file(image_url, filename)
+                
                 # Send Question Embed
                 embed = discord.Embed(title=title, color=discord.Color.red() if game_type == "player" else discord.Color.blue())
-                # Forcing the image URL to be a string and ensuring no hidden chars
-                embed.set_image(url=str(image_url).strip())
+                if image_file:
+                    embed.set_image(url=f"attachment://{filename}")
+                else:
+                    embed.description = "⚠️ Could not load image from NBA server. Using text only."
+                
                 embed.set_footer(text="You have 15 seconds to answer!")
                 
-                # Add a direct link in the description as a fallback in case the image embed fails to render
-                embed.description = f"Click here if image doesn't load: [Image Link]({image_url})"
-                
-                await ctx.send(embed=embed)
+                if image_file:
+                    await ctx.send(file=image_file, embed=embed)
+                else:
+                    await ctx.send(embed=embed)
 
                 # Wait for Answer
                 def check(m):
@@ -162,6 +182,17 @@ class NBATrivia(commands.Cog):
                 await ctx.send(embed=embed)
             else:
                 await ctx.send("Game Over! No points scored.")
+
+    @commands.command()
+    async def teamtrivia(self, ctx):
+        """Guess the NBA Team from its logo! (First to 10 or 50 rounds)"""
+        await self.run_game(ctx, "team")
+
+    @commands.command()
+    async def playertrivia(self, ctx):
+        """Guess the NBA Player from their headshot! (First to 10 or 50 rounds)"""
+        await self.run_game(ctx, "player")
+
 
     @commands.command()
     async def teamtrivia(self, ctx):
