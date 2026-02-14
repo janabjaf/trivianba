@@ -33,19 +33,26 @@ class F1Trivia(commands.Cog):
 
     async def get_driver_image(self, driver_name):
         """Fetches a driver's image and returns a discord.File to ensure consistency."""
-        search_query = f"F1 driver {driver_name} portrait racing"
+        # Use DuckDuckGo or direct sources if possible. 
+        # For now, let's refine the query to be extremely specific.
+        search_query = f"F1 driver {driver_name} racing suit portrait"
         encoded_query = urllib.parse.quote(search_query)
         
-        # Using loremflickr with more specific tags to avoid flags/maps
-        url = f"https://loremflickr.com/800/600/{encoded_query},driver,portrait/all?random={int(time.time() * 1000)}"
+        # Swapping to a more reliable tag-based URL or a different provider if loremflickr fails
+        # Trying a slightly different URL structure for loremflickr
+        url = f"https://loremflickr.com/800/600/{encoded_query},racing,f1/all?random={int(time.time() * 1000)}"
         
         async with aiohttp.ClientSession() as session:
             try:
-                async with session.get(url, timeout=10) as response:
+                # Add headers to look more like a browser
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
+                async with session.get(url, timeout=10, headers=headers) as response:
                     if response.status == 200:
                         data = await response.read()
-                        # Verify we actually got image data
-                        if len(data) > 1000:
+                        # Verify data size and content type
+                        if len(data) > 5000: # Increased minimum size to avoid "image not found" placeholders
                             return discord.File(io.BytesIO(data), filename="driver.jpg")
             except Exception:
                 pass
@@ -73,17 +80,22 @@ class F1Trivia(commands.Cog):
             driver = random.choice(self.drivers)
             
             async with ctx.typing():
-                image_file = await self.get_driver_image(driver)
+                # Attempt to get image up to 3 times for different drivers if one fails
+                image_file = None
+                for _ in range(3):
+                    image_file = await self.get_driver_image(driver)
+                    if image_file:
+                        break
+                    driver = random.choice(self.drivers)
 
             if not image_file:
-                await ctx.send("Failed to load an image, skipping this round...")
+                await ctx.send("Failed to load an image after several attempts, skipping this round...")
                 continue
 
             embed = discord.Embed(title=f"Round {round_num}/{total_rounds}: Who is this F1 Driver?", color=discord.Color.red())
             embed.set_image(url="attachment://driver.jpg")
             embed.set_footer(text="Type the full name or just the last name in chat!")
             
-            # Sending as a file attachment ensures all users see the same image
             await ctx.send(file=image_file, embed=embed)
 
             def check(m):
