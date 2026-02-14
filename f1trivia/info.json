@@ -1,0 +1,14 @@
+{
+  "author": ["jaffar21"],
+  "description": "F1 Drivers Trivia game with images!",
+  "install_msg": "Thanks for installing F1Trivia! Run `.f1 start` to play.",
+  "min_bot_version": "3.5.0",
+  "name": "F1Trivia",
+  "permissions": ["attach_files", "embed_links"],
+  "required_cogs": {},
+  "requirements": ["aiohttp"],
+  "short": "F1 drivers trivia",
+  "tags": ["f1", "racing", "sports", "trivia"],
+  "type": "COG",
+  "version": "1.0.0"
+}
