@@ -39,44 +39,58 @@ class F1Trivia(commands.Cog):
 
     async def get_driver_image(self, driver_name):
         """Fetches a driver's image using Wikipedia's API for maximum reliability."""
-        # Wikipedia is the most stable source for historical driver portraits
-        # Use the MediaWiki Action API to get the main image of the page
-        api_url = "https://en.wikipedia.org/w/api.php"
-        params = {
-            "action": "query",
-            "titles": driver_name,
-            "prop": "pageimages",
-            "format": "json",
-            "pithumbsize": 800
-        }
+        # Clean driver name for Wikipedia search
+        clean_name = driver_name.replace("(racing driver)", "").strip()
         
+        # API URL for Wikipedia
+        api_url = "https://en.wikipedia.org/w/api.php"
+        
+        # Use a real user agent to prevent blocks
         headers = {
-            'User-Agent': 'F1TriviaBot/1.0 (https://github.com/jaffar21/red-cogs; contact@example.com)'
+            'User-Agent': 'F1TriviaBot/1.1 (https://github.com/jaffar21/red-cogs; contact@example.com)'
         }
         
         async with aiohttp.ClientSession(headers=headers) as session:
+            # Step 1: Search for the page to get the correct title
+            search_params = {
+                "action": "query",
+                "list": "search",
+                "srsearch": f"{clean_name} F1 driver",
+                "format": "json",
+                "srlimit": 1
+            }
+            
             try:
-                async with session.get(api_url, params=params, timeout=10) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        pages = data.get("query", {}).get("pages", {})
-                        for page_id in pages:
-                            page = pages[page_id]
-                            thumbnail = page.get("thumbnail", {}).get("source")
-                            if thumbnail:
-                                # Fetch the actual image data
-                                async with session.get(thumbnail, timeout=10) as img_resp:
-                                    if img_resp.status == 200:
-                                        img_data = await img_resp.read()
-                                        if len(img_data) > 1000:
-                                            return discord.File(io.BytesIO(img_data), filename="driver.jpg")
+                async with session.get(api_url, params=search_params, timeout=10) as resp:
+                    if resp.status == 200:
+                        search_data = await resp.json()
+                        search_results = search_results = search_data.get("query", {}).get("search", [])
+                        if search_results:
+                            page_title = search_results[0].get("title")
+                            
+                            # Step 2: Get the main image from the found page
+                            img_params = {
+                                "action": "query",
+                                "titles": page_title,
+                                "prop": "pageimages",
+                                "format": "json",
+                                "pithumbsize": 800
+                            }
+                            
+                            async with session.get(api_url, params=img_params, timeout=10) as img_info_resp:
+                                if img_info_resp.status == 200:
+                                    img_info_data = await img_info_resp.json()
+                                    pages = img_info_data.get("query", {}).get("pages", {})
+                                    for pid in pages:
+                                        thumbnail = pages[pid].get("thumbnail", {}).get("source")
+                                        if thumbnail:
+                                            async with session.get(thumbnail, timeout=10) as final_resp:
+                                                if final_resp.status == 200:
+                                                    data = await final_resp.read()
+                                                    if len(data) > 1000:
+                                                        return discord.File(io.BytesIO(data), filename="driver.jpg")
             except Exception:
                 pass
-        
-        # Fallback to a different search query if the first title fails (e.g. adding "(racing driver)")
-        if "(racing driver)" not in driver_name:
-            return await self.get_driver_image(f"{driver_name} (racing driver)")
-            
         return None
 
     @f1quiz.command(name="start")
@@ -102,16 +116,16 @@ class F1Trivia(commands.Cog):
             
             async with ctx.typing():
                 image_file = None
-                # Attempt to get image for this driver or a fallback
-                for _ in range(5): # Increase attempts to find a driver with a photo
+                # Aggressive retry with different drivers
+                for _ in range(10): # Try up to 10 times to find a driver with a photo
                     image_file = await self.get_driver_image(driver)
                     if image_file:
                         break
                     driver = random.choice(self.drivers)
 
             if not image_file:
-                await ctx.send("❌ Could not retrieve driver images. Please check the bot's internet connection.")
-                break # Stop the game if we really can't get anything
+                await ctx.send("❌ Internal Error: Could not retrieve any driver images. Please check the bot's logs or internet connection.")
+                break
 
             embed = discord.Embed(title=f"Round {round_num}/{total_rounds}: Who is this F1 Driver?", color=discord.Color.red())
             embed.set_image(url="attachment://driver.jpg")
@@ -144,7 +158,6 @@ class F1Trivia(commands.Cog):
                 author_id = msg.author.id
                 game['scores'][author_id] = game['scores'].get(author_id, 0) + 1
                 
-                # Show the clean name in victory message
                 clean_name = driver.replace("(racing driver)", "").strip()
                 await ctx.send(f"✅ **Correct!** It was **{clean_name}**. {msg.author.mention} now has {game['scores'][author_id]} points.")
                 
