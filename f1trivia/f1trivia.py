@@ -38,40 +38,45 @@ class F1Trivia(commands.Cog):
             await ctx.send(embed=embed)
 
     async def get_driver_image(self, driver_name):
-        """Fetches a driver's image and returns a discord.File to ensure consistency."""
-        # Using a more robust image source strategy
-        # DuckDuckGo Images via a proxy or a more stable tag-based search
-        search_query = f"F1 driver {driver_name} racing"
-        encoded_query = urllib.parse.quote(search_query)
+        """Fetches a driver's image using Wikipedia's API for maximum reliability."""
+        # Wikipedia is the most stable source for historical driver portraits
+        # Use the MediaWiki Action API to get the main image of the page
+        api_url = "https://en.wikipedia.org/w/api.php"
+        params = {
+            "action": "query",
+            "titles": driver_name,
+            "prop": "pageimages",
+            "format": "json",
+            "pithumbsize": 800
+        }
         
-        # Swapping to a different provider (Unsplash-like or more reliable loremflickr tags)
-        # Using 'all' for broader search and including 'f1' as a priority tag
-        url = f"https://loremflickr.com/800/600/{encoded_query},f1,racing/all?random={int(time.time() * 1000)}"
+        headers = {
+            'User-Agent': 'F1TriviaBot/1.0 (https://github.com/jaffar21/red-cogs; contact@example.com)'
+        }
         
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=headers) as session:
             try:
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                    'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
-                }
-                async with session.get(url, timeout=15, headers=headers) as response:
+                async with session.get(api_url, params=params, timeout=10) as response:
                     if response.status == 200:
-                        data = await response.read()
-                        # Verify we didn't get a tiny 1x1 pixel or a broken placeholder
-                        # Placeholders are usually < 5000 bytes
-                        if len(data) > 5000:
-                            return discord.File(io.BytesIO(data), filename="driver.jpg")
-                        else:
-                            # Fallback to a simpler tag if specific driver search fails
-                            # This ensures *some* F1 image appears instead of failing
-                            fallback_url = f"https://loremflickr.com/800/600/f1,racing,car/all?random={int(time.time())}"
-                            async with session.get(fallback_url, timeout=10, headers=headers) as fb_resp:
-                                if fb_resp.status == 200:
-                                    fb_data = await fb_resp.read()
-                                    if len(fb_data) > 2000:
-                                        return discord.File(io.BytesIO(fb_data), filename="driver.jpg")
+                        data = await response.json()
+                        pages = data.get("query", {}).get("pages", {})
+                        for page_id in pages:
+                            page = pages[page_id]
+                            thumbnail = page.get("thumbnail", {}).get("source")
+                            if thumbnail:
+                                # Fetch the actual image data
+                                async with session.get(thumbnail, timeout=10) as img_resp:
+                                    if img_resp.status == 200:
+                                        img_data = await img_resp.read()
+                                        if len(img_data) > 1000:
+                                            return discord.File(io.BytesIO(img_data), filename="driver.jpg")
             except Exception:
                 pass
+        
+        # Fallback to a different search query if the first title fails (e.g. adding "(racing driver)")
+        if "(racing driver)" not in driver_name:
+            return await self.get_driver_image(f"{driver_name} (racing driver)")
+            
         return None
 
     @f1quiz.command(name="start")
@@ -97,16 +102,16 @@ class F1Trivia(commands.Cog):
             
             async with ctx.typing():
                 image_file = None
-                # Try 3 different drivers to ensure we get a working image
-                for _ in range(3):
+                # Attempt to get image for this driver or a fallback
+                for _ in range(5): # Increase attempts to find a driver with a photo
                     image_file = await self.get_driver_image(driver)
                     if image_file:
                         break
                     driver = random.choice(self.drivers)
 
             if not image_file:
-                await ctx.send("❌ Image service is currently unresponsive. Skipping this round...")
-                continue
+                await ctx.send("❌ Could not retrieve driver images. Please check the bot's internet connection.")
+                break # Stop the game if we really can't get anything
 
             embed = discord.Embed(title=f"Round {round_num}/{total_rounds}: Who is this F1 Driver?", color=discord.Color.red())
             embed.set_image(url="attachment://driver.jpg")
@@ -119,14 +124,14 @@ class F1Trivia(commands.Cog):
                     return False
                 
                 content = m.content.lower().strip()
-                driver_lower = driver.strip().lower()
+                driver_clean = driver.replace("(racing driver)", "").strip().lower()
                 
                 # Direct match
-                if content == driver_lower:
+                if content == driver_clean:
                     return True
                 
                 # Last name match
-                names = driver_lower.split()
+                names = driver_clean.split()
                 if len(names) > 1 and content == names[-1]:
                     return True
                 
@@ -139,7 +144,9 @@ class F1Trivia(commands.Cog):
                 author_id = msg.author.id
                 game['scores'][author_id] = game['scores'].get(author_id, 0) + 1
                 
-                await ctx.send(f"✅ **Correct!** It was **{driver}**. {msg.author.mention} now has {game['scores'][author_id]} points.")
+                # Show the clean name in victory message
+                clean_name = driver.replace("(racing driver)", "").strip()
+                await ctx.send(f"✅ **Correct!** It was **{clean_name}**. {msg.author.mention} now has {game['scores'][author_id]} points.")
                 
                 if game['scores'][author_id] >= 10:
                     await ctx.send(f"🏆 {msg.author.mention} has reached 10 points and **WINS THE GAME!**")
@@ -150,7 +157,8 @@ class F1Trivia(commands.Cog):
 
             except asyncio.TimeoutError:
                 if game['active']:
-                    await ctx.send(f"⏰ **Time's up!** The driver was **{driver}**.")
+                    clean_name = driver.replace("(racing driver)", "").strip()
+                    await ctx.send(f"⏰ **Time's up!** The driver was **{clean_name}**.")
             
             await asyncio.sleep(3)
 
