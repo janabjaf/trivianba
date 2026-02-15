@@ -1,0 +1,9 @@
+{
+    "author": ["jaffar21"],
+    "description": "MinigameRush: High-speed, competitive minigames with 10+ variations. Perfect for giveaways and quick fun.",
+    "install_msg": "MinigameRush loaded! Start a game with `.mg`.",
+    "short": "Competitive minigame suite",
+    "min_bot_version": "3.5.0",
+    "requirements": ["aiohttp"],
+    "end_user_data_statement": "This cog does not store any end user data."
+}
