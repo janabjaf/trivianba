@@ -6,9 +6,9 @@
   "name": "F1Trivia",
   "permissions": ["attach_files", "embed_links"],
   "required_cogs": {},
-  "requirements": ["aiohttp"],
+  "requirements": ["aiohttp", "fastf1"],
   "short": "F1 drivers trivia",
   "tags": ["f1", "racing", "sports", "trivia"],
   "type": "COG",
-  "version": "1.0.0"
+  "version": "1.0.1"
 }
