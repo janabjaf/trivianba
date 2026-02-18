@@ -1,0 +1,14 @@
+{
+    "author": ["jaffar21"],
+    "description": "A text-based Battle Royale simulation for server members.",
+    "install_msg": "Thanks for installing Battle Royale! Use `.br join` to enter the next match.",
+    "min_bot_version": "3.5.0",
+    "name": "BattleRoyale",
+    "permissions": ["embed_links", "send_messages"],
+    "required_cogs": {},
+    "requirements": [],
+    "short": "Server Battle Royale sim",
+    "tags": ["game", "simulation", "fun"],
+    "type": "COG",
+    "version": "1.0.0"
+}
