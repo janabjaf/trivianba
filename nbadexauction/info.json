@@ -1,0 +1,9 @@
+{
+    "author": ["jaffar21"],
+    "description": "NBAdex Auction: Professional auction system with live timers, outbid notifications, and logging.",
+    "install_msg": "NBAdex Auction System Initialized. Use `[p]auctionset` to configure and `[p]auction` to manage.",
+    "short": "Advanced auction system",
+    "min_bot_version": "3.5.0",
+    "requirements": ["humanize"],
+    "end_user_data_statement": "This cog does not store any end user data."
+}
