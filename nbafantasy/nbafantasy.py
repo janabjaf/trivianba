@@ -149,6 +149,7 @@ class NBAFantasy(commands.Cog):
         self.config.register_guild(**default_guild)
         self.config.register_global(**default_global)
         self.players_cache = []
+        self.last_fetch_error = None
         self.bg_task = bot.loop.create_task(self.update_cache_loop())
 
     def cog_unload(self):
@@ -161,40 +162,38 @@ class NBAFantasy(commands.Cog):
             try:
                 await self._fetch_players()
                 await self.config.players_cache.set(self.players_cache)
+                self.last_fetch_error = None
                 await asyncio.sleep(43200) # Update every 12 hours
             except Exception as e:
+                self.last_fetch_error = str(e)
                 print(f"[NBAFantasy] Error fetching NBA stats: {e}")
                 await asyncio.sleep(300) # Retry after 5 minutes on error
 
     async def _fetch_players(self):
         def fetch():
-            # The NBA API requires very specific headers that look like a real browser, 
-            # otherwise it will timeout or return a 403 Forbidden.
+            # NBA API requires specific headers including origin and token to bypass Akamai
             custom_headers = {
                 'Host': 'stats.nba.com',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:72.0) Gecko/20100101 Firefox/72.0',
                 'Accept': 'application/json, text/plain, */*',
                 'Accept-Language': 'en-US,en;q=0.5',
                 'Accept-Encoding': 'gzip, deflate, br',
+                'x-nba-stats-origin': 'stats',
+                'x-nba-stats-token': 'true',
                 'Connection': 'keep-alive',
-                'Referer': 'https://www.nba.com/',
-                'Origin': 'https://www.nba.com',
-                'Sec-Fetch-Dest': 'empty',
-                'Sec-Fetch-Mode': 'cors',
-                'Sec-Fetch-Site': 'same-site',
+                'Referer': 'https://stats.nba.com/',
                 'Pragma': 'no-cache',
                 'Cache-Control': 'no-cache'
             }
             import time
             for attempt in range(3):
                 try:
-                    # We explicitly pass the headers to bypass the block
-                    stats = leaguedashplayerstats.LeagueDashPlayerStats(timeout=120, headers=custom_headers)
+                    stats = leaguedashplayerstats.LeagueDashPlayerStats(timeout=30, headers=custom_headers)
                     return stats.get_normalized_dict()['LeagueDashPlayerStats']
                 except Exception as e:
                     if attempt == 2:
                         raise e
-                    time.sleep(5)
+                    time.sleep(3)
             
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(None, fetch)
@@ -263,6 +262,8 @@ class NBAFantasy(commands.Cog):
             return await ctx.send("You haven't joined the league yet. Use `[p]fantasy join`.")
             
         if not self.players_cache:
+            if self.last_fetch_error:
+                return await ctx.send(f"❌ **NBA API Error:** The bot could not fetch player stats.\n`{self.last_fetch_error}`\n\nThe bot owner can try `[p]fantasy update`.")
             return await ctx.send("Player data is currently updating. Please try again later.")
             
         player_dict = rosters[uid_str]
@@ -318,6 +319,8 @@ class NBAFantasy(commands.Cog):
             return await ctx.send("You haven't joined the league yet. Use `[p]fantasy join`.")
             
         if not self.players_cache:
+            if self.last_fetch_error:
+                return await ctx.send(f"❌ **NBA API Error:** The bot could not fetch player stats.\n`{self.last_fetch_error}`\n\nThe bot owner can try `[p]fantasy update`.")
             return await ctx.send("Player data is currently updating. Please try again later.")
             
         taken_ids = set()
@@ -354,6 +357,8 @@ class NBAFantasy(commands.Cog):
             return await ctx.send("No one has joined the league yet.")
             
         if not self.players_cache:
+            if self.last_fetch_error:
+                return await ctx.send(f"❌ **NBA API Error:** The bot could not fetch player stats.\n`{self.last_fetch_error}`\n\nThe bot owner can try `[p]fantasy update`.")
             return await ctx.send("Player data is currently updating. Please try again later.")
             
         scores = await self.config.guild(ctx.guild).scores()
