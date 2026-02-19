@@ -171,24 +171,11 @@ class NBAFantasy(commands.Cog):
 
     async def _fetch_players(self):
         def fetch():
-            # NBA API requires specific headers including origin and token to bypass Akamai
-            custom_headers = {
-                'Host': 'stats.nba.com',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:72.0) Gecko/20100101 Firefox/72.0',
-                'Accept': 'application/json, text/plain, */*',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'x-nba-stats-origin': 'stats',
-                'x-nba-stats-token': 'true',
-                'Connection': 'keep-alive',
-                'Referer': 'https://stats.nba.com/',
-                'Pragma': 'no-cache',
-                'Cache-Control': 'no-cache'
-            }
             import time
             for attempt in range(3):
                 try:
-                    stats = leaguedashplayerstats.LeagueDashPlayerStats(timeout=30, headers=custom_headers)
+                    # Relying on nba_api's built-in header management
+                    stats = leaguedashplayerstats.LeagueDashPlayerStats(timeout=30)
                     return stats.get_normalized_dict()['LeagueDashPlayerStats']
                 except Exception as e:
                     if attempt == 2:
