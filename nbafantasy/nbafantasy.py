@@ -2,7 +2,11 @@ import discord
 from redbot.core import commands, Config, checks
 from redbot.core.utils.chat_formatting import box
 import asyncio
+import time
+import random
+import requests
 from nba_api.stats.endpoints import leaguedashplayerstats
+from nba_api.stats.library.http import NBAStatsHTTP
 
 class TeamManagementView(discord.ui.View):
     def __init__(self, cog, ctx, team_players, rosters_dict):
@@ -150,6 +154,7 @@ class NBAFantasy(commands.Cog):
         self.config.register_global(**default_global)
         self.players_cache = []
         self.last_fetch_error = None
+        self._setup_session()
         self.bg_task = bot.loop.create_task(self.update_cache_loop())
 
     def cog_unload(self):
@@ -169,18 +174,30 @@ class NBAFantasy(commands.Cog):
                 print(f"[NBAFantasy] Error fetching NBA stats: {e}")
                 await asyncio.sleep(300) # Retry after 5 minutes on error
 
+    def _setup_session(self):
+        from nba_api.stats.library.http import STATS_HEADERS
+        self._session = requests.Session()
+        self._session.headers.update(STATS_HEADERS)
+        NBAStatsHTTP.set_session(self._session)
+
     async def _fetch_players(self):
         def fetch():
-            import time
-            for attempt in range(3):
+            max_attempts = 4
+            for attempt in range(max_attempts):
                 try:
-                    # Relying on nba_api's built-in header management
-                    stats = leaguedashplayerstats.LeagueDashPlayerStats(timeout=30)
+                    if attempt > 0:
+                        backoff = (2 ** attempt) + random.uniform(1.0, 3.0)
+                        print(f"[NBAFantasy] Retrying in {backoff:.1f}s (attempt {attempt + 1}/{max_attempts})...")
+                        time.sleep(backoff)
+
+                    stats = leaguedashplayerstats.LeagueDashPlayerStats(
+                        timeout=60,
+                    )
                     return stats.get_normalized_dict()['LeagueDashPlayerStats']
                 except Exception as e:
-                    if attempt == 2:
+                    print(f"[NBAFantasy] Attempt {attempt + 1} failed: {e}")
+                    if attempt == max_attempts - 1:
                         raise e
-                    time.sleep(3)
             
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(None, fetch)
@@ -439,9 +456,12 @@ class NBAFantasy(commands.Cog):
     @commands.is_owner()
     async def fantasy_update(self, ctx):
         """Force update the player stats cache (Bot Owner only)."""
-        await ctx.send("Fetching latest stats from NBA API... This may take a moment.")
+        msg = await ctx.send("Fetching latest stats from NBA API... This may take up to 2 minutes.")
         try:
             await self._fetch_players()
+            await self.config.players_cache.set(self.players_cache)
+            self.last_fetch_error = None
             await ctx.send(f"✅ Successfully updated stats for {len(self.players_cache)} players!")
         except Exception as e:
-            await ctx.send(f"❌ Failed to update stats: {box(str(e))}")
+            self.last_fetch_error = str(e)
+            await ctx.send(f"❌ Failed to update stats after multiple retries:\n{box(str(e))}\n\nThe NBA stats API may be temporarily unavailable. The bot will keep retrying automatically in the background.")
