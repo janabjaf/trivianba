@@ -162,16 +162,24 @@ class NBAFantasy(commands.Cog):
 
     async def _fetch_players(self):
         def fetch():
-            # Using current season by default
+            # The NBA API requires very specific headers that look like a real browser, 
+            # otherwise it will timeout or return a 403 Forbidden.
             custom_headers = {
                 'Host': 'stats.nba.com',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
                 'Accept': 'application/json, text/plain, */*',
                 'Accept-Language': 'en-US,en;q=0.5',
-                'Referer': 'https://www.nba.com/',
-                'Origin': 'https://www.nba.com/',
+                'Accept-Encoding': 'gzip, deflate, br',
                 'Connection': 'keep-alive',
+                'Referer': 'https://www.nba.com/',
+                'Origin': 'https://www.nba.com',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-site',
+                'Pragma': 'no-cache',
+                'Cache-Control': 'no-cache'
             }
+            # We explicitly pass the headers to bypass the block
             stats = leaguedashplayerstats.LeagueDashPlayerStats(timeout=60, headers=custom_headers)
             return stats.get_normalized_dict()['LeagueDashPlayerStats']
             
