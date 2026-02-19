@@ -1,14 +1,15 @@
 import discord
 import asyncio
 import time
-import humanize
-from datetime import datetime, timedelta
-from typing import Optional, Union
+import re
+from datetime import datetime
+from typing import Optional
 from redbot.core import commands, Config, checks
+from discord import app_commands
 
 class NBAdexAuction(commands.Cog):
     """
-    Advanced Auction System for NBAdex.
+    Advanced Auction System for NBAdex with Ping Roles and Reminders.
     """
 
     def __init__(self, bot):
@@ -21,6 +22,23 @@ class NBAdexAuction(commands.Cog):
         }
         self.config.register_guild(**default_guild)
         self.active_tasks = {}
+
+    def parse_amount(self, amount_str: str) -> Optional[int]:
+        if isinstance(amount_str, int):
+            return amount_str
+        
+        amount_str = str(amount_str).lower().strip().replace(",", "")
+        multipliers = {'k': 1000, 'm': 1000000, 'b': 1000000000}
+        
+        match = re.match(r"(\d+(?:\.\d+)?)([kmb])?", amount_str)
+        if not match:
+            return None
+        
+        val, mult = match.groups()
+        val = float(val)
+        if mult:
+            val *= multipliers[mult]
+        return int(val)
 
     @commands.group()
     @commands.guild_only()
@@ -43,66 +61,189 @@ class NBAdexAuction(commands.Cog):
 
     @auction.command()
     @checks.admin_or_permissions(manage_messages=True)
-    async def start(self, ctx, item_name: str, duration_mins: int, min_bid: int, buyout: Optional[int] = None):
-        """Start a new auction."""
-        guild_data = await self.config.guild(ctx.guild).all()
-        log_channel_id = guild_data["log_channel"]
-        
-        if not log_channel_id:
-            return await ctx.send("❌ Please set a logging channel first using `[p]auctionset channel`.")
-
-        log_channel = ctx.guild.get_channel(log_channel_id)
-        if not log_channel:
-            return await ctx.send("❌ Logging channel not found. Please re-set it.")
-
-        # Check if there's already an active auction in this channel
+    async def end(self, ctx):
+        """Force end the active auction in this channel."""
         async with self.config.guild(ctx.guild).auctions() as auctions:
+            target_id = None
             for aid, data in auctions.items():
                 if data["channel_id"] == ctx.channel.id and data["status"] == "active":
-                    return await ctx.send("❌ There is already an active auction in this channel. End it first.")
+                    target_id = aid
+                    break
+            
+            if not target_id:
+                return await ctx.send("❌ No active auction in this channel.")
+            
+            auc = auctions[target_id]
+            auc["status"] = "ended" if auc["highest_bidder"] else "expired"
+            
+            # The timer task will pick up the change, but let's trigger immediate cleanup
+            channel = ctx.channel
+            msg = f"🏁 The auction for **{auc['item']}** has been manually ended!"
+            if auc["highest_bidder"]:
+                msg += f" Winner: <@{auc['highest_bidder']}> for `{auc['current_bid']:,}`!"
+            
+            await channel.send(embed=discord.Embed(description=msg, color=discord.Color.red()))
+            
+            try:
+                m = await channel.fetch_message(auc["message_id"])
+                await m.edit(embed=self.make_auction_embed(auc))
+            except: pass
+            
+            ping_role = ctx.guild.get_role(auc["ping_role_id"])
+            if ping_role:
+                try: await ping_role.delete(reason="Auction manually ended")
+                except: pass
+
+        await ctx.send("✅ Auction ended.")
+
+    @auction.command()
+    @checks.admin_or_permissions(manage_messages=True)
+    async def extend(self, ctx, minutes: int):
+        """Extend the active auction in this channel by X minutes."""
+        async with self.config.guild(ctx.guild).auctions() as auctions:
+            target_id = None
+            for aid, data in auctions.items():
+                if data["channel_id"] == ctx.channel.id and data["status"] == "active":
+                    target_id = aid
+                    break
+            
+            if not target_id:
+                return await ctx.send("❌ No active auction in this channel.")
+            
+            auc = auctions[target_id]
+            auc["end_time"] += (minutes * 60)
+            
+            try:
+                m = await ctx.channel.fetch_message(auc["message_id"])
+                await m.edit(embed=self.make_auction_embed(auc))
+            except: pass
+            
+        await ctx.send(f"✅ Auction extended by {minutes} minutes.")
+
+    @app_commands.command(name="auction_start", description="Start a new auction")
+    @app_commands.describe(
+        item="The name of the item being auctioned",
+        bidding_channel="The channel where bidding will happen",
+        duration_mins="Auction duration in minutes",
+        min_bid="Starting bid (e.g. 100k, 1m)",
+        buyout="Optional buyout price (e.g. 5m)",
+        min_increase="Minimum bid increase (e.g. 10k, 50k)",
+        thumbnail_url="Optional URL for the auction image thumbnail"
+    )
+    async def slash_start(
+        self, 
+        interaction: discord.Interaction, 
+        item: str, 
+        bidding_channel: discord.TextChannel,
+        duration_mins: int, 
+        min_bid: str, 
+        buyout: Optional[str] = None,
+        min_increase: Optional[str] = None,
+        thumbnail_url: Optional[str] = None
+    ):
+        if not interaction.user.guild_permissions.manage_messages:
+            return await interaction.response.send_message("❌ You don't have permission to start auctions.", ephemeral=True)
+
+        parsed_min = self.parse_amount(min_bid)
+        parsed_buyout = self.parse_amount(buyout) if buyout else None
+        parsed_increase = self.parse_amount(min_increase) if min_increase else None
+        
+        if parsed_min is None:
+            return await interaction.response.send_message("❌ Invalid minimum bid format. Use 100k, 1m, etc.", ephemeral=True)
+
+        await interaction.response.defer()
+        
+        guild = interaction.guild
+        log_channel_id = await self.config.guild(guild).log_channel()
+        if not log_channel_id:
+            return await interaction.followup.send("❌ Logging channel not set. Use `.auctionset channel` first.")
+
+        log_channel = guild.get_channel(log_channel_id)
+        
+        # Create unique ping role for this auction
+        role_name = f"Auction: {item}"[:32]
+        ping_role = await guild.create_role(name=role_name, mentionable=True, reason="Auction start")
 
         end_time = time.time() + (duration_mins * 60)
+        auction_id = str(interaction.id)
         
-        auction_id = str(ctx.message.id)
         auction_data = {
             "id": auction_id,
-            "item": item_name,
-            "min_bid": min_bid,
-            "buyout": buyout,
+            "item": item,
+            "min_bid": parsed_min,
+            "buyout": parsed_buyout,
+            "min_increase": parsed_increase,
             "current_bid": 0,
             "highest_bidder": None,
             "end_time": end_time,
             "status": "active",
-            "channel_id": ctx.channel.id,
+            "channel_id": bidding_channel.id,
             "message_id": None,
-            "history": []
+            "ping_role_id": ping_role.id,
+            "thumbnail_url": thumbnail_url,
+            "history": [],
+            "reminders_sent": []
         }
 
         embed = self.make_auction_embed(auction_data)
-        msg = await ctx.send(embed=embed)
+        msg = await bidding_channel.send(content=ping_role.mention, embed=embed)
         auction_data["message_id"] = msg.id
         
-        async with self.config.guild(ctx.guild).auctions() as auctions:
+        async with self.config.guild(guild).auctions() as auctions:
             auctions[auction_id] = auction_data
 
-        # Start background timer task
-        task = asyncio.create_task(self.auction_timer(ctx, auction_id))
-        self.active_tasks[auction_id] = task
+        self.active_tasks[auction_id] = asyncio.create_task(self.auction_timer(guild, auction_id))
         
         log_embed = discord.Embed(title="🚀 Auction Started", color=discord.Color.blue())
-        log_embed.add_field(name="Item", value=item_name)
-        log_embed.add_field(name="Duration", value=f"{duration_mins}m")
-        log_embed.add_field(name="Min Bid", value=f"`{min_bid}`")
-        if buyout: log_embed.add_field(name="Buyout", value=f"`{buyout}`")
-        log_embed.set_footer(text=f"Started by {ctx.author} | ID: {auction_id}")
+        log_embed.add_field(name="Item", value=item)
+        log_embed.add_field(name="Channel", value=bidding_channel.mention)
+        log_embed.add_field(name="Role", value=ping_role.mention)
+        if thumbnail_url: log_embed.set_thumbnail(url=thumbnail_url)
+        log_embed.set_footer(text=f"Started by {interaction.user}")
         await log_channel.send(embed=log_embed)
+        
+        await interaction.followup.send(f"✅ Auction for **{item}** started in {bidding_channel.mention}!")
+
+    @app_commands.command(name="auction_cancel", description="Cancel an active auction")
+    @app_commands.describe(auction_id="ID of the auction to cancel (found in logs or footer)")
+    @checks.admin_or_permissions(manage_messages=True)
+    async def slash_cancel(self, interaction: discord.Interaction, auction_id: str):
+        async with self.config.guild(interaction.guild).auctions() as auctions:
+            if auction_id not in auctions:
+                return await interaction.response.send_message("❌ Auction not found.", ephemeral=True)
+            
+            auc = auctions[auction_id]
+            if auc["status"] != "active":
+                return await interaction.response.send_message("❌ This auction is already ended.", ephemeral=True)
+            
+            auc["status"] = "cancelled"
+            
+            # Cleanup
+            channel = interaction.guild.get_channel(auc["channel_id"])
+            if channel:
+                try:
+                    m = await channel.fetch_message(auc["message_id"])
+                    await m.edit(embed=self.make_auction_embed(auc))
+                    await channel.send(f"🚫 The auction for **{auc['item']}** has been cancelled by an administrator.")
+                except: pass
+            
+            ping_role = interaction.guild.get_role(auc["ping_role_id"])
+            if ping_role:
+                try: await ping_role.delete(reason="Auction cancelled")
+                except: pass
+                
+        await interaction.response.send_message(f"✅ Auction `{auction_id}` cancelled.")
 
     @commands.command()
     @commands.guild_only()
-    async def bid(self, ctx, amount: int):
-        """Place a bid on the active auction in this channel."""
+    async def bid(self, ctx, amount: str):
+        """Place a bid (e.g. .bid 100k, .bid 1.5m)"""
+        parsed_amount = self.parse_amount(amount)
+        if parsed_amount is None:
+            return await ctx.send("❌ Invalid amount. Use 100k, 1m, etc.")
+
         async with self.config.guild(ctx.guild).auctions() as auctions:
-            # Find the active auction in the current channel
+            # Find active auction in this channel
             target_id = None
             for aid, data in auctions.items():
                 if data["channel_id"] == ctx.channel.id and data["status"] == "active":
@@ -114,117 +255,141 @@ class NBAdexAuction(commands.Cog):
             
             auc = auctions[target_id]
             
-            if amount < auc["min_bid"]:
-                return await ctx.send(f"❌ Minimum bid is `{auc['min_bid']}`.")
-            
-            if amount <= auc["current_bid"]:
-                return await ctx.send(f"❌ Bid must be higher than the current bid of `{auc['current_bid']}`.")
+            # Prevent outbidding yourself
+            if auc["highest_bidder"] == ctx.author.id:
+                return await ctx.send("⚠️ You are already the highest bidder!")
 
-            # Anti-snipe: If bid in last 60 seconds, extend by 60 seconds
+            # Outbid Protection: Check if bidder can afford it (Placeholder for economy integration if needed)
+            # For now, just logging and checking basic rules
+            
+            old_bidder_id = auc["highest_bidder"]
+
+            if parsed_amount < auc["min_bid"]:
+                return await ctx.send(f"❌ Minimum bid is `{auc['min_bid']:,}`.")
+            
+            if parsed_amount <= auc["current_bid"]:
+                return await ctx.send(f"❌ Your bid must be higher than the current bid of `{auc['current_bid']:,}`.")
+
+            # Minimum increment logic
+            min_inc_val = auc.get("min_increase")
+            if min_inc_val is None:
+                min_inc_val = max(1000, int(auc["current_bid"] * 0.01))
+            
+            if auc["current_bid"] > 0 and (parsed_amount - auc["current_bid"]) < min_inc_val:
+                return await ctx.send(f"⚠️ Minimum bid increase is `{min_inc_val:,}`. Try bidding `{auc['current_bid'] + min_inc_val:,}` or more.")
+
+            # Anti-snipe: 60s extension
             time_left = auc["end_time"] - time.time()
             if time_left < 60:
                 auc["end_time"] += 60
-                await ctx.send("⏱️ **Anti-snipe!** Auction extended by 60s.")
+                await ctx.send("⏱️ **Anti-snipe!** Auction extended by 60 seconds.")
 
-            auc["current_bid"] = amount
+            auc["current_bid"] = parsed_amount
             auc["highest_bidder"] = ctx.author.id
-            auc["history"].append({"user": ctx.author.id, "amount": amount, "time": time.time()})
+            auc["history"].append({"user": ctx.author.id, "amount": parsed_amount, "time": time.time()})
             
-            # Check buyout
+            # Auto-assign role to current bidder
+            ping_role = ctx.guild.get_role(auc["ping_role_id"])
+            if ping_role:
+                try: await ctx.author.add_roles(ping_role)
+                except: pass
+
             is_buyout = False
-            if auc["buyout"] and amount >= auc["buyout"]:
+            if auc["buyout"] and parsed_amount >= auc["buyout"]:
                 is_buyout = True
                 auc["status"] = "sold"
 
-            # Update message
+            # Update embed
             try:
                 msg = await ctx.channel.fetch_message(auc["message_id"])
                 await msg.edit(embed=self.make_auction_embed(auc))
-            except:
-                pass
+            except: pass
 
+            # Log to channel
             log_channel_id = await self.config.guild(ctx.guild).log_channel()
             if log_channel_id:
                 log_channel = ctx.guild.get_channel(log_channel_id)
                 if log_channel:
-                    await log_channel.send(f"💰 **New Bid** | **{auc['item']}** | {ctx.author.mention} bid `{amount}`")
+                    await log_channel.send(f"💰 **New Bid** | **{auc['item']}** | {ctx.author.mention} bid `{parsed_amount:,}`")
+
+            # Outbid notification
+            if old_bidder_id and old_bidder_id != ctx.author.id:
+                await ctx.send(f"🔔 <@{old_bidder_id}>, you have been outbid on **{auc['item']}**!")
 
             if is_buyout:
-                await ctx.send(f"🔥 **BUYOUT!** {ctx.author.mention} has bought **{auc['item']}** for `{amount}`!")
-                # Call end_auction from outside the lock if possible, but for simplicity here we just finalize
-                # The timer task will pick up the 'sold' status
+                await ctx.send(f"🔥 **BUYOUT!** {ctx.author.mention} has bought **{auc['item']}** for `{parsed_amount:,}`!")
             else:
                 await ctx.message.add_reaction("✅")
 
     def make_auction_embed(self, auc):
-        time_left = max(0, int(auc["end_time"] - time.time()))
-        status_color = discord.Color.green() if auc["status"] == "active" else discord.Color.red()
-        if auc["status"] == "sold": status_color = discord.Color.gold()
+        status_color = discord.Color.green() if auc["status"] == "active" else discord.Color.gold() if auc["status"] == "sold" else discord.Color.red()
         
         embed = discord.Embed(title=f"📦 Auction: {auc['item']}", color=status_color)
-        embed.add_field(name="Current Bid", value=f"`{auc['current_bid']}`" if auc['current_bid'] > 0 else f"Min: `{auc['min_bid']}`", inline=True)
+        embed.add_field(name="Current Bid", value=f"`{auc['current_bid']:,}`" if auc['current_bid'] > 0 else f"Min: `{auc['min_bid']:,}`", inline=True)
         embed.add_field(name="Highest Bidder", value=f"<@{auc['highest_bidder']}>" if auc['highest_bidder'] else "None", inline=True)
         
         if auc["buyout"]:
-            embed.add_field(name="Buyout", value=f"`{auc['buyout']}`", inline=True)
+            embed.add_field(name="Buyout", value=f"`{auc['buyout']:,}`", inline=True)
+        
+        if auc.get("min_increase"):
+            embed.add_field(name="Min Increase", value=f"`{auc['min_increase']:,}`", inline=True)
             
         if auc["status"] == "active":
             embed.add_field(name="Ends", value=f"<t:{int(auc['end_time'])}:R>", inline=True)
             if auc["history"]:
-                last_3 = auc["history"][-3:]
-                history_text = "\n".join([f"<@{h['user']}>: `{h['amount']}`" for h in reversed(last_3)])
-                embed.add_field(name="Recent Bids", value=history_text, inline=False)
-            embed.set_footer(text=f"Use .bid <amount> to participate")
+                history = "\n".join([f"<@{h['user']}>: `{h['amount']:,}`" for h in reversed(auc['history'][-5:])])
+                embed.add_field(name="Recent Bids", value=history, inline=False)
+            embed.set_footer(text=f"ID: {auc['id']} | Use .bid <amount> to participate")
         else:
             embed.add_field(name="Status", value=f"**{auc['status'].upper()}**", inline=False)
             if auc["highest_bidder"]:
-                embed.description = f"Winner: <@{auc['highest_bidder']}> for `{auc['current_bid']}`"
+                embed.description = f"Winner: <@{auc['highest_bidder']}> for `{auc['current_bid']:,}`"
+        
+        if auc.get("thumbnail_url"):
+            embed.set_image(url=auc["thumbnail_url"])
             
         return embed
 
-    async def auction_timer(self, ctx, auction_id):
+    async def auction_timer(self, guild, auction_id):
         while True:
-            await asyncio.sleep(10)
-            async with self.config.guild(ctx.guild).auctions() as auctions:
-                if auction_id not in auctions or auctions[auction_id]["status"] != "active":
-                    break
-                
+            await asyncio.sleep(30)
+            async with self.config.guild(guild).auctions() as auctions:
+                if auction_id not in auctions: break
                 auc = auctions[auction_id]
-                if time.time() >= auc["end_time"]:
-                    await self.end_auction(ctx.guild, auction_id)
-                    break
+                if auc["status"] != "active": break
                 
-                # Periodically update the timer embed if needed (Discord <t:R> handles it mostly)
-                pass
+                now = time.time()
+                time_left = auc["end_time"] - now
+                channel = guild.get_channel(auc["channel_id"])
+                ping_role = guild.get_role(auc["ping_role_id"])
+                
+                # Reminders: 1 hour (60 mins) and 10 mins
+                for reminder_min in [60, 10]:
+                    reminder_key = f"reminder_{reminder_min}"
+                    if time_left <= (reminder_min * 60) and reminder_key not in auc["reminders_sent"]:
+                        if channel and ping_role:
+                            await channel.send(f"⏰ {ping_role.mention} - **{auc['item']}** ends in {reminder_min} minutes!")
+                        auc["reminders_sent"].append(reminder_key)
 
-    async def end_auction(self, guild, auction_id, winner=None):
-        async with self.config.guild(guild).auctions() as auctions:
-            if auction_id not in auctions: return
-            auc = auctions[auction_id]
-            if auc["status"] not in ["active", "sold"]: return
-            
-            if auc["status"] == "active":
-                auc["status"] = "ended" if auc["highest_bidder"] else "expired"
-            
-            # Final update
-            channel = guild.get_channel(auc["channel_id"])
-            if channel:
-                try:
-                    msg = await channel.fetch_message(auc["message_id"])
-                    await msg.edit(embed=self.make_auction_embed(auc))
-                except:
-                    pass
-
-            log_channel_id = await self.config.guild(guild).log_channel()
-            if log_channel_id:
-                log_channel = guild.get_channel(log_channel_id)
-                if log_channel:
-                    if auc["highest_bidder"]:
-                        winner_mention = f"<@{auc['highest_bidder']}>"
-                        await log_channel.send(f"🏁 **Auction Ended**\nItem: {auc['item']}\nWinner: {winner_mention}\nFinal Price: `{auc['current_bid']}`")
-                        if channel:
-                            await channel.send(f"🏁 The auction for **{auc['item']}** has ended! Winner: {winner_mention} for `{auc['current_bid']}`!")
-                    else:
-                        await log_channel.send(f"❌ **Auction Expired**\nItem: {auc['item']}\nReason: No bids placed.")
-                        if channel:
-                            await channel.send(f"❌ The auction for **{auc['item']}** has expired with no bids.")
+                if now >= auc["end_time"]:
+                    auc["status"] = "ended" if auc["highest_bidder"] else "expired"
+                    if channel:
+                        msg = f"🏁 The auction for **{auc['item']}** has ended!"
+                        if auc["highest_bidder"]:
+                            msg += f" Winner: <@{auc['highest_bidder']}> for `{auc['current_bid']:,}`!"
+                        else:
+                            msg += " Expired with no bids."
+                        
+                        ping_content = ping_role.mention if ping_role else ""
+                        await channel.send(content=ping_content, embed=discord.Embed(description=msg, color=discord.Color.red()))
+                        
+                        try:
+                            m = await channel.fetch_message(auc["message_id"])
+                            await m.edit(embed=self.make_auction_embed(auc))
+                        except: pass
+                    
+                    # Cleanup role
+                    if ping_role:
+                        try: await ping_role.delete(reason="Auction ended")
+                        except: pass
+                    break
