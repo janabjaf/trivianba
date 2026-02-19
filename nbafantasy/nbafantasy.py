@@ -142,8 +142,12 @@ class NBAFantasy(commands.Cog):
             "rosters": {}, # uid_str: {str(player_id): joined_fp}
             "scores": {}   # uid_str: accumulated_fp
         }
+        default_global = {
+            "players_cache": []
+        }
         
         self.config.register_guild(**default_guild)
+        self.config.register_global(**default_global)
         self.players_cache = []
         self.bg_task = bot.loop.create_task(self.update_cache_loop())
 
@@ -152,9 +156,11 @@ class NBAFantasy(commands.Cog):
 
     async def update_cache_loop(self):
         await self.bot.wait_until_ready()
+        self.players_cache = await self.config.players_cache()
         while True:
             try:
                 await self._fetch_players()
+                await self.config.players_cache.set(self.players_cache)
                 await asyncio.sleep(43200) # Update every 12 hours
             except Exception as e:
                 print(f"[NBAFantasy] Error fetching NBA stats: {e}")
@@ -166,7 +172,7 @@ class NBAFantasy(commands.Cog):
             # otherwise it will timeout or return a 403 Forbidden.
             custom_headers = {
                 'Host': 'stats.nba.com',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0',
                 'Accept': 'application/json, text/plain, */*',
                 'Accept-Language': 'en-US,en;q=0.5',
                 'Accept-Encoding': 'gzip, deflate, br',
@@ -179,9 +185,16 @@ class NBAFantasy(commands.Cog):
                 'Pragma': 'no-cache',
                 'Cache-Control': 'no-cache'
             }
-            # We explicitly pass the headers to bypass the block
-            stats = leaguedashplayerstats.LeagueDashPlayerStats(timeout=60, headers=custom_headers)
-            return stats.get_normalized_dict()['LeagueDashPlayerStats']
+            import time
+            for attempt in range(3):
+                try:
+                    # We explicitly pass the headers to bypass the block
+                    stats = leaguedashplayerstats.LeagueDashPlayerStats(timeout=120, headers=custom_headers)
+                    return stats.get_normalized_dict()['LeagueDashPlayerStats']
+                except Exception as e:
+                    if attempt == 2:
+                        raise e
+                    time.sleep(5)
             
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(None, fetch)
