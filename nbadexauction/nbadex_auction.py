@@ -3,7 +3,7 @@ import asyncio
 import time
 import re
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union
 from redbot.core import commands, Config, checks
 from discord import app_commands
 
@@ -23,7 +23,7 @@ class NBAdexAuction(commands.Cog):
         self.config.register_guild(**default_guild)
         self.active_tasks = {}
 
-    def parse_amount(self, amount_str: str) -> Optional[int]:
+    def parse_amount(self, amount_str: Union[str, int]) -> Optional[int]:
         if isinstance(amount_str, int):
             return amount_str
         
@@ -59,6 +59,31 @@ class NBAdexAuction(commands.Cog):
         """Auction Management Commands."""
         await ctx.send_help()
 
+    @auction.command(name="start")
+    @checks.admin_or_permissions(manage_messages=True)
+    async def prefix_start(self, ctx, duration_mins: int, min_bid: str, bidding_channel: discord.TextChannel, item: str, buyout: str = None, min_increase: str = None):
+        """
+        Start an auction.
+        Usage: .auction start <duration_mins> <min_bid> <bidding_channel> <item> [buyout] [min_increase]
+        """
+        parsed_min = self.parse_amount(min_bid)
+        parsed_buyout = self.parse_amount(buyout) if buyout else None
+        parsed_increase = self.parse_amount(min_increase) if min_increase else None
+
+        if parsed_min is None:
+            return await ctx.send("❌ Invalid minimum bid format. Use 100k, 1m, etc.")
+
+        await self._start_auction(
+            ctx=ctx,
+            item=item,
+            bidding_channel=bidding_channel,
+            duration_mins=duration_mins,
+            parsed_min=parsed_min,
+            parsed_buyout=parsed_buyout,
+            parsed_increase=parsed_increase,
+            user=ctx.author
+        )
+
     @auction.command()
     @checks.admin_or_permissions(manage_messages=True)
     async def end(self, ctx):
@@ -76,7 +101,6 @@ class NBAdexAuction(commands.Cog):
             auc = auctions[target_id]
             auc["status"] = "ended" if auc["highest_bidder"] else "expired"
             
-            # The timer task will pick up the change, but let's trigger immediate cleanup
             channel = ctx.channel
             msg = f"🏁 The auction for **{auc['item']}** has been manually ended!"
             if auc["highest_bidder"]:
@@ -151,21 +175,33 @@ class NBAdexAuction(commands.Cog):
         if parsed_min is None:
             return await interaction.response.send_message("❌ Invalid minimum bid format. Use 100k, 1m, etc.", ephemeral=True)
 
+        # Defer immediately to prevent "Thinking..." getting stuck
         await interaction.response.defer()
         
-        guild = interaction.guild
-        log_channel_id = await self.config.guild(guild).log_channel()
-        if not log_channel_id:
-            return await interaction.followup.send("❌ Logging channel not set. Use `.auctionset channel` first.")
+        await self._start_auction(
+            interaction=interaction,
+            item=item,
+            bidding_channel=bidding_channel,
+            duration_mins=duration_mins,
+            parsed_min=parsed_min,
+            parsed_buyout=parsed_buyout,
+            parsed_increase=parsed_increase,
+            thumbnail_url=thumbnail_url,
+            user=interaction.user
+        )
 
-        log_channel = guild.get_channel(log_channel_id)
+    async def _start_auction(self, ctx=None, interaction=None, item=None, bidding_channel=None, duration_mins=None, parsed_min=None, parsed_buyout=None, parsed_increase=None, thumbnail_url=None, user=None):
+        guild = ctx.guild if ctx else interaction.guild
+        log_channel_id = await self.config.guild(guild).log_channel()
+        
+        log_channel = guild.get_channel(log_channel_id) if log_channel_id else None
         
         # Create unique ping role for this auction
         role_name = f"Auction: {item}"[:32]
         ping_role = await guild.create_role(name=role_name, mentionable=True, reason="Auction start")
 
         end_time = time.time() + (duration_mins * 60)
-        auction_id = str(interaction.id)
+        auction_id = str(interaction.id if interaction else ctx.message.id)
         
         auction_data = {
             "id": auction_id,
@@ -192,17 +228,24 @@ class NBAdexAuction(commands.Cog):
         async with self.config.guild(guild).auctions() as auctions:
             auctions[auction_id] = auction_data
 
+        # Cleanup existing task if any
+        if auction_id in self.active_tasks:
+            self.active_tasks[auction_id].cancel()
+
         self.active_tasks[auction_id] = asyncio.create_task(self.auction_timer(guild, auction_id))
         
-        log_embed = discord.Embed(title="🚀 Auction Started", color=discord.Color.blue())
-        log_embed.add_field(name="Item", value=item)
-        log_embed.add_field(name="Channel", value=bidding_channel.mention)
-        log_embed.add_field(name="Role", value=ping_role.mention)
-        if thumbnail_url: log_embed.set_thumbnail(url=thumbnail_url)
-        log_embed.set_footer(text=f"Started by {interaction.user}")
-        await log_channel.send(embed=log_embed)
+        if log_channel:
+            log_embed = discord.Embed(title="🚀 Auction Started", color=discord.Color.blue())
+            log_embed.add_field(name="Item", value=item)
+            log_embed.add_field(name="Channel", value=bidding_channel.mention)
+            log_embed.add_field(name="Role", value=ping_role.mention)
+            if thumbnail_url: log_embed.set_thumbnail(url=thumbnail_url)
+            log_embed.set_footer(text=f"Started by {user}")
+            await log_channel.send(embed=log_embed)
         
-        await interaction.followup.send(f"✅ Auction for **{item}** started in {bidding_channel.mention}!")
+        success_msg = f"✅ Auction for **{item}** started in {bidding_channel.mention}!"
+        if interaction: await interaction.followup.send(success_msg)
+        else: await ctx.send(success_msg)
 
     @app_commands.command(name="auction_cancel", description="Cancel an active auction")
     @app_commands.describe(auction_id="ID of the auction to cancel (found in logs or footer)")
@@ -255,14 +298,8 @@ class NBAdexAuction(commands.Cog):
             
             auc = auctions[target_id]
             
-            # Prevent outbidding yourself
             if auc["highest_bidder"] == ctx.author.id:
                 return await ctx.send("⚠️ You are already the highest bidder!")
-
-            # Outbid Protection: Check if bidder can afford it (Placeholder for economy integration if needed)
-            # For now, just logging and checking basic rules
-            
-            old_bidder_id = auc["highest_bidder"]
 
             if parsed_amount < auc["min_bid"]:
                 return await ctx.send(f"❌ Minimum bid is `{auc['min_bid']:,}`.")
@@ -270,7 +307,6 @@ class NBAdexAuction(commands.Cog):
             if parsed_amount <= auc["current_bid"]:
                 return await ctx.send(f"❌ Your bid must be higher than the current bid of `{auc['current_bid']:,}`.")
 
-            # Minimum increment logic
             min_inc_val = auc.get("min_increase")
             if min_inc_val is None:
                 min_inc_val = max(1000, int(auc["current_bid"] * 0.01))
@@ -278,17 +314,16 @@ class NBAdexAuction(commands.Cog):
             if auc["current_bid"] > 0 and (parsed_amount - auc["current_bid"]) < min_inc_val:
                 return await ctx.send(f"⚠️ Minimum bid increase is `{min_inc_val:,}`. Try bidding `{auc['current_bid'] + min_inc_val:,}` or more.")
 
-            # Anti-snipe: 60s extension
             time_left = auc["end_time"] - time.time()
             if time_left < 60:
                 auc["end_time"] += 60
                 await ctx.send("⏱️ **Anti-snipe!** Auction extended by 60 seconds.")
 
+            old_bidder_id = auc["highest_bidder"]
             auc["current_bid"] = parsed_amount
             auc["highest_bidder"] = ctx.author.id
             auc["history"].append({"user": ctx.author.id, "amount": parsed_amount, "time": time.time()})
             
-            # Auto-assign role to current bidder
             ping_role = ctx.guild.get_role(auc["ping_role_id"])
             if ping_role:
                 try: await ctx.author.add_roles(ping_role)
@@ -299,20 +334,17 @@ class NBAdexAuction(commands.Cog):
                 is_buyout = True
                 auc["status"] = "sold"
 
-            # Update embed
             try:
                 msg = await ctx.channel.fetch_message(auc["message_id"])
                 await msg.edit(embed=self.make_auction_embed(auc))
             except: pass
 
-            # Log to channel
             log_channel_id = await self.config.guild(ctx.guild).log_channel()
             if log_channel_id:
                 log_channel = ctx.guild.get_channel(log_channel_id)
                 if log_channel:
                     await log_channel.send(f"💰 **New Bid** | **{auc['item']}** | {ctx.author.mention} bid `{parsed_amount:,}`")
 
-            # Outbid notification
             if old_bidder_id and old_bidder_id != ctx.author.id:
                 await ctx.send(f"🔔 <@{old_bidder_id}>, you have been outbid on **{auc['item']}**!")
 
@@ -363,7 +395,6 @@ class NBAdexAuction(commands.Cog):
                 channel = guild.get_channel(auc["channel_id"])
                 ping_role = guild.get_role(auc["ping_role_id"])
                 
-                # Reminders: 1 hour (60 mins) and 10 mins
                 for reminder_min in [60, 10]:
                     reminder_key = f"reminder_{reminder_min}"
                     if time_left <= (reminder_min * 60) and reminder_key not in auc["reminders_sent"]:
@@ -388,8 +419,10 @@ class NBAdexAuction(commands.Cog):
                             await m.edit(embed=self.make_auction_embed(auc))
                         except: pass
                     
-                    # Cleanup role
                     if ping_role:
                         try: await ping_role.delete(reason="Auction ended")
                         except: pass
                     break
+        # Cleanup task reference
+        if auction_id in self.active_tasks:
+            del self.active_tasks[auction_id]
