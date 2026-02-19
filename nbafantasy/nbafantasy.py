@@ -177,21 +177,47 @@ class NBAFantasy(commands.Cog):
     def _setup_session(self):
         from nba_api.stats.library.http import STATS_HEADERS
         self._session = requests.Session()
-        self._session.headers.update(STATS_HEADERS)
+        
+        # Enhanced headers to bypass Cloudflare/Bot detection in 2026
+        custom_headers = STATS_HEADERS.copy()
+        custom_headers.update({
+            "Host": "stats.nba.com",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Referer": "https://www.nba.com/",
+            "Origin": "https://www.nba.com",
+            "x-nba-stats-origin": "stats",
+            "x-nba-stats-token": "true",
+            "Sec-Ch-Ua": '"Chromium";v="131", "Google Chrome";v="131", "Not;A=Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
+        })
+        
+        self._session.headers.update(custom_headers)
         NBAStatsHTTP.set_session(self._session)
 
     async def _fetch_players(self):
         def fetch():
-            max_attempts = 4
+            max_attempts = 5
             for attempt in range(max_attempts):
                 try:
+                    # Longer initial delay and randomized jitter
                     if attempt > 0:
-                        backoff = (2 ** attempt) + random.uniform(1.0, 3.0)
+                        backoff = (attempt * 15) + random.uniform(5.0, 15.0)
                         print(f"[NBAFantasy] Retrying in {backoff:.1f}s (attempt {attempt + 1}/{max_attempts})...")
                         time.sleep(backoff)
+                    else:
+                        # Initial jitter to avoid synchronized cloud blocks
+                        time.sleep(random.uniform(1.0, 5.0))
 
                     stats = leaguedashplayerstats.LeagueDashPlayerStats(
-                        timeout=60,
+                        timeout=120, # Increased to 2 minutes
                     )
                     return stats.get_normalized_dict()['LeagueDashPlayerStats']
                 except Exception as e:
@@ -456,7 +482,7 @@ class NBAFantasy(commands.Cog):
     @commands.is_owner()
     async def fantasy_update(self, ctx):
         """Force update the player stats cache (Bot Owner only)."""
-        msg = await ctx.send("Fetching latest stats from NBA API... This may take up to 2 minutes.")
+        msg = await ctx.send("🏀 Fetching latest stats from NBA API... This can take 2-5 minutes due to NBA.com rate limits. Please be patient.")
         try:
             await self._fetch_players()
             await self.config.players_cache.set(self.players_cache)
@@ -464,4 +490,4 @@ class NBAFantasy(commands.Cog):
             await ctx.send(f"✅ Successfully updated stats for {len(self.players_cache)} players!")
         except Exception as e:
             self.last_fetch_error = str(e)
-            await ctx.send(f"❌ Failed to update stats after multiple retries:\n{box(str(e))}\n\nThe NBA stats API may be temporarily unavailable. The bot will keep retrying automatically in the background.")
+            await ctx.send(f"❌ **NBA API Error:** The connection timed out after 5 attempts.\n\n**Why?** NBA.com often blocks cloud-hosted bots (like AWS/Heroku/Replit). \n\n**Fix:** The bot will keep trying automatically every 5 minutes in the background. It usually eventually gets through when traffic is lower.")
