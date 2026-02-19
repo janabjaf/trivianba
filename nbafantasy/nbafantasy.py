@@ -155,14 +155,24 @@ class NBAFantasy(commands.Cog):
         while True:
             try:
                 await self._fetch_players()
+                await asyncio.sleep(43200) # Update every 12 hours
             except Exception as e:
                 print(f"[NBAFantasy] Error fetching NBA stats: {e}")
-            await asyncio.sleep(43200) # Update every 12 hours
+                await asyncio.sleep(300) # Retry after 5 minutes on error
 
     async def _fetch_players(self):
         def fetch():
             # Using current season by default
-            stats = leaguedashplayerstats.LeagueDashPlayerStats()
+            custom_headers = {
+                'Host': 'stats.nba.com',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://www.nba.com/',
+                'Origin': 'https://www.nba.com/',
+                'Connection': 'keep-alive',
+            }
+            stats = leaguedashplayerstats.LeagueDashPlayerStats(timeout=60, headers=custom_headers)
             return stats.get_normalized_dict()['LeagueDashPlayerStats']
             
         loop = asyncio.get_running_loop()
