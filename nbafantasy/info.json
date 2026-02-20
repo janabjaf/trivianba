@@ -5,7 +5,7 @@
     "description": "A fully-featured NBA Fantasy cog for Discord where users can draft players, manage their rosters, and compete in leagues.",
     "install_msg": "Thank you for installing the NBA Fantasy cog. Please make sure to load it using `[p]load nbafantasy`.",
     "tags": ["nba", "fantasy", "sports", "basketball"],
-    "requirements": ["nba_api @ git+https://github.com/swar/nba_api.git"],
+    "requirements": [],
     "min_bot_version": "3.5.22",
     "end_user_data_statement": "This cog stores discord user IDs to keep track of their fantasy teams and league participation."
 }

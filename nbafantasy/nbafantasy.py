@@ -5,8 +5,6 @@ import asyncio
 import time
 import random
 import requests
-from nba_api.stats.endpoints import leaguedashplayerstats
-from nba_api.stats.library.http import NBAStatsHTTP
 
 class TeamManagementView(discord.ui.View):
     def __init__(self, cog, ctx, team_players, rosters_dict):
@@ -175,75 +173,83 @@ class NBAFantasy(commands.Cog):
                 await asyncio.sleep(300) # Retry after 5 minutes on error
 
     def _setup_session(self):
-        from nba_api.stats.library.http import STATS_HEADERS
         self._session = requests.Session()
-        
-        # Enhanced headers to bypass Cloudflare/Bot detection in 2026
-        custom_headers = STATS_HEADERS.copy()
-        custom_headers.update({
-            "Host": "stats.nba.com",
+        self._session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Referer": "https://www.nba.com/",
-            "Origin": "https://www.nba.com",
-            "x-nba-stats-origin": "stats",
-            "x-nba-stats-token": "true",
-            "Sec-Ch-Ua": '"Chromium";v="131", "Google Chrome";v="131", "Not;A=Brand";v="99"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Windows"',
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-site",
         })
-        
-        self._session.headers.update(custom_headers)
-        NBAStatsHTTP.set_session(self._session)
 
     async def _fetch_players(self):
         def fetch():
-            max_attempts = 5
-            for attempt in range(max_attempts):
+            base_url = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/statistics/byathlete?region=us&lang=en&contentorigin=espn&isqualified=false&limit=500"
+            players_data = []
+            page = 1
+            max_pages = 1
+            
+            while page <= max_pages:
                 try:
-                    # Longer initial delay and randomized jitter
-                    if attempt > 0:
-                        backoff = (attempt * 15) + random.uniform(5.0, 15.0)
-                        print(f"[NBAFantasy] Retrying in {backoff:.1f}s (attempt {attempt + 1}/{max_attempts})...")
-                        time.sleep(backoff)
-                    else:
-                        # Initial jitter to avoid synchronized cloud blocks
-                        time.sleep(random.uniform(1.0, 5.0))
-
-                    stats = leaguedashplayerstats.LeagueDashPlayerStats(
-                        timeout=120, # Increased to 2 minutes
-                    )
-                    return stats.get_normalized_dict()['LeagueDashPlayerStats']
+                    response = self._session.get(f"{base_url}&page={page}", timeout=30)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if page == 1 and "pagination" in data:
+                        max_pages = data["pagination"].get("pages", 1)
+                        
+                    players_data.extend(data.get("athletes", []))
+                    page += 1
+                    time.sleep(1) # Be nice to the API
                 except Exception as e:
-                    print(f"[NBAFantasy] Attempt {attempt + 1} failed: {e}")
-                    if attempt == max_attempts - 1:
-                        raise e
+                    print(f"[NBAFantasy] ESPN API fetch failed on page {page}: {e}")
+                    raise e
+                    
+            return players_data
             
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(None, fetch)
         
         cached = []
         for p in data:
-            fp = (p['PTS'] * 1 +
-                  p['REB'] * 1.2 +
-                  p['AST'] * 1.5 +
-                  p['STL'] * 3 +
-                  p['BLK'] * 3 +
-                  p['TOV'] * -1)
+            athlete = p.get("athlete", {})
+            try:
+                player_id = int(athlete.get("id", 0))
+            except ValueError:
+                continue
+                
+            name = athlete.get("displayName", "Unknown Player")
+            team = athlete.get("teamShortName", "FA")
+            
+            categories = p.get("categories", [])
+            
+            pts = reb = ast = stl = blk = tov = 0.0
+            
+            for cat in categories:
+                cat_name = cat.get("name")
+                names = cat.get("names", [])
+                values = cat.get("values", [])
+                
+                if cat_name == "offensive":
+                    if "points" in names: pts = float(values[names.index("points")])
+                    if "rebounds" in names: reb = float(values[names.index("rebounds")])
+                    if "assists" in names: ast = float(values[names.index("assists")])
+                    if "turnovers" in names: tov = float(values[names.index("turnovers")])
+                elif cat_name == "defensive":
+                    if "steals" in names: stl = float(values[names.index("steals")])
+                    if "blocks" in names: blk = float(values[names.index("blocks")])
+                    
+            fp = (pts * 1 + reb * 1.2 + ast * 1.5 + stl * 3 + blk * 3 + tov * -1)
+            
+            # Ensure stats are never negative for the cache
+            pts = max(0, pts)
+            reb = max(0, reb)
+            ast = max(0, ast)
+            
             cached.append({
-                "id": p['PLAYER_ID'],
-                "name": p['PLAYER_NAME'],
-                "team": p['TEAM_ABBREVIATION'],
+                "id": player_id,
+                "name": name,
+                "team": team,
                 "fp": round(fp, 1),
-                "pts": p['PTS'],
-                "reb": p['REB'],
-                "ast": p['AST']
+                "pts": round(pts, 1),
+                "reb": round(reb, 1),
+                "ast": round(ast, 1)
             })
         
         self.players_cache = sorted(cached, key=lambda x: x['fp'], reverse=True)
@@ -293,7 +299,7 @@ class NBAFantasy(commands.Cog):
             
         if not self.players_cache:
             if self.last_fetch_error:
-                return await ctx.send(f"❌ **NBA API Error:** The bot could not fetch player stats.\n`{self.last_fetch_error}`\n\nThe bot owner can try `[p]fantasy update`.")
+                return await ctx.send(f"❌ **Stats Error:** The bot could not fetch player stats.\n`{self.last_fetch_error}`\n\nThe bot owner can try `[p]fantasy update`.")
             return await ctx.send("Player data is currently updating. Please try again later.")
             
         player_dict = rosters[uid_str]
@@ -350,7 +356,7 @@ class NBAFantasy(commands.Cog):
             
         if not self.players_cache:
             if self.last_fetch_error:
-                return await ctx.send(f"❌ **NBA API Error:** The bot could not fetch player stats.\n`{self.last_fetch_error}`\n\nThe bot owner can try `[p]fantasy update`.")
+                return await ctx.send(f"❌ **Stats Error:** The bot could not fetch player stats.\n`{self.last_fetch_error}`\n\nThe bot owner can try `[p]fantasy update`.")
             return await ctx.send("Player data is currently updating. Please try again later.")
             
         taken_ids = set()
@@ -388,7 +394,7 @@ class NBAFantasy(commands.Cog):
             
         if not self.players_cache:
             if self.last_fetch_error:
-                return await ctx.send(f"❌ **NBA API Error:** The bot could not fetch player stats.\n`{self.last_fetch_error}`\n\nThe bot owner can try `[p]fantasy update`.")
+                return await ctx.send(f"❌ **Stats Error:** The bot could not fetch player stats.\n`{self.last_fetch_error}`\n\nThe bot owner can try `[p]fantasy update`.")
             return await ctx.send("Player data is currently updating. Please try again later.")
             
         scores = await self.config.guild(ctx.guild).scores()
@@ -482,7 +488,7 @@ class NBAFantasy(commands.Cog):
     @commands.is_owner()
     async def fantasy_update(self, ctx):
         """Force update the player stats cache (Bot Owner only)."""
-        msg = await ctx.send("🏀 Fetching latest stats from NBA API... This can take 2-5 minutes due to NBA.com rate limits. Please be patient.")
+        msg = await ctx.send("🏀 Fetching latest stats... This can take 1-2 minutes. Please be patient.")
         try:
             await self._fetch_players()
             await self.config.players_cache.set(self.players_cache)
@@ -490,4 +496,4 @@ class NBAFantasy(commands.Cog):
             await ctx.send(f"✅ Successfully updated stats for {len(self.players_cache)} players!")
         except Exception as e:
             self.last_fetch_error = str(e)
-            await ctx.send(f"❌ **NBA API Error:** The connection timed out after 5 attempts.\n\n**Why?** NBA.com often blocks cloud-hosted bots (like AWS/Heroku/Replit). \n\n**Fix:** The bot will keep trying automatically every 5 minutes in the background. It usually eventually gets through when traffic is lower.")
+            await ctx.send(f"❌ **Stats Error:** The connection failed.\n\n**Fix:** The bot will keep trying automatically every 5 minutes in the background.")
