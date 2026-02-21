@@ -18,23 +18,18 @@ class TeamManagementView(discord.ui.View):
             return
             
         options = []
-        for p in team_players:
+        for p in team_players[:25]:
             joined_fp = self.rosters_dict.get(str(p['id']), 0)
             earned_fp = p['fp'] - joined_fp
             options.append(discord.SelectOption(
-                label=f"[{p.get('pos', 'G')}] {p['name']}",
+                label=p['name'],
                 description=f"{p['team']} - Earned FP: {round(earned_fp, 1)}",
                 value=str(p['id'])
             ))
             
-        for i in range(0, len(options), 25):
-            select = discord.ui.Select(
-                placeholder=f"Select a player to DROP (Page {i//25 + 1})...", 
-                options=options[i:i+25], 
-                custom_id=f"drop_select_{i}"
-            )
-            select.callback = self.drop_callback
-            self.add_item(select)
+        select = discord.ui.Select(placeholder="Select a player to DROP...", options=options, custom_id="drop_select")
+        select.callback = self.drop_callback
+        self.add_item(select)
 
     async def on_timeout(self):
         for child in self.children:
@@ -70,33 +65,6 @@ class TeamManagementView(discord.ui.View):
             else:
                 await interaction.response.send_message("Failed to drop player.", ephemeral=True)
 
-class DraftView(discord.ui.View):
-    def __init__(self, cog, guild, available_players, current_picker_id):
-        super().__init__(timeout=300)
-        self.cog = cog
-        self.guild = guild
-        self.current_picker_id = current_picker_id
-        
-        options = []
-        for p in available_players[:25]:
-            options.append(discord.SelectOption(
-                label=f"[{p.get('pos', 'G')}] {p['name']}",
-                description=f"{p['team']} - FP: {p['fp']}",
-                value=str(p['id'])
-            ))
-            
-        if options:
-            select = discord.ui.Select(placeholder="Draft a player...", options=options)
-            select.callback = self.draft_callback
-            self.add_item(select)
-
-    async def draft_callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.current_picker_id:
-            return await interaction.response.send_message("It's not your turn to draft!", ephemeral=True)
-            
-        player_id = int(interaction.data['values'][0])
-        await self.cog._perform_draft_pick(interaction, player_id)
-
 class FreeAgentView(discord.ui.View):
     def __init__(self, cog, ctx, available_players):
         super().__init__(timeout=120)
@@ -105,19 +73,15 @@ class FreeAgentView(discord.ui.View):
         self.message = None
         
         options = []
-        for p in available_players:
+        for p in available_players[:25]:
             options.append(discord.SelectOption(
-                label=f"[{p.get('pos', 'G')}] {p['name']}",
+                label=p['name'],
                 description=f"{p['team']} - Total Season FP: {p['fp']}",
                 value=str(p['id'])
             ))
             
-        for i in range(0, min(len(options), 100), 25): # Limit to 4 pages for stability
-            select = discord.ui.Select(
-                placeholder=f"Select a player to ADD (Page {i//25 + 1})...", 
-                options=options[i:i+25], 
-                custom_id=f"add_select_{i}"
-            )
+        if options:
+            select = discord.ui.Select(placeholder="Select a player to ADD...", options=options, custom_id="add_select")
             select.callback = self.add_callback
             self.add_item(select)
 
@@ -136,74 +100,39 @@ class FreeAgentView(discord.ui.View):
             
         fa_locked = await self.cog.config.guild(self.ctx.guild).fa_locked()
         if fa_locked:
-            return await interaction.response.send_message("Free Agency is currently locked.", ephemeral=True)
+            return await interaction.response.send_message("Free Agency is currently locked by admins.", ephemeral=True)
             
         player_id = int(interaction.data['values'][0])
         uid_str = str(self.ctx.author.id)
         
-        player = next((p for p in self.cog.players_cache if p['id'] == player_id), None)
-        if not player:
-            return await interaction.response.send_message("Player not found.", ephemeral=True)
-
-        settings = await self.cog.config.guild(self.ctx.guild).settings()
         async with self.cog.config.guild(self.ctx.guild).rosters() as rosters:
-            if uid_str not in rosters: rosters[uid_str] = {}
-            
-            # Position/Max Check
-            user_roster = rosters[uid_str]
-            if len(user_roster) >= settings['max_players']:
-                return await interaction.response.send_message(f"Roster full! Max {settings['max_players']} players.", ephemeral=True)
+            if uid_str not in rosters:
+                rosters[uid_str] = {}
                 
-            pos_count = sum(1 for pid in user_roster.keys() if next((p['pos'] for p in self.cog.players_cache if str(p['id']) == pid), 'G') == player['pos'])
-            if pos_count >= settings['positions'].get(player['pos'], 0):
-                return await interaction.response.send_message(f"Your {player['pos']} spots are full! (Max {settings['positions'].get(player['pos'])})", ephemeral=True)
-
-            # Ownership Check
-            for team in rosters.values():
-                if str(player_id) in team:
+            if len(rosters[uid_str]) >= 10:
+                return await interaction.response.send_message("Your roster is full (max 10). Drop someone first.", ephemeral=True)
+                
+            # Check if anyone else has this player
+            for team_dict in rosters.values():
+                if isinstance(team_dict, dict) and str(player_id) in team_dict:
+                    return await interaction.response.send_message("That player is already on another team!", ephemeral=True)
+                elif isinstance(team_dict, list) and player_id in team_dict:
                     return await interaction.response.send_message("That player is already on another team!", ephemeral=True)
                     
+            player = next((p for p in self.cog.players_cache if p['id'] == player_id), None)
+            if not player:
+                return await interaction.response.send_message("Player not found in cache. Please try again later.", ephemeral=True)
+                
             rosters[uid_str][str(player_id)] = player['fp']
             
-            await interaction.response.send_message(f"✅ **{player['name']}** added successfully!", ephemeral=True)
-            for child in self.children: child.disabled = True
+            await interaction.response.send_message(f"**{player['name']}** added to your team successfully!", ephemeral=True)
+            for child in self.children:
+                child.disabled = True
             await interaction.message.edit(view=self)
 
-class TradeView(discord.ui.View):
-    def __init__(self, cog, sender, receiver, s_player, r_player):
-        super().__init__(timeout=300)
-        self.cog = cog
-        self.sender = sender
-        self.receiver = receiver
-        self.s_player = s_player
-        self.r_player = r_player
-
-    @discord.ui.button(label="Accept Trade", style=discord.ButtonStyle.green)
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.receiver.id:
-            return await interaction.response.send_message("Not your trade.", ephemeral=True)
-        
-        async with self.cog.config.guild(interaction.guild).rosters() as rosters:
-            s_uid, r_uid = str(self.sender.id), str(self.receiver.id)
-            # Remove
-            s_val = rosters[s_uid].pop(str(self.s_player['id']))
-            r_val = rosters[r_uid].pop(str(self.r_player['id']))
-            # Add
-            rosters[s_uid][str(self.r_player['id'])] = r_val
-            rosters[r_uid][str(self.s_player['id'])] = s_val
-            
-        await interaction.response.send_message(f"✅ Trade Complete! {self.s_player['name']} <-> {self.r_player['name']}")
-        self.stop()
-
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.red)
-    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id not in [self.sender.id, self.receiver.id]:
-            return await interaction.response.send_message("Not your trade.", ephemeral=True)
-        await interaction.response.send_message("Trade declined.")
-        self.stop()
 
 class NBAFantasy(commands.Cog):
-    """NBA Fantasy League with Drafting, Trading, and Positions!"""
+    """NBA Fantasy League within Discord!"""
 
     def __init__(self, bot):
         self.bot = bot
@@ -212,22 +141,15 @@ class NBAFantasy(commands.Cog):
         default_guild = {
             "is_active": False,
             "fa_locked": False,
-            "rosters": {}, 
-            "scores": {},
-            "settings": {
-                "max_players": 10,
-                "positions": {"G": 4, "F": 4, "C": 2},
-                "point_values": {"pts": 1.0, "reb": 1.2, "ast": 1.5, "stl": 3.0, "blk": 3.0, "tov": -1.0}
-            },
-            "draft": {
-                "order": [],
-                "current_index": 0,
-                "is_running": False,
-                "round": 1
-            }
+            "rosters": {}, # uid_str: {str(player_id): joined_fp}
+            "scores": {}   # uid_str: accumulated_fp
         }
+        default_global = {
+            "players_cache": []
+        }
+        
         self.config.register_guild(**default_guild)
-        self.config.register_global(players_cache=[])
+        self.config.register_global(**default_global)
         self.players_cache = []
         self.last_fetch_error = None
         self._setup_session()
@@ -244,201 +166,334 @@ class NBAFantasy(commands.Cog):
                 await self._fetch_players()
                 await self.config.players_cache.set(self.players_cache)
                 self.last_fetch_error = None
-                await asyncio.sleep(43200) 
+                await asyncio.sleep(43200) # Update every 12 hours
             except Exception as e:
                 self.last_fetch_error = str(e)
-                print(f"[NBAFantasy] Error fetching stats: {e}")
-                await asyncio.sleep(300)
+                print(f"[NBAFantasy] Error fetching NBA stats: {e}")
+                await asyncio.sleep(300) # Retry after 5 minutes on error
 
     def _setup_session(self):
         self._session = requests.Session()
-        self._session.headers.update({"User-Agent": "Mozilla/5.0"})
+        self._session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        })
 
     async def _fetch_players(self):
         def fetch():
-            url = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/statistics/byathlete?region=us&lang=en&contentorigin=espn&isqualified=false&limit=500"
-            r = self._session.get(url, timeout=30)
-            r.raise_for_status()
-            return r.json().get("athletes", [])
+            base_url = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/statistics/byathlete?region=us&lang=en&contentorigin=espn&isqualified=false&limit=500"
+            players_data = []
+            page = 1
+            max_pages = 1
             
-        data = await asyncio.get_running_loop().run_in_executor(None, fetch)
-        pv = {"pts": 1.0, "reb": 1.2, "ast": 1.5, "stl": 3.0, "blk": 3.0, "tov": -1.0}
+            while page <= max_pages:
+                try:
+                    response = self._session.get(f"{base_url}&page={page}", timeout=30)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if page == 1 and "pagination" in data:
+                        max_pages = data["pagination"].get("pages", 1)
+                        
+                    players_data.extend(data.get("athletes", []))
+                    page += 1
+                    time.sleep(1) # Be nice to the API
+                except Exception as e:
+                    print(f"[NBAFantasy] ESPN API fetch failed on page {page}: {e}")
+                    raise e
+                    
+            return players_data
+            
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(None, fetch)
         
         cached = []
         for p in data:
             athlete = p.get("athlete", {})
-            try: pid = int(athlete.get("id", 0))
-            except: continue
+            try:
+                player_id = int(athlete.get("id", 0))
+            except ValueError:
+                continue
+                
+            name = athlete.get("displayName", "Unknown Player")
+            team = athlete.get("teamShortName", "FA")
             
-            pos = athlete.get("position", {}).get("abbreviation", "G")[0] # Just G, F, or C
-            if pos not in ["G", "F", "C"]: pos = "G"
+            categories = p.get("categories", [])
             
-            stats = {"pts": 0, "reb": 0, "ast": 0, "stl": 0, "blk": 0, "tov": 0}
-            for cat in p.get("categories", []):
-                names, values = cat.get("names", []), cat.get("values", [])
-                for k in stats.keys():
-                    if k == "pts": search = "points"
-                    elif k == "reb": search = "rebounds"
-                    elif k == "ast": search = "assists"
-                    elif k == "tov": search = "turnovers"
-                    else: search = k
-                    if search in names: stats[k] = float(values[names.index(search)])
+            pts = reb = ast = stl = blk = tov = 0.0
             
-            fp = sum(stats[k] * pv[k] for k in stats)
+            for cat in categories:
+                cat_name = cat.get("name")
+                names = cat.get("names", [])
+                values = cat.get("values", [])
+                
+                if cat_name == "offensive":
+                    if "points" in names: pts = float(values[names.index("points")])
+                    if "rebounds" in names: reb = float(values[names.index("rebounds")])
+                    if "assists" in names: ast = float(values[names.index("assists")])
+                    if "turnovers" in names: tov = float(values[names.index("turnovers")])
+                elif cat_name == "defensive":
+                    if "steals" in names: stl = float(values[names.index("steals")])
+                    if "blocks" in names: blk = float(values[names.index("blocks")])
+                    
+            fp = (pts * 1 + reb * 1.2 + ast * 1.5 + stl * 3 + blk * 3 + tov * -1)
+            
+            # Ensure stats are never negative for the cache
+            pts = max(0, pts)
+            reb = max(0, reb)
+            ast = max(0, ast)
+            
             cached.append({
-                "id": pid, "name": athlete.get("displayName"), "team": athlete.get("teamShortName", "FA"),
-                "pos": pos, "fp": round(fp, 1), "pts": stats["pts"]
+                "id": player_id,
+                "name": name,
+                "team": team,
+                "fp": round(fp, 1),
+                "pts": round(pts, 1),
+                "reb": round(reb, 1),
+                "ast": round(ast, 1)
             })
+        
         self.players_cache = sorted(cached, key=lambda x: x['fp'], reverse=True)
 
-    @commands.group(name="fantasy")
+    @commands.group(name="fantasy", aliases=["nbafantasy", "nbaf"])
     async def fantasy(self, ctx):
-        """NBA Fantasy League"""
+        """Main command for NBA Fantasy"""
         pass
 
     @fantasy.command(name="setup")
     @commands.admin_or_permissions(manage_guild=True)
     async def fantasy_setup(self, ctx):
-        """Enable NBA Fantasy."""
+        """Enable NBA Fantasy in this server."""
         await self.config.guild(ctx.guild).is_active.set(True)
-        await ctx.send("🏀 NBA Fantasy enabled! `[p]fantasy join` to start.")
+        await ctx.send("🏀 NBA Fantasy has been enabled for this server! Users can now `[p]fantasy join`.")
 
     @fantasy.command(name="join")
     async def fantasy_join(self, ctx):
-        """Join the league."""
+        """Join the server's NBA Fantasy league."""
+        is_active = await self.config.guild(ctx.guild).is_active()
+        if not is_active:
+            return await ctx.send("Fantasy league is not active in this server. An admin must run `[p]fantasy setup` first.")
+            
         async with self.config.guild(ctx.guild).rosters() as rosters:
-            if str(ctx.author.id) in rosters: return await ctx.send("Joined already.")
-            rosters[str(ctx.author.id)] = {}
-        await ctx.send("🎉 Joined!")
-
-    @fantasy.command(name="settings")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def fantasy_settings(self, ctx, key: str = None, value: str = None):
-        """View or update settings. Keys: point_pts, point_reb, pos_g, pos_f, pos_c, etc."""
-        async with self.config.guild(ctx.guild).settings() as s:
-            if not key:
-                embed = discord.Embed(title="NBA Fantasy Settings", color=discord.Color.blue())
-                pv = s["point_values"]
-                pos = s["positions"]
-                embed.add_field(name="Scoring", value=f"PTS: {pv['pts']} | REB: {pv['reb']} | AST: {pv['ast']}\nSTL: {pv['stl']} | BLK: {pv['blk']} | TOV: {pv['tov']}", inline=False)
-                embed.add_field(name="Roster Requirements", value=f"Guards: {pos['G']} | Forwards: {pos['F']} | Centers: {pos['C']}\nTotal: {s['max_players']}", inline=False)
-                return await ctx.send(embed=embed)
-
-            if key.startswith("point_"):
-                stat = key.split("_")[1].lower()
-                if stat in s["point_values"]: 
-                    s["point_values"][stat] = float(value)
-                    await ctx.send(f"✅ Updated {stat.upper()} to {value} points.")
-            elif key.startswith("pos_"):
-                p = key.split("_")[1].upper()
-                if p in s["positions"]: 
-                    s["positions"][p] = int(value)
-                    s["max_players"] = sum(s["positions"].values())
-                    await ctx.send(f"✅ Updated {p} requirement to {value}. New total roster size: {s['max_players']}.")
-            else:
-                await ctx.send("Invalid key. Use `point_pts`, `pos_g`, etc.")
-
-    @fantasy.command(name="draft")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def start_draft(self, ctx):
-        """Start the draft."""
-        rosters = await self.config.guild(ctx.guild).rosters()
-        order = list(rosters.keys())
-        random.shuffle(order)
-        async with self.config.guild(ctx.guild).draft() as d:
-            d.update({"order": order, "current_index": 0, "is_running": True, "round": 1})
-        await self._announce_draft_turn(ctx)
-
-    async def _announce_draft_turn(self, ctx):
-        d = await self.config.guild(ctx.guild).draft()
-        if not d["is_running"]: return
-        uid = int(d["order"][d["current_index"]])
-        user = ctx.guild.get_member(uid)
-        avail = await self._get_avail(ctx.guild)
-        view = DraftView(self, ctx.guild, avail, uid)
-        await ctx.send(f"🏀 Round {d['round']}: {user.mention}'s turn!", view=view)
-
-    async def _perform_draft_pick(self, interaction, pid):
-        uid = str(interaction.user.id)
-        player = next((p for p in self.players_cache if p['id'] == pid), None)
-        
-        settings = await self.config.guild(interaction.guild).settings()
-        async with self.config.guild(interaction.guild).rosters() as rosters:
-            if uid not in rosters: rosters[uid] = {}
+            uid_str = str(ctx.author.id)
+            if uid_str in rosters:
+                return await ctx.send("You have already joined the league!")
+            rosters[uid_str] = {}
             
-            # Position Check
-            user_roster = rosters[uid]
-            pos_count = sum(1 for pid_str in user_roster.keys() if next((p['pos'] for p in self.players_cache if str(p['id']) == pid_str), 'G') == player['pos'])
-            if pos_count >= settings['positions'].get(player['pos'], 0):
-                return await interaction.response.send_message(f"Your {player['pos']} spots are full! Choose another position.", ephemeral=True)
-                
-            rosters[uid][str(pid)] = player['fp']
+        async with self.config.guild(ctx.guild).scores() as scores:
+            scores[str(ctx.author.id)] = 0.0
             
-        await interaction.response.send_message(f"✅ Drafted **{player['name']}** ({player['pos']})!")
-        
-        async with self.config.guild(interaction.guild).draft() as d:
-            d["current_index"] += 1
-            if d["current_index"] >= len(d["order"]):
-                d["current_index"] = 0
-                d["round"] += 1
-                if d["round"] > settings["max_players"]:
-                    d["is_running"] = False
-                    return await interaction.channel.send("🏆 **Draft Complete!** All rosters are set. Good luck this season!")
-        
-        # Determine next picker
-        await self._announce_draft_turn(await self.bot.get_context(interaction.message))
-
-    async def _get_avail(self, guild):
-        rosters = await self.config.guild(guild).rosters()
-        taken = {int(pid) for team in rosters.values() for pid in team}
-        return [p for p in self.players_cache if p['id'] not in taken]
+        await ctx.send("🎉 You have successfully joined the fantasy league! Use `[p]fantasy freeagents` to pick up players.")
 
     @fantasy.command(name="team")
     async def fantasy_team(self, ctx, member: discord.Member = None):
-        """View team and drop players."""
+        """View your team or another member's team."""
         target = member or ctx.author
+        uid_str = str(target.id)
+        
         rosters = await self.config.guild(ctx.guild).rosters()
-        if str(target.id) not in rosters: return await ctx.send("Not in league.")
         
-        pids = [int(p) for p in rosters[str(target.id)].keys()]
-        team = [p for p in self.players_cache if p['id'] in pids]
+        if uid_str not in rosters:
+            if member:
+                return await ctx.send(f"{target.display_name} hasn't joined the league yet.")
+            return await ctx.send("You haven't joined the league yet. Use `[p]fantasy join`.")
+            
+        if not self.players_cache:
+            if self.last_fetch_error:
+                return await ctx.send(f"❌ **Stats Error:** The bot could not fetch player stats.\n`{self.last_fetch_error}`\n\nThe bot owner can try `[p]fantasy update`.")
+            return await ctx.send("Player data is currently updating. Please try again later.")
+            
+        player_dict = rosters[uid_str]
         
-        embed = discord.Embed(title=f"{target.name}'s Team", color=0xffa500)
-        for p in team:
-            embed.add_field(name=f"[{p['pos']}] {p['name']}", value=f"{p['team']}", inline=True)
+        # Check if the data is from the old list format and reset if needed to avoid crash
+        if isinstance(player_dict, list):
+            async with self.config.guild(ctx.guild).rosters() as r:
+                r[uid_str] = {}
+            player_dict = {}
+            
+        player_ids = [int(pid) for pid in player_dict.keys()]
+        team_players = [p for p in self.players_cache if p['id'] in player_ids]
         
-        view = TeamManagementView(self, ctx, team, rosters[str(target.id)]) if target == ctx.author else None
-        await ctx.send(embed=embed, view=view)
+        scores = await self.config.guild(ctx.guild).scores()
+        accumulated_fp = scores.get(uid_str, 0.0)
+        
+        embed = discord.Embed(title=f"{target.display_name}'s Fantasy Team", color=discord.Color.orange())
+        embed.set_thumbnail(url=target.display_avatar.url)
+        
+        if not team_players:
+            embed.description = f"**Total Team FP:** {round(accumulated_fp, 1)}\n\nThis team is empty! Use `[p]fantasy freeagents` to pick up players."
+            return await ctx.send(embed=embed)
+            
+        current_roster_fp = 0
+        for p in team_players:
+            joined_fp = player_dict.get(str(p['id']), p['fp'])
+            earned_fp = p['fp'] - joined_fp
+            embed.add_field(name=p['name'], value=f"{p['team']} | Earned FP: {round(earned_fp, 1)}", inline=True)
+            current_roster_fp += earned_fp
+            
+        total_team_fp = accumulated_fp + current_roster_fp
+        
+        if target == ctx.author:
+            embed.description = f"**Total Team FP:** {round(total_team_fp, 1)}\n*Use the dropdown below to drop a player.*"
+            view = TeamManagementView(self, ctx, team_players, player_dict)
+            msg = await ctx.send(embed=embed, view=view)
+            view.message = msg
+        else:
+            embed.description = f"**Total Team FP:** {round(total_team_fp, 1)}"
+            await ctx.send(embed=embed)
 
     @fantasy.command(name="freeagents", aliases=["fa"])
-    async def fantasy_fa(self, ctx):
-        """Browse Free Agents."""
-        avail = await self._get_avail(ctx.guild)
-        embed = discord.Embed(title="Free Agents", color=0x0000ff)
-        for p in avail[:10]:
-            embed.add_field(name=f"[{p['pos']}] {p['name']}", value=f"FP: {p['fp']}", inline=True)
-        await ctx.send(embed=embed, view=FreeAgentView(self, ctx, avail))
-
-    @fantasy.command(name="trade")
-    async def fantasy_trade(self, ctx, member: discord.Member, your_p: str, their_p: str):
-        """Trade: [p]fantasy trade @user 'Your Player' 'Their Player'"""
+    async def fantasy_freeagents(self, ctx):
+        """Browse and pick up available free agents."""
+        fa_locked = await self.config.guild(ctx.guild).fa_locked()
+        if fa_locked:
+            return await ctx.send("🔒 Free Agency is currently locked by the admins.")
+            
         rosters = await self.config.guild(ctx.guild).rosters()
-        s_id, r_id = str(ctx.author.id), str(member.id)
-        if s_id not in rosters or r_id not in rosters: return await ctx.send("Both must be in league.")
+        uid_str = str(ctx.author.id)
         
-        s_p = next((p for p in self.players_cache if (your_p.lower() in p['name'].lower() or your_p == str(p['id'])) and str(p['id']) in rosters[s_id]), None)
-        r_p = next((p for p in self.players_cache if (their_p.lower() in p['name'].lower() or their_p == str(p['id'])) and str(p['id']) in rosters[r_id]), None)
+        if uid_str not in rosters:
+            return await ctx.send("You haven't joined the league yet. Use `[p]fantasy join`.")
+            
+        if not self.players_cache:
+            if self.last_fetch_error:
+                return await ctx.send(f"❌ **Stats Error:** The bot could not fetch player stats.\n`{self.last_fetch_error}`\n\nThe bot owner can try `[p]fantasy update`.")
+            return await ctx.send("Player data is currently updating. Please try again later.")
+            
+        taken_ids = set()
+        for team_dict in rosters.values():
+            if isinstance(team_dict, dict):
+                taken_ids.update(int(pid) for pid in team_dict.keys())
+            elif isinstance(team_dict, list):
+                taken_ids.update(team_dict)
+            
+        available_players = [p for p in self.players_cache if p['id'] not in taken_ids]
         
-        if not s_p or not r_p: return await ctx.send("Player(s) not found on respective rosters.")
+        if not available_players:
+            return await ctx.send("No free agents available.")
+            
+        embed = discord.Embed(
+            title="Top Available Free Agents", 
+            description="Select a player from the dropdown to add to your team.\nPlayers are sorted by Total Season FP.", 
+            color=discord.Color.blue()
+        )
         
-        embed = discord.Embed(title="Trade Proposal", description=f"{ctx.author.mention} wants to trade **{s_p['name']}** for {member.mention}'s **{r_p['name']}**", color=0x00ff00)
-        await ctx.send(content=member.mention, embed=embed, view=TradeView(self, ctx.author, member, s_p, r_p))
+        for p in available_players[:10]:
+            embed.add_field(name=p['name'], value=f"{p['team']} | FP: {p['fp']} | PTS: {p['pts']}", inline=True)
+            
+        view = FreeAgentView(self, ctx, available_players)
+        msg = await ctx.send(embed=embed, view=view)
+        view.message = msg
 
-    @fantasy.command(name="search")
-    async def fantasy_search(self, ctx, *, query: str):
-        """Search players."""
-        ms = [p for p in self.players_cache if query.lower() in p['name'].lower()][:10]
-        if not ms: return await ctx.send("No matches.")
-        e = discord.Embed(title="Results", color=0x00ffff)
-        for p in ms: e.add_field(name=f"[{p['pos']}] {p['name']}", value=f"{p['team']} | FP: {p['fp']}", inline=False)
-        await ctx.send(embed=e)
+    @fantasy.command(name="standings")
+    async def fantasy_standings(self, ctx):
+        """View the league standings."""
+        rosters = await self.config.guild(ctx.guild).rosters()
+        
+        if not rosters:
+            return await ctx.send("No one has joined the league yet.")
+            
+        if not self.players_cache:
+            if self.last_fetch_error:
+                return await ctx.send(f"❌ **Stats Error:** The bot could not fetch player stats.\n`{self.last_fetch_error}`\n\nThe bot owner can try `[p]fantasy update`.")
+            return await ctx.send("Player data is currently updating. Please try again later.")
+            
+        scores = await self.config.guild(ctx.guild).scores()
+        leaderboard = []
+        
+        for uid_str, player_dict in rosters.items():
+            if isinstance(player_dict, list):
+                continue # Skip old corrupted data if it exists
+                
+            team_players = [p for p in self.players_cache if p['id'] in [int(pid) for pid in player_dict.keys()]]
+            current_roster_fp = sum(p['fp'] - player_dict.get(str(p['id']), p['fp']) for p in team_players)
+            
+            total_fp = scores.get(uid_str, 0.0) + current_roster_fp
+            
+            # Find best current player
+            best_player = None
+            if team_players:
+                best_player = max(team_players, key=lambda p: p['fp'] - player_dict.get(str(p['id']), p['fp']))
+                
+            leaderboard.append((uid_str, round(total_fp, 1), best_player, player_dict))
+            
+        leaderboard.sort(key=lambda x: x[1], reverse=True)
+        
+        embed = discord.Embed(title="🏆 NBA Fantasy Standings", color=discord.Color.gold())
+        
+        for idx, (uid_str, score, best_player, player_dict) in enumerate(leaderboard, 1):
+            user = ctx.guild.get_member(int(uid_str))
+            name = user.display_name if user else f"User {uid_str}"
+            
+            top_player_str = ""
+            if best_player:
+                earned_fp = best_player['fp'] - player_dict.get(str(best_player['id']), best_player['fp'])
+                top_player_str = f"\n*MVP: {best_player['name']} (+{round(earned_fp, 1)} FP)*"
+                
+            embed.add_field(name=f"{idx}. {name}", value=f"**{score}** Fantasy Points{top_player_str}", inline=False)
+            
+        await ctx.send(embed=embed)
+
+    @fantasy.command(name="lock")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def fantasy_lock(self, ctx):
+        """Lock free agency (Admin)."""
+        await self.config.guild(ctx.guild).fa_locked.set(True)
+        await ctx.send("🔒 Free Agency has been locked. Players can no longer be picked up.")
+
+    @fantasy.command(name="unlock")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def fantasy_unlock(self, ctx):
+        """Unlock free agency (Admin)."""
+        await self.config.guild(ctx.guild).fa_locked.set(False)
+        await ctx.send("🔓 Free Agency has been unlocked. Players can now be picked up.")
+
+    @fantasy.command(name="remove")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def fantasy_remove(self, ctx, member: discord.Member):
+        """Remove a user's team from the league (Admin)."""
+        uid_str = str(member.id)
+        
+        async with self.config.guild(ctx.guild).rosters() as rosters:
+            if uid_str in rosters:
+                del rosters[uid_str]
+                
+        async with self.config.guild(ctx.guild).scores() as scores:
+            if uid_str in scores:
+                del scores[uid_str]
+                
+        await ctx.send(f"🗑️ Successfully removed **{member.display_name}** from the fantasy league.")
+
+    @fantasy.command(name="reset")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def fantasy_reset(self, ctx):
+        """Reset the entire fantasy league (Admin)."""
+        await ctx.send("⚠️ Are you sure you want to completely wipe all rosters and scores for this server? Type `yes` to confirm.")
+        
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel
+
+        try:
+            msg = await self.bot.wait_for("message", check=check, timeout=30.0)
+        except asyncio.TimeoutError:
+            return await ctx.send("Reset cancelled due to timeout.")
+
+        if msg.content.lower() == "yes":
+            await self.config.guild(ctx.guild).rosters.set({})
+            await self.config.guild(ctx.guild).scores.set({})
+            await ctx.send("🔄 The fantasy league has been completely reset. All teams and scores are wiped.")
+        else:
+            await ctx.send("Reset cancelled.")
+
+    @fantasy.command(name="update")
+    @commands.is_owner()
+    async def fantasy_update(self, ctx):
+        """Force update the player stats cache (Bot Owner only)."""
+        msg = await ctx.send("🏀 Fetching latest stats... This can take 1-2 minutes. Please be patient.")
+        try:
+            await self._fetch_players()
+            await self.config.players_cache.set(self.players_cache)
+            self.last_fetch_error = None
+            await ctx.send(f"✅ Successfully updated stats for {len(self.players_cache)} players!")
+        except Exception as e:
+            self.last_fetch_error = str(e)
+            await ctx.send(f"❌ **Stats Error:** The connection failed.\n\n**Fix:** The bot will keep trying automatically every 5 minutes in the background.")
