@@ -8,30 +8,39 @@ import math
 
 VALID_SLOTS = {
     "PG": ["PG", "G", "UTIL"],
-    "SG": ["SG", "G", "UTIL"],
-    "SF": ["SF", "F", "UTIL"],
-    "PF": ["PF", "F", "UTIL"],
-    "C":  ["C", "UTIL"],
-    "G":  ["G", "UTIL"],
-    "F":  ["F", "UTIL"],
+    "SG": ["SG", "G", "UTIL", "SF"],
+    "SF": ["SF", "F", "UTIL", "SG", "PF"],
+    "PF": ["PF", "F", "UTIL", "SF", "C"],
+    "C":  ["C", "UTIL", "PF", "F"],
+    "G":  ["PG", "SG", "G", "UTIL"],
+    "F":  ["SF", "PF", "F", "UTIL", "C"],
     "UTIL": ["UTIL"]
 }
 
 def can_fit_roster(players, slots):
     if len(players) > len(slots): return False
+    
+    # Pre-calculate allowed slots for each player to avoid repeated lookups
+    player_requirements = []
+    for p in players:
+        pos = p.get('pos', 'UTIL')
+        # Handle ESPN's potentially grouped positions like "G" or "F"
+        allowed = set(VALID_SLOTS.get(pos, ["UTIL"]))
+        player_requirements.append(allowed)
+
     def solve(player_idx, available_slots):
         if player_idx == len(players): return True
-        p = players[player_idx]
-        pos = p.get('pos', 'UTIL')
-        allowed = VALID_SLOTS.get(pos, ["UTIL"])
+        
+        allowed_for_this_player = player_requirements[player_idx]
+        
         for i, slot in enumerate(available_slots):
-            if slot in allowed:
-                new_slots = available_slots.copy()
-                new_slots.pop(i)
-                if solve(player_idx + 1, new_slots):
+            if slot in allowed_for_this_player:
+                # Optimized recursion: pass a new list without the used slot
+                if solve(player_idx + 1, available_slots[:i] + available_slots[i+1:]):
                     return True
         return False
-    return solve(0, slots)
+        
+    return solve(0, list(slots))
 
 def assign_slots(players, slots):
     unassigned_players = list(players)
