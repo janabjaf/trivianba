@@ -527,8 +527,7 @@ class NBAFantasy(commands.Cog):
     @commands.group(name="fantasy", aliases=["nbafantasy", "nbaf"])
     async def fantasy(self, ctx):
         """Advanced NBA Fantasy League!"""
-        if ctx.invoked_subcommand is None:
-            await ctx.send_help(ctx.command)
+        pass
 
     @fantasy.command(name="guide")
     async def fantasy_guide(self, ctx):
@@ -584,6 +583,8 @@ class NBAFantasy(commands.Cog):
         """Set the required positional slots for a team.
         Example: [p]fantasy setslots PG SG SF PF C UTIL UTIL
         Valid options: PG, SG, SF, PF, C, G, F, UTIL"""
+        if not slots:
+            return await ctx.send_help(ctx.command)
         valid = set(VALID_SLOTS.keys())
         slots = [s.upper() for s in slots]
         for s in slots:
@@ -947,12 +948,14 @@ class NBAFantasy(commands.Cog):
     @fantasy.command(name="unlock")
     @commands.admin_or_permissions(manage_guild=True)
     async def fantasy_unlock(self, ctx):
+        """Unlock free agency so players can be picked up."""
         await self.config.guild(ctx.guild).fa_locked.set(False)
         await ctx.send("🔓 Free Agency unlocked.")
 
     @fantasy.command(name="remove")
     @commands.admin_or_permissions(manage_guild=True)
     async def fantasy_remove(self, ctx, member: discord.Member):
+        """Remove a member's team from the fantasy league."""
         uid_str = str(member.id)
         async with self.config.guild(ctx.guild).rosters() as rosters:
             if uid_str in rosters: del rosters[uid_str]
@@ -963,6 +966,7 @@ class NBAFantasy(commands.Cog):
     @fantasy.command(name="reset")
     @commands.admin_or_permissions(manage_guild=True)
     async def fantasy_reset(self, ctx):
+        """Reset the fantasy league completely (rosters, scores, drafts)."""
         await ctx.send("⚠️ Type `yes` to confirm complete reset.")
         def check(m): return m.author == ctx.author and m.channel == ctx.channel
         try:
@@ -980,6 +984,7 @@ class NBAFantasy(commands.Cog):
     @fantasy.command(name="update")
     @commands.is_owner()
     async def fantasy_update(self, ctx):
+        """Force an update of NBA player stats manually."""
         msg = await ctx.send("🏀 Fetching stats...")
         try:
             await self._fetch_players()
@@ -989,3 +994,85 @@ class NBAFantasy(commands.Cog):
         except Exception as e:
             self.last_fetch_error = str(e)
             await ctx.send(f"❌ Failed: {e}")
+
+    @fantasy.command(name="player")
+    async def fantasy_player(self, ctx, *, name: str):
+        """View a specific player's real-life stats and fantasy points."""
+        if not self.players_cache:
+            return await ctx.send("Player data is updating. Please try again later.")
+        
+        matches = [p for p in self.players_cache if name.lower() in p['name'].lower()]
+        if not matches:
+            return await ctx.send(f"No player found matching '{name}'.")
+            
+        scoring_system = await self.config.guild(ctx.guild).scoring_system()
+        player = matches[0]
+        fp = calculate_fp(player, scoring_system)
+        
+        status = " [OUT]" if player.get('out', False) else ""
+        embed = discord.Embed(title=f"{player['name']} ({player['pos']}){status}", description=f"Team: **{player['team']}**", color=discord.Color.blue())
+        embed.add_field(name="Fantasy Points (FP)", value=f"**{fp}**", inline=False)
+        embed.add_field(name="Points (PTS)", value=player['pts'], inline=True)
+        embed.add_field(name="Rebounds (REB)", value=player['reb'], inline=True)
+        embed.add_field(name="Assists (AST)", value=player['ast'], inline=True)
+        embed.add_field(name="Steals (STL)", value=player['stl'], inline=True)
+        embed.add_field(name="Blocks (BLK)", value=player['blk'], inline=True)
+        embed.add_field(name="Turnovers (TOV)", value=player['tov'], inline=True)
+        
+        await ctx.send(embed=embed)
+
+    @fantasy.command(name="forceadd")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def fantasy_forceadd(self, ctx, member: discord.Member, *, player_name: str):
+        """Admin command to force add a player to a member's roster."""
+        uid_str = str(member.id)
+        rosters = await self.config.guild(ctx.guild).rosters()
+        if uid_str not in rosters:
+            return await ctx.send("That member hasn't joined the fantasy league.")
+            
+        matches = [p for p in self.players_cache if player_name.lower() in p['name'].lower()]
+        if not matches:
+            return await ctx.send(f"No player found matching '{player_name}'.")
+            
+        player = matches[0]
+        player_id = str(player['id'])
+        
+        for team_dict in rosters.values():
+            if player_id in team_dict:
+                return await ctx.send(f"{player['name']} is already on another team!")
+                
+        scoring_system = await self.config.guild(ctx.guild).scoring_system()
+        async with self.config.guild(ctx.guild).rosters() as r:
+            r[uid_str][player_id] = calculate_fp(player, scoring_system)
+            
+        await ctx.send(f"✅ Successfully force-added **{player['name']}** to **{member.display_name}**'s roster.")
+
+    @fantasy.command(name="forcedrop")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def fantasy_forcedrop(self, ctx, member: discord.Member, *, player_name: str):
+        """Admin command to force drop a player from a member's roster."""
+        uid_str = str(member.id)
+        rosters = await self.config.guild(ctx.guild).rosters()
+        if uid_str not in rosters:
+            return await ctx.send("That member hasn't joined the fantasy league.")
+            
+        team_dict = rosters[uid_str]
+        team_pids = [int(pid) for pid in team_dict.keys()]
+        team_players = [p for p in self.players_cache if p['id'] in team_pids]
+        
+        matches = [p for p in team_players if player_name.lower() in p['name'].lower()]
+        if not matches:
+            return await ctx.send(f"No player found matching '{player_name}' on that roster.")
+            
+        player = matches[0]
+        player_id = str(player['id'])
+        
+        async with self.config.guild(ctx.guild).rosters() as r:
+            joined_fp = r[uid_str].pop(player_id)
+            scoring_system = await self.config.guild(ctx.guild).scoring_system()
+            earned_fp = calculate_fp(player, scoring_system) - joined_fp
+            
+            async with self.config.guild(ctx.guild).scores() as scores:
+                scores[uid_str] = scores.get(uid_str, 0.0) + earned_fp
+                
+        await ctx.send(f"✅ Successfully force-dropped **{player['name']}** from **{member.display_name}**'s roster. They kept their earned {round(earned_fp, 1)} FP.")
