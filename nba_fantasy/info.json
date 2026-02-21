@@ -1,0 +1,10 @@
+{
+    "author": ["jaffar21"],
+    "name": "NBAFantasy",
+    "short": "ESPN NBA Fantasy integration",
+    "description": "A fully featured cog for ESPN NBA Fantasy leagues. View standings, rosters, matchups, and more.",
+    "install_msg": "Thanks for installing the ESPN NBA Fantasy Cog! Use `[p]nba setleague` to configure your league.",
+    "tags": ["nba", "fantasy", "espn", "basketball"],
+    "requirements": ["espn-api"],
+    "min_bot_version": "3.5.22"
+}
