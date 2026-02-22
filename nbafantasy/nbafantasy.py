@@ -222,6 +222,40 @@ class PlayerListPagination(discord.ui.View):
             if self.message: await self.message.edit(view=self)
         except: pass
 
+class SlotSelectionView(discord.ui.View):
+    def __init__(self, cog, ctx, player, slots):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.ctx = ctx
+        self.player = player
+        
+        pos = player.get('pos', 'UTIL')
+        allowed_slots = set(VALID_SLOTS.get(pos, ["UTIL"]))
+        available_slots = list(set(slots).intersection(allowed_slots))
+        available_slots.append("BENCH")
+        
+        options = [discord.SelectOption(label=s, value=s) for s in available_slots]
+        select = discord.ui.Select(placeholder="Select a slot...", options=options, custom_id="slot_select")
+        select.callback = self.slot_callback
+        self.add_item(select)
+        
+    async def slot_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.ctx.author.id: return
+        slot = interaction.data['values'][0]
+        
+        async with self.cog.config.guild(self.ctx.guild).assignments() as assignments:
+            uid_str = str(self.ctx.author.id)
+            if uid_str not in assignments: assignments[uid_str] = {}
+            if slot == "BENCH":
+                if str(self.player['id']) in assignments[uid_str]:
+                    del assignments[uid_str][str(self.player['id'])]
+            else:
+                assignments[uid_str][str(self.player['id'])] = slot
+                
+        await interaction.response.send_message(f"Assigned **{self.player['name']}** to **{slot}**!\nRun `[p]fantasy team` again to see changes.", ephemeral=True)
+        for child in self.children: child.disabled = True
+        await interaction.message.edit(view=self)
+
 class TeamManagementView(discord.ui.View):
     def __init__(self, cog, ctx, team_players, rosters_dict, scoring_system, slots):
         super().__init__(timeout=120)
@@ -249,19 +283,19 @@ class TeamManagementView(discord.ui.View):
         select.callback = self.drop_callback
         self.add_item(select)
 
-        reassign_btn = discord.ui.Button(label="Reassign Roster Slots", style=discord.ButtonStyle.secondary, row=1)
-        reassign_btn.callback = self.reassign_callback
-        self.add_item(reassign_btn)
+        assign_options = [discord.SelectOption(label=f"{p['name']} ({p['pos']})", value=str(p['id'])) for p in team_players[:25]]
+        assign_select = discord.ui.Select(placeholder="Select a player to ASSIGN...", options=assign_options, custom_id="assign_select", row=1)
+        assign_select.callback = self.assign_callback
+        self.add_item(assign_select)
 
-    async def reassign_callback(self, interaction: discord.Interaction):
+    async def assign_callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.ctx.author.id: return await interaction.response.send_message("Not your menu.", ephemeral=True)
+        player_id = int(interaction.data['values'][0])
+        player = next((p for p in self.team_players if p['id'] == player_id), None)
+        if not player: return await interaction.response.send_message("Player not found.", ephemeral=True)
         
-        # This purely visual reassignment is handled by the assign_slots function 
-        # which is called every time [p]fantasy team is run.
-        # Since the bot already tries to fit players optimally into slots,
-        # "reassigning" just means refreshing the view to show the best fit.
-        
-        await interaction.response.send_message("Roster slots have been optimized based on your current players!", ephemeral=True)
+        view = SlotSelectionView(self.cog, self.ctx, player, self.slots)
+        await interaction.response.send_message(f"Select a slot for **{player['name']}**:", view=view, ephemeral=True)
 
     async def drop_callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.ctx.author.id: return await interaction.response.send_message("Not your menu.", ephemeral=True)
@@ -422,6 +456,7 @@ class NBAFantasy(commands.Cog):
             "is_active": False,
             "fa_locked": False,
             "rosters": {},
+            "assignments": {},
             "scores": {},
             "team_slots": ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL", "UTIL", "UTIL"],
             "scoring_system": {
@@ -474,6 +509,7 @@ class NBAFantasy(commands.Cog):
             players_data = []
             page = 1
             max_pages = 1
+            category_maps = {}
             
             while page <= max_pages:
                 try:
@@ -483,6 +519,10 @@ class NBAFantasy(commands.Cog):
                     
                     if page == 1 and "pagination" in data:
                         max_pages = data["pagination"].get("pages", 1)
+                        for cat in data.get("categories", []):
+                            cname = cat.get("name")
+                            names = cat.get("names", [])
+                            category_maps[cname] = {n: i for i, n in enumerate(names)}
                         
                     players_data.extend(data.get("athletes", []))
                     page += 1
@@ -491,10 +531,23 @@ class NBAFantasy(commands.Cog):
                     print(f"[NBAFantasy] ESPN API fetch failed on page {page}: {e}")
                     raise e
                     
-            return players_data
+            injuries_data = {}
+            try:
+                inj_response = self._session.get("http://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries", timeout=30)
+                inj_response.raise_for_status()
+                inj_json = inj_response.json()
+                for team_inj in inj_json.get("injuries", []):
+                    for inj in team_inj.get("injuries", []):
+                        athlete = inj.get("athlete", {})
+                        if "id" in athlete:
+                            injuries_data[int(athlete["id"])] = inj.get("status", "Out")
+            except Exception as e:
+                print(f"[NBAFantasy] ESPN Injuries fetch failed: {e}")
+                
+            return players_data, category_maps, injuries_data
             
         loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(None, fetch)
+        data, cat_maps, injuries = await loop.run_in_executor(None, fetch)
         
         cached = []
         for p in data:
@@ -511,35 +564,33 @@ class NBAFantasy(commands.Cog):
             pos_data = athlete.get("position", {})
             pos = pos_data.get("abbreviation", "UTIL")
             
-            # Map general G/F to more specific positions if possible, or keep as is
-            # ESPN usually provides PG, SG, SF, PF, C. If it gives G or F, we'll map them
-            # to their most flexible equivalent in our VALID_SLOTS.
-            
-            # Check for injury status
-            status_data = athlete.get("status", {})
-            status_type = status_data.get("type", "active").lower()
-            status_detail = status_data.get("abbreviation", "").upper()
-            
-            # Show specific status like OUT, SUSP, DTD
-            is_out = status_type in ["out", "day-to-day", "injured", "suspended"]
-            display_status = status_detail if status_detail and status_type != "active" else ""
+            is_out = False
+            display_status = ""
+            if player_id in injuries:
+                is_out = True
+                display_status = injuries[player_id].upper()
+            else:
+                status_data = athlete.get("status", {})
+                status_type = status_data.get("type", "active").lower()
+                status_detail = status_data.get("abbreviation", "").upper()
+                is_out = status_type in ["out", "day-to-day", "injured", "suspended"]
+                if is_out:
+                    display_status = status_detail if status_detail else "OUT"
             
             categories = p.get("categories", [])
             pts = reb = ast = stl = blk = tov = 0.0
             
             for cat in categories:
                 cat_name = cat.get("name")
-                names = cat.get("names", [])
                 values = cat.get("values", [])
+                cmap = cat_maps.get(cat_name, {})
                 
-                if cat_name == "offensive":
-                    if "points" in names: pts = float(values[names.index("points")])
-                    if "rebounds" in names: reb = float(values[names.index("rebounds")])
-                    if "assists" in names: ast = float(values[names.index("assists")])
-                    if "turnovers" in names: tov = float(values[names.index("turnovers")])
-                elif cat_name == "defensive":
-                    if "steals" in names: stl = float(values[names.index("steals")])
-                    if "blocks" in names: blk = float(values[names.index("blocks")])
+                if "points" in cmap and len(values) > cmap["points"]: pts = float(values[cmap["points"]])
+                if "rebounds" in cmap and len(values) > cmap["rebounds"]: reb = float(values[cmap["rebounds"]])
+                if "assists" in cmap and len(values) > cmap["assists"]: ast = float(values[cmap["assists"]])
+                if "turnovers" in cmap and len(values) > cmap["turnovers"]: tov = float(values[cmap["turnovers"]])
+                if "steals" in cmap and len(values) > cmap["steals"]: stl = float(values[cmap["steals"]])
+                if "blocks" in cmap and len(values) > cmap["blocks"]: blk = float(values[cmap["blocks"]])
                     
             pts = max(0, pts)
             reb = max(0, reb)
@@ -694,9 +745,43 @@ class NBAFantasy(commands.Cog):
             return await ctx.send(embed=embed)
             
         current_roster_fp = 0
-        assigned = assign_slots(team_players, slots)
         
-        for slot, p in assigned:
+        assignments = await self.config.guild(ctx.guild).assignments()
+        user_assignments = assignments.get(uid_str, {})
+        
+        from collections import Counter
+        slot_counts = Counter(slots)
+        
+        assigned_display = []
+        bench_display = []
+        assigned_players = set()
+        
+        for p in team_players:
+            pid_str = str(p['id'])
+            if pid_str in user_assignments:
+                slot = user_assignments[pid_str]
+                if slot_counts[slot] > 0:
+                    assigned_display.append((slot, p))
+                    slot_counts[slot] -= 1
+                    assigned_players.add(pid_str)
+                    
+        for p in team_players:
+            pid_str = str(p['id'])
+            if pid_str not in assigned_players:
+                bench_display.append(("BENCH", p))
+                
+        for slot, count in slot_counts.items():
+            for _ in range(count):
+                assigned_display.append((slot, None))
+                
+        def slot_order(s):
+            order = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"]
+            return order.index(s[0]) if s[0] in order else 99
+            
+        assigned_display.sort(key=slot_order)
+        final_display = assigned_display + bench_display
+        
+        for slot, p in final_display:
             if p:
                 joined_fp = player_dict.get(str(p['id']), calculate_fp(p, scoring_system))
                 earned_fp = calculate_fp(p, scoring_system) - joined_fp
@@ -714,13 +799,61 @@ class NBAFantasy(commands.Cog):
         total_team_fp = accumulated_fp + current_roster_fp
         
         if target == ctx.author:
-            embed.description = f"**Total Team FP:** {round(total_team_fp, 1)}\n*Use the dropdown below to drop a player or reassign slots.*"
+            embed.description = f"**Total Team FP:** {round(total_team_fp, 1)}\n*Use the dropdowns below to manage your roster.*"
             view = TeamManagementView(self, ctx, team_players, player_dict, scoring_system, slots)
             msg = await ctx.send(embed=embed, view=view)
             view.message = msg
         else:
             embed.description = f"**Total Team FP:** {round(total_team_fp, 1)}"
             await ctx.send(embed=embed)
+
+    @fantasy.command(name="assign")
+    async def fantasy_assign(self, ctx, slot: str, *, player_name: str):
+        """Manually assign a player to a specific roster slot.
+        Example: [p]fantasy assign PG Luka Doncic
+        Use BENCH as the slot to unassign a player."""
+        slot = slot.upper()
+        uid_str = str(ctx.author.id)
+        
+        rosters = await self.config.guild(ctx.guild).rosters()
+        if uid_str not in rosters or not rosters[uid_str]:
+            return await ctx.send("You don't have any players on your team.")
+            
+        player_dict = rosters[uid_str]
+        if isinstance(player_dict, list):
+            return await ctx.send("Your roster is in an invalid state. Please contact an admin.")
+            
+        player_ids = [int(pid) for pid in player_dict.keys()]
+        team_players = [p for p in self.players_cache if p['id'] in player_ids]
+        
+        # Find player by name
+        player = None
+        for p in team_players:
+            if player_name.lower() in p['name'].lower():
+                player = p
+                break
+                
+        if not player:
+            return await ctx.send(f"Could not find a player matching '{player_name}' on your roster.")
+            
+        slots = await self.config.guild(ctx.guild).team_slots()
+        pos = player.get('pos', 'UTIL')
+        allowed_slots = set(VALID_SLOTS.get(pos, ["UTIL"]))
+        available_slots = list(set(slots).intersection(allowed_slots))
+        available_slots.append("BENCH")
+        
+        if slot not in available_slots:
+            return await ctx.send(f"Invalid slot '{slot}' for {player['name']} ({pos}). Valid slots are: {', '.join(available_slots)}")
+            
+        async with self.config.guild(ctx.guild).assignments() as assignments:
+            if uid_str not in assignments: assignments[uid_str] = {}
+            if slot == "BENCH":
+                if str(player['id']) in assignments[uid_str]:
+                    del assignments[uid_str][str(player['id'])]
+            else:
+                assignments[uid_str][str(player['id'])] = slot
+                
+        await ctx.send(f"✅ Assigned **{player['name']}** to **{slot}**!")
 
     @fantasy.group(name="draft")
     async def fantasy_draft(self, ctx):
