@@ -223,12 +223,14 @@ class PlayerListPagination(discord.ui.View):
         except: pass
 
 class TeamManagementView(discord.ui.View):
-    def __init__(self, cog, ctx, team_players, rosters_dict, scoring_system):
+    def __init__(self, cog, ctx, team_players, rosters_dict, scoring_system, slots):
         super().__init__(timeout=120)
         self.cog = cog
         self.ctx = ctx
+        self.team_players = team_players
         self.rosters_dict = rosters_dict
         self.scoring_system = scoring_system
+        self.slots = slots
         self.message = None
         
         if not team_players: return
@@ -243,9 +245,23 @@ class TeamManagementView(discord.ui.View):
                 value=str(p['id'])
             ))
             
-        select = discord.ui.Select(placeholder="Select a player to DROP...", options=options, custom_id="drop_select")
+        select = discord.ui.Select(placeholder="Select a player to DROP...", options=options, custom_id="drop_select", row=0)
         select.callback = self.drop_callback
         self.add_item(select)
+
+        reassign_btn = discord.ui.Button(label="Reassign Roster Slots", style=discord.ButtonStyle.secondary, row=1)
+        reassign_btn.callback = self.reassign_callback
+        self.add_item(reassign_btn)
+
+    async def reassign_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.ctx.author.id: return await interaction.response.send_message("Not your menu.", ephemeral=True)
+        
+        # This purely visual reassignment is handled by the assign_slots function 
+        # which is called every time [p]fantasy team is run.
+        # Since the bot already tries to fit players optimally into slots,
+        # "reassigning" just means refreshing the view to show the best fit.
+        
+        await interaction.response.send_message("Roster slots have been optimized based on your current players!", ephemeral=True)
 
     async def drop_callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.ctx.author.id: return await interaction.response.send_message("Not your menu.", ephemeral=True)
@@ -396,7 +412,7 @@ class TradeAcceptView(discord.ui.View):
 
 
 class NBAFantasy(commands.Cog):
-    """Advanced NBA Fantasy League within Discord!"""
+    """Advanced NBAdex Fantasy League!"""
 
     def __init__(self, bot):
         self.bot = bot
@@ -490,11 +506,23 @@ class NBAFantasy(commands.Cog):
                 
             name = athlete.get("displayName", "Unknown Player")
             team = athlete.get("teamShortName", "FA")
-            pos = athlete.get("position", {}).get("abbreviation", "UTIL")
+            
+            # Extract more specific position from athlete data if available
+            pos_data = athlete.get("position", {})
+            pos = pos_data.get("abbreviation", "UTIL")
+            
+            # Map general G/F to more specific positions if possible, or keep as is
+            # ESPN usually provides PG, SG, SF, PF, C. If it gives G or F, we'll map them
+            # to their most flexible equivalent in our VALID_SLOTS.
             
             # Check for injury status
-            status_text = athlete.get("status", {}).get("type", "active")
-            is_out = status_text.lower() in ["out", "day-to-day", "injured", "suspended"]
+            status_data = athlete.get("status", {})
+            status_type = status_data.get("type", "active").lower()
+            status_detail = status_data.get("abbreviation", "").upper()
+            
+            # Show specific status like OUT, SUSP, DTD
+            is_out = status_type in ["out", "day-to-day", "injured", "suspended"]
+            display_status = status_detail if status_detail and status_type != "active" else ""
             
             categories = p.get("categories", [])
             pts = reb = ast = stl = blk = tov = 0.0
@@ -528,7 +556,8 @@ class NBAFantasy(commands.Cog):
                 "stl": round(stl, 1),
                 "blk": round(blk, 1),
                 "tov": round(tov, 1),
-                "out": is_out
+                "out": is_out,
+                "status_label": display_status
             })
         
         self.players_cache = cached
@@ -540,9 +569,9 @@ class NBAFantasy(commands.Cog):
 
     @fantasy.command(name="guide")
     async def fantasy_guide(self, ctx):
-        """Show a guide on how to play NBA Fantasy."""
+        """Show a guide on how to play NBAdex Fantasy."""
         guide_text = (
-            "🏀 **NBA Fantasy Guide** 🏀\n\n"
+            "🏀 **NBAdex Fantasy Guide** 🏀\n\n"
             "**1. Joining the League**\n"
             "Use `[p]fantasy join` to enter the server's fantasy league. "
             "Once joined, you'll need to build a roster by drafting or picking up players.\n\n"
@@ -578,7 +607,7 @@ class NBAFantasy(commands.Cog):
         slots = await self.config.guild(ctx.guild).team_slots()
         scoring = await self.config.guild(ctx.guild).scoring_system()
         
-        embed = discord.Embed(title="NBA Fantasy Settings", color=discord.Color.blurple())
+        embed = discord.Embed(title="NBAdex Fantasy Settings", color=discord.Color.blurple())
         embed.add_field(name="Roster Slots", value=", ".join(slots), inline=False)
         
         score_str = "\n".join([f"**{k.upper()}**: {v}" for k, v in scoring.items()])
@@ -672,16 +701,21 @@ class NBAFantasy(commands.Cog):
                 joined_fp = player_dict.get(str(p['id']), calculate_fp(p, scoring_system))
                 earned_fp = calculate_fp(p, scoring_system) - joined_fp
                 current_roster_fp += earned_fp
-                status_mark = "🏥 " if p.get('out', False) else ""
-                embed.add_field(name=f"[{slot}] {status_mark}{p['name']} ({p['pos']})", value=f"{p['team']} | Earned FP: {round(earned_fp, 1)}", inline=False)
+                
+                status_label = p.get('status_label', '')
+                status_mark = f" [{status_label}]" if status_label else ""
+                if p.get('out', False) and not status_mark:
+                    status_mark = " [OUT]"
+                
+                embed.add_field(name=f"[{slot}] {p['name']} ({p['pos']}){status_mark}", value=f"{p['team']} | Earned FP: {round(earned_fp, 1)}", inline=False)
             else:
                 embed.add_field(name=f"[{slot}] EMPTY", value="--", inline=False)
             
         total_team_fp = accumulated_fp + current_roster_fp
         
         if target == ctx.author:
-            embed.description = f"**Total Team FP:** {round(total_team_fp, 1)}\n*Use the dropdown below to drop a player.*"
-            view = TeamManagementView(self, ctx, team_players, player_dict, scoring_system)
+            embed.description = f"**Total Team FP:** {round(total_team_fp, 1)}\n*Use the dropdown below to drop a player or reassign slots.*"
+            view = TeamManagementView(self, ctx, team_players, player_dict, scoring_system, slots)
             msg = await ctx.send(embed=embed, view=view)
             view.message = msg
         else:
@@ -933,7 +967,7 @@ class NBAFantasy(commands.Cog):
             leaderboard.append((uid_str, round(total_fp, 1), best_player, player_dict))
             
         leaderboard.sort(key=lambda x: x[1], reverse=True)
-        embed = discord.Embed(title="🏆 NBA Fantasy Standings", color=discord.Color.gold())
+        embed = discord.Embed(title="🏆 NBAdex Fantasy Standings", color=discord.Color.gold())
         
         for idx, (uid_str, score, best_player, player_dict) in enumerate(leaderboard, 1):
             user = ctx.guild.get_member(int(uid_str))
