@@ -152,8 +152,12 @@ class PlayerListPagination(discord.ui.View):
             for p in page_players:
                 fp = calculate_fp(p, self.scoring_system)
                 status_emoji = "🏥" if p.get('out', False) else "🏀"
+                status_label = p.get('status_label', '')
+                status_mark = f" [{status_label}]" if status_label else ""
+                if p.get('out', False) and not status_mark:
+                    status_mark = " [OUT]"
                 options.append(discord.SelectOption(
-                    label=f"{p['name']} ({p['pos']})",
+                    label=f"{p['name']} ({p['pos']}){status_mark}",
                     description=f"{status_emoji} {p['team']} | FP: {fp} | PTS: {p['pts']}",
                     value=str(p['id'])
                 ))
@@ -177,8 +181,11 @@ class PlayerListPagination(discord.ui.View):
         page_players = filtered[self.current_page * 25:(self.current_page + 1) * 25]
         for p in page_players[:10]:
             fp = calculate_fp(p, self.scoring_system)
-            status = " [OUT]" if p.get('out', False) else ""
-            embed.add_field(name=f"{p['name']} ({p['pos']}){status}", value=f"{p['team']} | FP: {fp} | PTS: {p['pts']} REB: {p['reb']} AST: {p['ast']}", inline=True)
+            status_label = p.get('status_label', '')
+            status_mark = f" [{status_label}]" if status_label else ""
+            if p.get('out', False) and not status_mark:
+                status_mark = " [OUT]"
+            embed.add_field(name=f"{p['name']} ({p['pos']}){status_mark}", value=f"{p['team']} | FP: {fp} | PTS: {p['pts']} REB: {p['reb']} AST: {p['ast']}", inline=True)
             
         embed.set_footer(text=f"Page {self.current_page + 1}/{max_pages} | Search: {self.search_query or 'None'}")
         
