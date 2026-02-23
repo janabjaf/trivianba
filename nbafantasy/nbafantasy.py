@@ -831,15 +831,15 @@ class NBAFantasy(commands.Cog):
             embed.description = f"**Total Team FP:** {round(total_team_fp, 1)}"
             await ctx.send(embed=embed)
 
-    @fantasy.group(name="settings")
-    @checks.admin_or_permissions(manage_guild=True)
-    async def fantasy_settings(self, ctx):
-        """Admin settings for NBA Fantasy."""
+    @fantasy.group(name="config")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def fantasy_config(self, ctx):
+        """Admin config for NBA Fantasy."""
         if ctx.invoked_subcommand is None:
             await ctx.send_help(ctx.command)
 
-    @fantasy_settings.command(name="channel")
-    async def fantasy_settings_channel(self, ctx, channel: discord.TextChannel = None):
+    @fantasy_config.command(name="channel")
+    async def fantasy_config_channel(self, ctx, channel: discord.TextChannel = None):
         """Set the channel for transaction logs (drops, adds, trades).
         Pass no channel to disable logging."""
         if channel:
