@@ -568,10 +568,41 @@ class NBAFantasy(commands.Cog):
             except Exception as e:
                 print(f"[NBAFantasy] ESPN Injuries fetch failed: {e}")
                 
-            return players_data, category_maps, injuries_data
+            today_stats = {}
+            try:
+                sb_resp = self._session.get("http://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard", timeout=30)
+                if sb_resp.status_code == 200:
+                    sb_data = sb_resp.json()
+                    events = [e["id"] for e in sb_data.get("events", []) if e.get("status", {}).get("type", {}).get("state") in ["in", "post"]]
+                    for gid in events:
+                        sum_resp = self._session.get(f"http://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event={gid}", timeout=30)
+                        if sum_resp.status_code == 200:
+                            sum_data = sum_resp.json()
+                            for team in sum_data.get("boxscore", {}).get("players", []):
+                                for stat_group in team.get("statistics", []):
+                                    labels = stat_group.get("labels", [])
+                                    for p in stat_group.get("athletes", []):
+                                        if not p.get("stats"): continue
+                                        stats = p.get("stats", [])
+                                        pid = int(p["athlete"]["id"])
+                                        if pid not in today_stats:
+                                            today_stats[pid] = {"pts": 0, "reb": 0, "ast": 0, "stl": 0, "blk": 0, "tov": 0}
+                                        try:
+                                            if "PTS" in labels: today_stats[pid]["pts"] = float(stats[labels.index("PTS")])
+                                            if "REB" in labels: today_stats[pid]["reb"] = float(stats[labels.index("REB")])
+                                            if "AST" in labels: today_stats[pid]["ast"] = float(stats[labels.index("AST")])
+                                            if "STL" in labels: today_stats[pid]["stl"] = float(stats[labels.index("STL")])
+                                            if "BLK" in labels: today_stats[pid]["blk"] = float(stats[labels.index("BLK")])
+                                            if "TO" in labels: today_stats[pid]["tov"] = float(stats[labels.index("TO")])
+                                        except (ValueError, IndexError):
+                                            pass
+            except Exception as e:
+                print(f"[NBAFantasy] ESPN Live Stats fetch failed: {e}")
+                
+            return players_data, category_maps, injuries_data, today_stats
             
         loop = asyncio.get_running_loop()
-        data, cat_maps, injuries = await loop.run_in_executor(None, fetch)
+        data, cat_maps, injuries, today_stats = await loop.run_in_executor(None, fetch)
         
         cached = []
         for p in data:
@@ -616,9 +647,12 @@ class NBAFantasy(commands.Cog):
                 if "steals" in cmap and len(values) > cmap["steals"]: stl = float(values[cmap["steals"]])
                 if "blocks" in cmap and len(values) > cmap["blocks"]: blk = float(values[cmap["blocks"]])
                     
-            pts = max(0, pts)
-            reb = max(0, reb)
-            ast = max(0, ast)
+            pts = max(0, pts + today_stats.get(player_id, {}).get("pts", 0))
+            reb = max(0, reb + today_stats.get(player_id, {}).get("reb", 0))
+            ast = max(0, ast + today_stats.get(player_id, {}).get("ast", 0))
+            stl = max(0, stl + today_stats.get(player_id, {}).get("stl", 0))
+            blk = max(0, blk + today_stats.get(player_id, {}).get("blk", 0))
+            tov = max(0, tov + today_stats.get(player_id, {}).get("tov", 0))
             
             cached.append({
                 "id": player_id,
