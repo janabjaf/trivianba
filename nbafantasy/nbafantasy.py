@@ -317,7 +317,15 @@ class TeamManagementView(discord.ui.View):
                     earned_fp = calculate_fp(player, self.scoring_system) - joined_fp
                     async with self.cog.config.guild(self.ctx.guild).scores() as scores:
                         scores[uid_str] = scores.get(uid_str, 0.0) + earned_fp
-                await interaction.response.send_message("Player dropped successfully.", ephemeral=True)
+                    
+                    # Log Drop
+                    log_embed = discord.Embed(title="Transaction: Player Dropped", color=discord.Color.red())
+                    log_embed.add_field(name="User", value=self.ctx.author.mention, inline=True)
+                    log_embed.add_field(name="Player", value=f"{player['name']} ({player['pos']})", inline=True)
+                    log_embed.add_field(name="Earned FP", value=str(round(earned_fp, 1)), inline=True)
+                    await self.cog.log_transaction(self.ctx.guild, log_embed)
+
+                await interaction.response.send_message(f"Dropped **{player['name']}** if they were on your roster.", ephemeral=True)
                 for child in self.children: child.disabled = True
                 await interaction.message.edit(view=self)
             else:
@@ -437,8 +445,16 @@ class TradeAcceptView(discord.ui.View):
                     scores[p_uid] = scores.get(p_uid, 0.0) + p_earned
                     scores[t_uid] = scores.get(t_uid, 0.0) + t_earned
                     
-            r[p_uid][str(self.receive_id)] = calculate_fp(receive_player, scoring_system)
-            r[t_uid][str(self.give_id)] = calculate_fp(give_player, scoring_system)
+            r[p_uid][str(self.receive_id)] = calculate_fp(receive_player, self.cog.scoring_system)
+            r[t_uid][str(self.give_id)] = calculate_fp(give_player, self.cog.scoring_system)
+            
+            # Log Trade
+            log_embed = discord.Embed(title="Transaction: Trade Accepted", color=discord.Color.gold())
+            log_embed.add_field(name="Proposer", value=self.proposer.mention, inline=True)
+            log_embed.add_field(name="Target", value=self.target.mention, inline=True)
+            log_embed.add_field(name=f"{self.proposer.display_name} Received", value=f"{receive_player['name']} ({receive_player['pos']})", inline=False)
+            log_embed.add_field(name=f"{self.target.display_name} Received", value=f"{give_player['name']} ({give_player['pos']})", inline=False)
+            await self.cog.log_transaction(guild, log_embed)
             
         for child in self.children: child.disabled = True
         await interaction.message.edit(content="✅ Trade Accepted and Processed!", view=self)
@@ -466,6 +482,7 @@ class NBAFantasy(commands.Cog):
             "assignments": {},
             "scores": {},
             "team_slots": ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL", "UTIL", "UTIL"],
+            "transaction_channel": None,
             "scoring_system": {
                 "pts": 1.0, "reb": 1.2, "ast": 1.5, "stl": 3.0, "blk": 3.0, "tov": -1.0
             },
@@ -498,7 +515,7 @@ class NBAFantasy(commands.Cog):
                 await self._fetch_players()
                 await self.config.players_cache.set(self.players_cache)
                 self.last_fetch_error = None
-                await asyncio.sleep(43200) # 12 hours
+                await asyncio.sleep(3600) # 1 hour
             except Exception as e:
                 self.last_fetch_error = str(e)
                 print(f"[NBAFantasy] Error fetching NBA stats: {e}")
@@ -814,6 +831,34 @@ class NBAFantasy(commands.Cog):
             embed.description = f"**Total Team FP:** {round(total_team_fp, 1)}"
             await ctx.send(embed=embed)
 
+    @fantasy.group(name="settings")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def fantasy_settings(self, ctx):
+        """Admin settings for NBA Fantasy."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help(ctx.command)
+
+    @fantasy_settings.command(name="channel")
+    async def fantasy_settings_channel(self, ctx, channel: discord.TextChannel = None):
+        """Set the channel for transaction logs (drops, adds, trades).
+        Pass no channel to disable logging."""
+        if channel:
+            await self.config.guild(ctx.guild).transaction_channel.set(channel.id)
+            await ctx.send(f"✅ Transaction logs will now be sent to {channel.mention}")
+        else:
+            await self.config.guild(ctx.guild).transaction_channel.set(None)
+            await ctx.send("❌ Transaction logging disabled.")
+
+    async def log_transaction(self, guild, embed):
+        chan_id = await self.config.guild(guild).transaction_channel()
+        if not chan_id: return
+        channel = guild.get_channel(chan_id)
+        if channel:
+            try:
+                await channel.send(embed=embed)
+            except:
+                pass
+
     @fantasy.command(name="assign")
     async def fantasy_assign(self, ctx, slot: str, *, player_name: str):
         """Manually assign a player to a specific roster slot.
@@ -1021,6 +1066,13 @@ class NBAFantasy(commands.Cog):
                 
             rosters[uid_str][str(player_id)] = calculate_fp(player, scoring_system)
             
+            # Log FA Pickup
+            log_embed = discord.Embed(title="Transaction: Free Agency Pickup", color=discord.Color.green())
+            log_embed.add_field(name="User", value=interaction.user.mention, inline=True)
+            log_embed.add_field(name="Player", value=f"{player['name']} ({player['pos']})", inline=True)
+            log_embed.add_field(name="Team", value=player['team'], inline=True)
+            await self.log_transaction(interaction.guild, log_embed)
+            
             await interaction.response.send_message(f"**{player['name']}** added successfully!", ephemeral=True)
             for child in view.children: child.disabled = True
             if not interaction.response.is_done():
@@ -1060,7 +1112,14 @@ class NBAFantasy(commands.Cog):
             async with self.config.guild(interaction.guild).rosters() as r:
                 if uid_str not in r: r[uid_str] = {}
                 r[uid_str][str(player_id)] = calculate_fp(player, scoring_system)
-                
+            
+            # Log Draft Pick
+            log_embed = discord.Embed(title="Transaction: Draft Pick", color=discord.Color.blue())
+            log_embed.add_field(name="User", value=interaction.user.mention, inline=True)
+            log_embed.add_field(name="Player", value=f"{player['name']} ({player['pos']})", inline=True)
+            log_embed.add_field(name="Pick #", value=str(current_pick + 1), inline=True)
+            await self.cog.log_transaction(interaction.guild, log_embed)
+            
             draft_state['picks'].append({
                 "pick_number": current_pick + 1,
                 "user_id": uid_str,
