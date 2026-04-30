@@ -876,7 +876,7 @@ class MediaCaption(commands.Cog):
         """Add an iFunny-style white caption bar with black text on top.
 
         Examples:
-          `[p]media caption Uno hana`
+          `[p]media caption pov: monday morning`
           `[p]media caption when bro forgets the prefix`
         """
         text = text.strip().strip('"').strip("'")
