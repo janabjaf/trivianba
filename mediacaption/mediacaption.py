@@ -727,7 +727,14 @@ class MediaCaption(commands.Cog):
             with open(out_path, "rb") as f:
                 return f.read(), "mp4"
 
-    async def _video_to_gif(self, data: bytes) -> Tuple[bytes, str]:
+    async def _video_to_gif_once(
+        self,
+        data: bytes,
+        width: int,
+        fps: int,
+        max_duration: Optional[float],
+    ) -> bytes:
+        """Encode one GIF attempt at the given width / fps / duration cap."""
         self._require_ffmpeg()
         with tempfile.TemporaryDirectory() as tmp:
             in_path = os.path.join(tmp, "in.mp4")
@@ -735,28 +742,82 @@ class MediaCaption(commands.Cog):
             out_path = os.path.join(tmp, "out.gif")
             with open(in_path, "wb") as f:
                 f.write(data)
+            duration_args: List[str] = (
+                ["-t", f"{max_duration:.2f}"] if max_duration else []
+            )
+            vf = (
+                f"fps={fps},scale={width}:-1:flags=lanczos"
+            )
             await self._run_ffmpeg(
                 [
+                    *duration_args,
                     "-i",
                     in_path,
                     "-vf",
-                    "fps=15,scale=480:-1:flags=lanczos,palettegen",
+                    f"{vf},palettegen=stats_mode=diff",
                     palette,
                 ]
             )
             await self._run_ffmpeg(
                 [
+                    *duration_args,
                     "-i",
                     in_path,
                     "-i",
                     palette,
                     "-lavfi",
-                    "fps=15,scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse",
+                    f"{vf}[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5",
                     out_path,
                 ]
             )
             with open(out_path, "rb") as f:
-                return f.read(), "gif"
+                return f.read()
+
+    async def _video_to_gif(
+        self, data: bytes, target_bytes: int
+    ) -> Tuple[bytes, str]:
+        """Adaptive video -> GIF that tries to fit within ``target_bytes``."""
+        # (width, fps, max_duration_seconds_or_None) — progressively smaller
+        presets: List[Tuple[int, int, Optional[float]]] = [
+            (480, 15, None),
+            (480, 12, None),
+            (420, 12, None),
+            (360, 12, None),
+            (320, 12, None),
+            (320, 10, None),
+            (320, 10, 20.0),
+            (280, 10, 15.0),
+            (240, 10, 12.0),
+            (240, 8, 10.0),
+            (200, 8, 8.0),
+            (180, 6, 6.0),
+        ]
+        last_out: bytes = b""
+        for width, fps, max_dur in presets:
+            out = await self._video_to_gif_once(data, width, fps, max_dur)
+            last_out = out
+            if len(out) <= target_bytes:
+                return out, "gif"
+        # Couldn't get under the limit - return smallest attempt anyway
+        return last_out, "gif"
+
+    async def _image_to_gif(self, data: bytes) -> Tuple[bytes, str]:
+        """Wrap a still image as a single-frame GIF."""
+        loop = asyncio.get_running_loop()
+
+        def _encode() -> bytes:
+            img = self._open_image(data)
+            if getattr(img, "is_animated", False):
+                # Already animated - re-save as GIF preserving frames
+                buf = io.BytesIO()
+                img.save(buf, format="GIF", save_all=True)
+                return buf.getvalue()
+            buf = io.BytesIO()
+            img.convert("RGBA").save(buf, format="GIF")
+            return buf.getvalue()
+
+        out = await loop.run_in_executor(None, _encode)
+        return out, "gif"
 
     async def _gif_to_mp4(self, data: bytes) -> Tuple[bytes, str]:
         self._require_ffmpeg()
@@ -820,18 +881,20 @@ class MediaCaption(commands.Cog):
                 )
         await self._send_result(ctx, out, ext)
 
+    @staticmethod
+    def _upload_limit(ctx: commands.Context) -> int:
+        """Best-effort current channel/guild upload size limit, in bytes."""
+        try:
+            if ctx.guild is not None:
+                return int(ctx.guild.filesize_limit)
+        except AttributeError:
+            pass
+        return MAX_OUTPUT_BYTES
+
     async def _send_result(
         self, ctx: commands.Context, data: bytes, ext: str
     ) -> None:
-        if len(data) > MAX_OUTPUT_BYTES:
-            raise MediaError(
-                f"Result is too big to upload ({len(data) / 1024 / 1024:.1f} MB)."
-            )
-        # Respect the channel's actual upload limit when we can read it
-        try:
-            limit = ctx.guild.filesize_limit if ctx.guild else MAX_OUTPUT_BYTES
-        except AttributeError:
-            limit = MAX_OUTPUT_BYTES
+        limit = self._upload_limit(ctx)
         if len(data) > limit:
             raise MediaError(
                 f"Result is {len(data) / 1024 / 1024:.1f} MB but this server "
@@ -1115,12 +1178,26 @@ class MediaCaption(commands.Cog):
 
     @media.command(name="togif")
     async def media_togif(self, ctx: commands.Context) -> None:
-        """Convert a video to a GIF."""
+        """Convert an image, GIF or video to a GIF.
+
+        For videos the cog automatically scales the output down until it
+        fits this server's upload limit.
+        """
         data, ct, _ = await self._find_media(ctx)
-        if not self._is_video(ct, data):
-            raise MediaError("That isn't a video.")
         async with ctx.typing():
-            out, ext = await self._video_to_gif(data)
+            if self._is_video(ct, data):
+                target = self._upload_limit(ctx)
+                # Leave a small safety margin so Discord's own overhead
+                # doesn't push us over the line.
+                margin = max(256 * 1024, int(target * 0.03))
+                out, ext = await self._video_to_gif(
+                    data, target_bytes=target - margin
+                )
+            elif self._is_gif(ct, data):
+                # Already a GIF - hand it back as-is
+                out, ext = data, "gif"
+            else:
+                out, ext = await self._image_to_gif(data)
         await self._send_result(ctx, out, ext)
 
     @media.command(name="tomp4", aliases=["togifv"])
