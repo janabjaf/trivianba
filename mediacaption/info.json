@@ -1,0 +1,15 @@
+{
+  "author": ["jaffar21"],
+  "install_msg": "Thanks for installing **MediaCaption**!\n\nQuick start:\n• `[p]media caption Uno hana` (reply to or attach an image / GIF / video)\n• `[p]media meme top text | bottom text`\n• `[p]media speechbubble`, `[p]media deepfry`, `[p]media jpeg`, `[p]media invert`, `[p]media grayscale`, `[p]media blur`, `[p]media pixelate`, `[p]media rotate`, `[p]media flip`, `[p]media flop`, `[p]media reverse`, `[p]media speed`, `[p]media togif`, `[p]media tomp4`, `[p]media info`\n\n`ffmpeg` is bundled automatically (via `imageio-ffmpeg`) — no extra setup needed.\nRun `[p]help media` for the full list.",
+  "name": "MediaCaption",
+  "short": "Caption and edit images, GIFs, and videos right inside Discord.",
+  "description": "Adds a `[p]media` command group that captions, memes, deepfries, blurs, pixelates, reverses, speed-shifts, and converts media. Works on attachments, replies, message links and history. Image / GIF features run on Pillow; video features use a bundled static `ffmpeg` (via `imageio-ffmpeg`) so no system install is required.",
+  "tags": ["media", "image", "gif", "video", "caption", "meme", "ifunny", "edit", "fun"],
+  "requirements": ["Pillow>=10.0.0", "aiohttp", "imageio-ffmpeg>=0.4.9"],
+  "min_bot_version": "3.5.0",
+  "min_python_version": [3, 8, 0],
+  "hidden": false,
+  "disabled": false,
+  "type": "COG",
+  "end_user_data_statement": "This cog does not persistently store any end user data. Media submitted to commands is processed in memory (and briefly written to a temp directory for video operations) and discarded as soon as the result is sent."
+}
