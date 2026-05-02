@@ -1,0 +1,15 @@
+{
+  "author": ["jaffar21"],
+  "install_msg": "Thanks for installing **Gambling**!\n\nGames available:\n• `[p]roulette` — spin the European wheel (animated)\n• `[p]slots` — pull the lever (animated)\n• `[p]dice [sides]` — roll a die (animated)\n• `[p]coinflip` — heads or tails (animated)\n• `[p]blackjack` then `[p]hit` / `[p]stand` — classic 21\n• `[p]crash` — watch the multiplier fly before it crashes\n• `[p]highlow` — guess if the next card is higher or lower\n\nNo currency required. Pure fun.\nRun `[p]help Gambling` for the full list.",
+  "name": "Gambling",
+  "short": "Casino mini-games with animated visuals — roulette, slots, blackjack, and more.",
+  "description": "A suite of gambling mini-games for Discord with animated GIF visuals generated on the fly. Includes European roulette (spinning wheel + ball), a 3-reel slot machine, dice, coin flip, interactive blackjack, crash, and high-low. No economy or currency required.",
+  "tags": ["gambling", "casino", "roulette", "slots", "blackjack", "dice", "fun", "games"],
+  "requirements": ["Pillow>=10.0.0"],
+  "min_bot_version": "3.5.0",
+  "min_python_version": [3, 8, 0],
+  "hidden": false,
+  "disabled": false,
+  "type": "COG",
+  "end_user_data_statement": "This cog does not persistently store any end user data. Active blackjack sessions are kept in memory only for the duration of the game and discarded afterward."
+}
