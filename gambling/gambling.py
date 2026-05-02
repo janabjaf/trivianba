@@ -6,6 +6,7 @@ import functools
 import io
 import math
 import random
+import secrets
 from typing import Dict, List, Optional, Tuple
 
 import discord
@@ -262,18 +263,6 @@ def _roulette_frame_3d(
         fill=(210, 170, 0), outline=(145, 110, 0), width=2,
     )
 
-    # ── Gold pointer at 12-o'clock ───────────────────────────────────────────
-    ptr_tip_y  = cy - _RY - 16
-    ptr_base_y = cy - _RY + 2
-    draw.polygon(
-        [(cx, ptr_tip_y), (cx - 9, ptr_base_y), (cx + 9, ptr_base_y)],
-        fill=(255, 225, 0),
-    )
-    draw.polygon(
-        [(cx, ptr_tip_y), (cx - 9, ptr_base_y), (cx + 9, ptr_base_y)],
-        outline=(160, 120, 0), width=1,
-    )
-
     # ── Ball ─────────────────────────────────────────────────────────────────
     if ball_angle is not None:
         br_x = int(_RX_TRACK * ball_rfrac)
@@ -299,69 +288,77 @@ def _make_roulette_gif(winning_number: int) -> bytes:
     aps = 360.0 / N
     win_idx = WHEEL_ORDER.index(winning_number)
 
-    # ── Correct rotation math ────────────────────────────────────────────────
-    # Segment j centre sits at:  wheel_angle + j*aps - 90
-    # We want win_idx centre at 270° (PIL 12-o'clock) when animation ends:
-    #   final_wheel_angle + win_idx*aps - 90 = 270
-    #   final_wheel_angle = (360 - win_idx*aps) % 360
-    final_wheel_angle = (360.0 - win_idx * aps) % 360.0
+    # ── Everything randomised per spin so no two spins look the same ─────────
+    # Ball: random start, random number of full orbits, random landing angle.
+    ball_start  = random.uniform(0.0, 360.0)
+    ball_end    = random.uniform(0.0, 360.0)   # where ball settles this spin
+    ball_spins  = random.randint(8, 14)
+    ball_ease_k = random.uniform(2.0, 3.5)     # ease-out exponent for ball
 
-    # wheel_angle at t=1  →  -(total_travel) % 360 = final_wheel_angle
-    # So:  total_travel = SPINS*360 + (360 - final_wheel_angle) % 360
-    FULL_SPINS   = 8
-    total_travel = FULL_SPINS * 360.0 + (360.0 - final_wheel_angle) % 360.0
+    # Total angular distance ball travels (ends exactly at ball_end)
+    ball_delta = (ball_end - ball_start) % 360.0
+    ball_total = ball_spins * 360.0 + ball_delta
 
-    # Ball: starts at 270° (top), orbits counter-clockwise (increasing angle)
-    # Uses integer multiples of 360 so it always ends back at 270° at rest
-    BALL_SPINS        = 11
-    ball_travel_total = BALL_SPINS * 360.0
+    # Wheel: random start angle, random full-spin count, varied ease exponent.
+    wheel_start  = random.uniform(0.0, 360.0)
+    wheel_spins  = random.randint(5, 10)
+    wheel_ease_k = random.uniform(3.0, 4.8)
 
-    TOTAL  = 100   # frames
-    FLASH  = 5     # extra flash frames at the end
+    # Wheel must end with winning segment centred at ball_end.
+    # Segment j centre = wheel_angle + j*aps - 90
+    # At t=1:  final_wheel_angle + win_idx*aps - 90 = ball_end
+    final_wheel_angle = (ball_end + 90.0 - win_idx * aps) % 360.0
 
-    frames:   List[Image.Image] = []
+    # wheel_angle(t) = (wheel_start - ease * total_wheel_travel) % 360
+    # At t=1: wheel_start - total_wheel_travel ≡ final_wheel_angle (mod 360)
+    wheel_delta  = (wheel_start - final_wheel_angle) % 360.0
+    wheel_travel = wheel_spins * 360.0 + wheel_delta
+
+    TOTAL = 100
+    FLASH = 6     # alternating highlight frames after spin stops
+
+    frames:    List[Image.Image] = []
     durations: List[int]         = []
+    spin_ms    = 0  # cumulative ms of the spin portion only
 
     for i in range(TOTAL + FLASH):
         is_flash = i >= TOTAL
         fi = min(i, TOTAL - 1)
         t  = fi / (TOTAL - 1)
 
-        # Cubic ease-out for wheel
-        ease = 1.0 - (1.0 - t) ** 3
-        wheel_angle = -(ease * total_travel) % 360
+        wheel_ease  = 1.0 - (1.0 - t) ** wheel_ease_k
+        wheel_angle = (wheel_start - wheel_ease * wheel_travel) % 360.0
 
-        # Quadratic ease-out for ball — reaches 270° when t=1
-        ball_ease   = 1.0 - (1.0 - t) ** 2
-        ball_travel = ball_ease * ball_travel_total
-        ball_angle  = (270.0 + ball_travel) % 360
+        ball_ease_v = 1.0 - (1.0 - t) ** ball_ease_k
+        ball_angle  = (ball_start + ball_ease_v * ball_total) % 360.0
 
-        # Ball spirals inward during last 30 % of spin frames
+        # Ball spirals inward in final 30 % of spin frames
         if t < 0.70:
             ball_rfrac = 1.00
         else:
             inward_t   = (t - 0.70) / 0.30
-            # Ease-in the inward spiral so it snaps into the pocket crisply
             ball_rfrac = 1.00 - 0.28 * (inward_t ** 2)
 
-        # Flash frames: highlight winning pocket
         flash_idx = win_idx if is_flash and (i % 2 == 0) else -1
 
         img = _roulette_frame_3d(wheel_angle, ball_angle, ball_rfrac, flash_idx)
         frames.append(img.quantize(colors=108, method=Image.Quantize.FASTOCTREE))
 
         if is_flash:
-            durations.append(200)
+            durations.append(220)
         else:
-            # Fast at start, very slow at end
-            durations.append(int(22 + 130 * (t ** 2.8)))
+            ms = int(20 + 140 * (t ** wheel_ease_k))
+            durations.append(ms)
+            spin_ms += ms
 
     buf = io.BytesIO()
     frames[0].save(
         buf, format="GIF", save_all=True, append_images=frames[1:],
         loop=0, duration=durations, optimize=False,
     )
-    return buf.getvalue()
+    # Return bytes + how long the spin portion lasts so the caller can
+    # reveal the result text exactly when the ball lands.
+    return buf.getvalue(), spin_ms / 1000.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -720,13 +717,25 @@ class Gambling(commands.Cog):
         The ball is dropped, the wheel spins, and whatever slot it lands on
         is your result.  No bets — just pure spin.
         """
-        winning = random.choice(WHEEL_ORDER)
+        winning = secrets.choice(WHEEL_ORDER)
         async with ctx.typing():
             loop = asyncio.get_running_loop()
-            gif_bytes = await loop.run_in_executor(
+            gif_bytes, spin_secs = await loop.run_in_executor(
                 None, functools.partial(_make_roulette_gif, winning)
             )
 
+        # ── Phase 1: send the GIF with no result text ─────────────────────────
+        # The embed is attached later so users see the result only when the
+        # ball actually lands, not before the wheel even starts moving.
+        file = discord.File(io.BytesIO(gif_bytes), filename="roulette.gif")
+        msg = await ctx.send(file=file)
+
+        # ── Phase 2: wait for the spin to finish in the GIF ───────────────────
+        # spin_secs is the exact sum of non-flash frame durations.
+        # Add ~1 s to absorb file-download latency on the client side.
+        await asyncio.sleep(spin_secs + 1.0)
+
+        # ── Phase 3: edit the message to reveal the result ────────────────────
         color_name = (
             "🟢 Green" if winning == 0
             else "🔴 Red" if winning in RED_SLOTS
@@ -758,8 +767,11 @@ class Gambling(commands.Cog):
         embed.add_field(name="Half", value=half, inline=True)
         embed.set_image(url="attachment://roulette.gif")
 
-        file = discord.File(io.BytesIO(gif_bytes), filename="roulette.gif")
-        await ctx.send(embed=embed, file=file)
+        try:
+            await msg.edit(embed=embed)
+        except discord.HTTPException:
+            # Fallback: just send the embed as a follow-up if the edit fails
+            await ctx.send(embed=embed)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
     @commands.command(name="slots")
