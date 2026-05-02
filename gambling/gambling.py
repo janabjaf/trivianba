@@ -127,147 +127,234 @@ def _star_polygon(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Roulette GIF generator
+# Roulette GIF generator  (3-D perspective ellipse, rotated numbers, fixed math)
 # ──────────────────────────────────────────────────────────────────────────────
-def _slot_color(n: int) -> Tuple[int, int, int]:
+
+# Canvas size — wider than tall gives the casino angle view automatically
+_W = 580
+_H = 400
+# Wheel centre
+_CX = _W // 2
+_CY = int(_H * 0.50)
+# Outer rim radii — horizontal full-width, vertical squished (≈25° camera tilt)
+_RX = 252
+_RY = int(_RX * 0.42)          # perspective squish ratio
+# Derived radii
+_RX_TRACK = int(_RX * 0.875)
+_RY_TRACK = int(_RY * 0.875)
+_RX_NUM   = int(_RX * 0.755)   # number labels sit here
+_RY_NUM   = int(_RY * 0.755)
+_RX_IN    = int(_RX * 0.340)   # inner mahogany cone
+_RY_IN    = int(_RY * 0.340)
+_DEPTH    = 36                  # visible cylinder depth (px)
+
+
+def _seg_color(n: int) -> Tuple[int, int, int]:
     if n == 0:
-        return (0, 140, 55)
-    return (185, 25, 25) if n in RED_SLOTS else (22, 22, 22)
+        return (0, 145, 55)
+    return (188, 22, 22) if n in RED_SLOTS else (20, 20, 20)
 
 
-def _roulette_frame(
+def _roulette_frame_3d(
     wheel_angle: float,
     ball_angle: Optional[float],
-    ball_r: float,
-    size: int,
+    ball_rfrac: float,          # fraction of track radius (0→1)
+    flash_idx: int = -1,        # segment index to highlight, -1 = none
 ) -> Image.Image:
-    cx = cy = size // 2
-    R = size // 2 - 16
-    r_inner = int(R * 0.36)
-    r_track = int(R * 0.87)
-
-    img = Image.new("RGB", (size, size), (18, 55, 28))
+    img = Image.new("RGBA", (_W, _H), (10, 48, 20, 255))
     draw = ImageDraw.Draw(img)
+    cx, cy = _CX, _CY
 
-    # Multi-layer outer rim (gives depth / 3-D feel)
-    for d in range(18, 0, -2):
-        frac = d / 18.0
-        c = int(90 * frac)
+    # ── Felt table shadow ────────────────────────────────────────────────────
+    for d in range(22, 0, -2):
+        t = d / 22.0
+        r = int(30 * t)
         draw.ellipse(
-            [cx - R - d, cy - R - d, cx + R + d, cy + R + d],
-            fill=(c, int(c * 0.65), 0),
+            [cx - _RX - d - 4, cy - _RY - d + _DEPTH,
+             cx + _RX + d + 4, cy + _RY + d + _DEPTH],
+            fill=(r, int(r * 0.5), 0),
         )
 
-    # Segments
-    N = len(WHEEL_ORDER)
+    # ── Cylinder side (visible depth below wheel face) ───────────────────────
+    for d in range(_DEPTH, 0, -1):
+        t = 1.0 - d / _DEPTH
+        g = int(55 + 25 * t)
+        draw.ellipse(
+            [cx - _RX - 6, cy - _RY + d,
+             cx + _RX + 6, cy + _RY + d],
+            fill=(g, int(g * 0.58), 0),
+        )
+
+    # ── Layered gold outer rim (gives 3-D depth to the top face) ────────────
+    for d in range(16, 0, -1):
+        t = d / 16.0
+        c = int(115 * t)
+        draw.ellipse(
+            [cx - _RX - d, cy - _RY - d,
+             cx + _RX + d, cy + _RY + d],
+            fill=(c, int(c * 0.70), 0),
+        )
+
+    # ── Numbered segments ────────────────────────────────────────────────────
+    N   = len(WHEEL_ORDER)
     aps = 360.0 / N
+    f_num = _font(10)
+
     for j, num in enumerate(WHEEL_ORDER):
-        start = wheel_angle + j * aps - 90.0 - aps / 2
+        start = wheel_angle + j * aps - 90.0 - aps / 2.0
+        fill  = _seg_color(num)
+        if j == flash_idx:
+            # Brighten the winning pocket
+            fill = tuple(min(255, v + 90) for v in fill)  # type: ignore[assignment]
+
         draw.pieslice(
-            [cx - R, cy - R, cx + R, cy + R],
+            [cx - _RX, cy - _RY, cx + _RX, cy + _RY],
             start=start, end=start + aps,
-            fill=_slot_color(num),
-            outline=(200, 162, 0), width=1,
+            fill=fill, outline=(200, 162, 0), width=1,
         )
 
-    # Ball track ring
+        # Number label — rotated so text reads radially outward
+        mid_deg = wheel_angle + j * aps - 90.0
+        mid_rad = math.radians(mid_deg)
+        nx = cx + int(_RX_NUM * math.cos(mid_rad))
+        ny = cy + int(_RY_NUM * math.sin(mid_rad))
+
+        label = str(num)
+        # Tiny canvas for the label
+        tmp = Image.new("RGBA", (36, 20), (0, 0, 0, 0))
+        td  = ImageDraw.Draw(tmp)
+        bb  = td.textbbox((0, 0), label, font=f_num)
+        tw, th = bb[2] - bb[0], bb[3] - bb[1]
+        td.text((18 - tw // 2, 10 - th // 2), label,
+                font=f_num, fill=(255, 255, 255, 255))
+        # Rotate so text bottom faces the wheel centre → reads outward
+        rot_angle = -(mid_deg - 270.0)
+        rotated = tmp.rotate(rot_angle, expand=True, resample=Image.BICUBIC)
+        px = nx - rotated.width  // 2
+        py = ny - rotated.height // 2
+        img.paste(rotated, (px, py), rotated)
+
+    # ── Ball track groove ────────────────────────────────────────────────────
     draw.ellipse(
-        [cx - r_track, cy - r_track, cx + r_track, cy + r_track],
-        outline=(210, 175, 20), width=2,
+        [cx - _RX_TRACK, cy - _RY_TRACK,
+         cx + _RX_TRACK, cy + _RY_TRACK],
+        outline=(220, 180, 30), width=2,
     )
 
-    # Inner platform (mahogany)
+    # ── Inner mahogany cone ──────────────────────────────────────────────────
     draw.ellipse(
-        [cx - r_inner, cy - r_inner, cx + r_inner, cy + r_inner],
-        fill=(52, 30, 12), outline=(200, 162, 0), width=3,
+        [cx - _RX_IN, cy - _RY_IN, cx + _RX_IN, cy + _RY_IN],
+        fill=(50, 28, 10), outline=(200, 162, 0), width=3,
     )
 
-    # Spokes
+    # ── Spokes ───────────────────────────────────────────────────────────────
     for k in range(8):
-        ang = math.radians(wheel_angle + k * 45)
-        x1 = cx + int(r_inner * math.cos(ang))
-        y1 = cy + int(r_inner * math.sin(ang))
-        x2 = cx + int(R * 0.50 * math.cos(ang))
-        y2 = cy + int(R * 0.50 * math.sin(ang))
+        ar = math.radians(wheel_angle + k * 45)
+        x1 = cx + int(_RX_IN * math.cos(ar))
+        y1 = cy + int(_RY_IN * math.sin(ar))
+        x2 = cx + int(_RX * 0.50 * math.cos(ar))
+        y2 = cy + int(_RY * 0.50 * math.sin(ar))
         draw.line([(x1, y1), (x2, y2)], fill=(200, 162, 0), width=1)
 
-    # Centre hub
+    # ── Centre hub ───────────────────────────────────────────────────────────
     draw.ellipse(
-        [cx - 20, cy - 20, cx + 20, cy + 20],
-        fill=(200, 162, 0), outline=(140, 110, 0), width=2,
+        [cx - 18, cy - 9, cx + 18, cy + 9],
+        fill=(210, 170, 0), outline=(145, 110, 0), width=2,
     )
 
-    # Ball
+    # ── Gold pointer at 12-o'clock ───────────────────────────────────────────
+    ptr_tip_y  = cy - _RY - 16
+    ptr_base_y = cy - _RY + 2
+    draw.polygon(
+        [(cx, ptr_tip_y), (cx - 9, ptr_base_y), (cx + 9, ptr_base_y)],
+        fill=(255, 225, 0),
+    )
+    draw.polygon(
+        [(cx, ptr_tip_y), (cx - 9, ptr_base_y), (cx + 9, ptr_base_y)],
+        outline=(160, 120, 0), width=1,
+    )
+
+    # ── Ball ─────────────────────────────────────────────────────────────────
     if ball_angle is not None:
-        bx = cx + int(ball_r * math.cos(math.radians(ball_angle)))
-        by = cy + int(ball_r * math.sin(math.radians(ball_angle)))
-        br = 9
+        br_x = int(_RX_TRACK * ball_rfrac)
+        br_y = int(_RY_TRACK * ball_rfrac)
+        bx   = cx + int(br_x * math.cos(math.radians(ball_angle)))
+        by   = cy + int(br_y * math.sin(math.radians(ball_angle)))
+        br   = 9
         draw.ellipse(
             [bx - br, by - br, bx + br, by + br],
-            fill=(245, 245, 245), outline=(170, 170, 170), width=1,
+            fill=(248, 248, 248), outline=(165, 165, 165), width=1,
         )
         # Specular highlight
         draw.ellipse(
-            [bx - br + 2, by - br + 2, bx, by],
+            [bx - br + 2, by - br + 2, bx + 1, by + 1],
             fill=(255, 255, 255),
         )
 
-    return img
+    return img.convert("RGB")
 
 
 def _make_roulette_gif(winning_number: int) -> bytes:
-    N = len(WHEEL_ORDER)
+    N   = len(WHEEL_ORDER)
+    aps = 360.0 / N
     win_idx = WHEEL_ORDER.index(winning_number)
-    SIZE = 480
-    R_TRACK = SIZE // 2 - 16 - 24   # ball orbit radius
 
-    # How many degrees we must rotate so winning slot ends at 12-o'clock
-    # In the wheel's local frame, slot j starts at j*(360/N) from 12-o'clock.
-    slot_center_local = win_idx * (360.0 / N)
-    # We want wheel_angle (the offset we add to all angles) to satisfy:
-    # wheel_angle + slot_center_local = 0 (mod 360)  => wheel_angle = -slot_center_local
-    final_wheel_angle = (-slot_center_local) % 360
+    # ── Correct rotation math ────────────────────────────────────────────────
+    # Segment j centre sits at:  wheel_angle + j*aps - 90
+    # We want win_idx centre at 270° (PIL 12-o'clock) when animation ends:
+    #   final_wheel_angle + win_idx*aps - 90 = 270
+    #   final_wheel_angle = (360 - win_idx*aps) % 360
+    final_wheel_angle = (360.0 - win_idx * aps) % 360.0
 
-    TOTAL = 90
-    FULL_SPINS = 7
+    # wheel_angle at t=1  →  -(total_travel) % 360 = final_wheel_angle
+    # So:  total_travel = SPINS*360 + (360 - final_wheel_angle) % 360
+    FULL_SPINS   = 8
+    total_travel = FULL_SPINS * 360.0 + (360.0 - final_wheel_angle) % 360.0
 
-    # total degrees the wheel rotates (forward = clockwise visually)
-    total_travel = FULL_SPINS * 360.0 + final_wheel_angle
-
-    # Ball orbits counter-clockwise (negative direction)
-    BALL_SPINS = 10
+    # Ball: starts at 270° (top), orbits counter-clockwise (increasing angle)
+    # Uses integer multiples of 360 so it always ends back at 270° at rest
+    BALL_SPINS        = 11
     ball_travel_total = BALL_SPINS * 360.0
 
-    frames: List[Image.Image] = []
-    durations: List[int] = []
+    TOTAL  = 100   # frames
+    FLASH  = 5     # extra flash frames at the end
 
-    for i in range(TOTAL):
-        t = i / (TOTAL - 1)
-        ease = 1.0 - (1.0 - t) ** 3      # cubic ease-out
+    frames:   List[Image.Image] = []
+    durations: List[int]         = []
 
-        # Wheel rotates clockwise, expressed as negative offset in our draw fn
+    for i in range(TOTAL + FLASH):
+        is_flash = i >= TOTAL
+        fi = min(i, TOTAL - 1)
+        t  = fi / (TOTAL - 1)
+
+        # Cubic ease-out for wheel
+        ease = 1.0 - (1.0 - t) ** 3
         wheel_angle = -(ease * total_travel) % 360
 
-        # Ball orbits counter-clockwise at decreasing speed
-        ball_ease = 1.0 - (1.0 - t) ** 2  # ease-out for ball
+        # Quadratic ease-out for ball — reaches 270° when t=1
+        ball_ease   = 1.0 - (1.0 - t) ** 2
         ball_travel = ball_ease * ball_travel_total
-        ball_ang_raw = 270.0 + ball_travel   # start at top, go counter-cw
-        ball_angle = ball_ang_raw % 360
+        ball_angle  = (270.0 + ball_travel) % 360
 
-        # Ball spirals inward in the last 25% of frames
-        if t < 0.75:
-            br = float(R_TRACK)
+        # Ball spirals inward during last 30 % of spin frames
+        if t < 0.70:
+            ball_rfrac = 1.00
         else:
-            inward_t = (t - 0.75) / 0.25
-            r_landing = int((SIZE // 2 - 16) * 0.68)
-            br = R_TRACK + (r_landing - R_TRACK) * (inward_t ** 2)
+            inward_t   = (t - 0.70) / 0.30
+            # Ease-in the inward spiral so it snaps into the pocket crisply
+            ball_rfrac = 1.00 - 0.28 * (inward_t ** 2)
 
-        img = _roulette_frame(wheel_angle, ball_angle, br, SIZE)
-        frames.append(img.quantize(colors=96, method=Image.Quantize.FASTOCTREE))
+        # Flash frames: highlight winning pocket
+        flash_idx = win_idx if is_flash and (i % 2 == 0) else -1
 
-        # Frame timing: fast at start, slow at end (mimics deceleration)
-        raw_ms = 25 + int(120 * (t ** 2.5))
-        durations.append(raw_ms)
+        img = _roulette_frame_3d(wheel_angle, ball_angle, ball_rfrac, flash_idx)
+        frames.append(img.quantize(colors=108, method=Image.Quantize.FASTOCTREE))
+
+        if is_flash:
+            durations.append(200)
+        else:
+            # Fast at start, very slow at end
+            durations.append(int(22 + 130 * (t ** 2.8)))
 
     buf = io.BytesIO()
     frames[0].save(
