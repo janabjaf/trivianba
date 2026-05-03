@@ -5,7 +5,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from redbot.core.data_manager import cog_data_path
 
@@ -141,6 +141,19 @@ class BetsManager:
         data["settled"][bet_id] = bet
         self._save(guild_id)
         return True
+
+    def clear_all_bets(self, guild_id: int) -> Tuple[int, List[Dict]]:
+        """
+        Wipe ALL active and settled bets for a guild.
+        Returns (active_count, list_of_active_bets_for_refund).
+        Call this before resetting balances so the caller can refund stakes.
+        """
+        data   = self._load(guild_id)
+        active = list(data["active"].values())
+        data["active"]   = {}
+        data["settled"]  = {}
+        self._save(guild_id)
+        return len(active), active
 
     def get_bet_distribution(self, guild_id: int, event_id: str) -> Dict[str, float]:
         """

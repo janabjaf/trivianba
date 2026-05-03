@@ -884,17 +884,17 @@ class ConfirmView(discord.ui.View):
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.user.id != self.author_id:
             return await interaction.response.send_message("Not your action.", ephemeral=True)
+        await interaction.response.defer()   # acknowledge FIRST — must happen before stop()
         self.confirmed = True
         self.stop()
-        await interaction.response.defer()
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red, emoji="❌")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.user.id != self.author_id:
             return await interaction.response.send_message("Not your action.", ephemeral=True)
+        await interaction.response.defer()   # acknowledge FIRST — must happen before stop()
         self.confirmed = False
         self.stop()
-        await interaction.response.defer()
 
     async def on_timeout(self) -> None:
         self.confirmed = None

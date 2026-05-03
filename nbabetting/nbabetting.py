@@ -359,10 +359,13 @@ class NBABetting(commands.Cog):
             balance = await self.economy.get_balance(ctx.guild.id, ctx.author.id)
 
         # ── Only show games that haven't started yet ───────────────────────────
-        # Completed games AND in-progress (live) games are excluded.
+        # Whitelist approach: only allow clearly pre-game states.
+        # Catches STATUS_IN_PROGRESS, STATUS_HALFTIME, STATUS_END_PERIOD,
+        # STATUS_FINAL, and any other mid/post-game state automatically.
+        _BETTABLE_STATES = {"STATUS_SCHEDULED", "STATUS_PREGAME", ""}
         upcoming = [
             g for g in games
-            if not g.get("completed") and g.get("state") != "STATUS_IN_PROGRESS"
+            if not g.get("completed") and g.get("state", "") in _BETTABLE_STATES
         ]
         if not upcoming:
             return await ctx.send(
@@ -461,19 +464,44 @@ class NBABetting(commands.Cog):
 
     @admin_group.command(name="reseteco")
     async def admin_reseteco(self, ctx: commands.Context) -> None:
-        """Reset ALL members' balances to the starting amount (asks for confirmation)."""
+        """Reset ALL members' balances AND clear all bet history."""
         view = ConfirmView(ctx.author.id, timeout=30)
         msg  = await ctx.send(
-            f"⚠️ This will reset **every member's balance** to {CURRENCY}**{STARTING_BALANCE:.0f}**.\n"
-            "Bet history and stats are **not** affected. Continue?",
+            f"⚠️ **Full economy reset** — this will:\n"
+            f"• Reset every member's balance to {CURRENCY}**{STARTING_BALANCE:.0f}**\n"
+            f"• **Delete all bet history** (active and settled)\n\n"
+            f"This cannot be undone. Continue?",
             view=view,
         )
         await view.wait()
         if not view.confirmed:
             return await msg.edit(content="Reset cancelled.", view=None)
+        self.bets.clear_all_bets(ctx.guild.id)
         count = await self.economy.reset_all_balances(ctx.guild)
         await msg.edit(
-            content=f"✅ Reset {count} member balance(s) to {CURRENCY}**{STARTING_BALANCE:.0f}**.",
+            content=(
+                f"✅ Reset {count} member balance(s) to {CURRENCY}**{STARTING_BALANCE:.0f}**"
+                f" and cleared all bet history."
+            ),
+            view=None,
+        )
+
+    @admin_group.command(name="resetbets")
+    async def admin_resetbets(self, ctx: commands.Context) -> None:
+        """Clear ALL bet history for this server without touching balances."""
+        view = ConfirmView(ctx.author.id, timeout=30)
+        msg  = await ctx.send(
+            "⚠️ This will **permanently delete all bet history** "
+            "(active and settled) for this server.\n"
+            "Member balances are **not** affected. Continue?",
+            view=view,
+        )
+        await view.wait()
+        if not view.confirmed:
+            return await msg.edit(content="Reset cancelled.", view=None)
+        active_cleared, _ = self.bets.clear_all_bets(ctx.guild.id)
+        await msg.edit(
+            content=f"✅ Cleared all bet history ({active_cleared} active bet(s) removed).",
             view=None,
         )
 
