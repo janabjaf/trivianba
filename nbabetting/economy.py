@@ -1,7 +1,7 @@
 """economy.py – Per-guild economy manager backed by Red's Config."""
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List
 
 import discord
 from redbot.core import Config
@@ -9,7 +9,7 @@ from redbot.core import Config
 if TYPE_CHECKING:
     from redbot.core.bot import Red
 
-STARTING_BALANCE: float = 100.0
+STARTING_BALANCE: float = 1000.0
 CURRENCY: str = "\U0001f4b0"
 
 
@@ -45,28 +45,24 @@ class Economy:
         await conf.balance.set(round(bal - amount, 2))
         return True
 
-    async def set_balance(
-        self, guild_id: int, user_id: int, amount: float
-    ) -> None:
-        await self.config.member_from_ids(guild_id, user_id).balance.set(
-            round(amount, 2)
-        )
+    async def set_balance(self, guild_id: int, user_id: int, amount: float) -> None:
+        await self.config.member_from_ids(guild_id, user_id).balance.set(round(amount, 2))
 
-    async def record_bet_placed(
-        self, guild_id: int, user_id: int, stake: float
-    ) -> None:
+    async def record_bet_placed(self, guild_id: int, user_id: int, stake: float) -> None:
         conf = self.config.member_from_ids(guild_id, user_id)
         async with conf.total_wagered() as tw:
             tw += stake
         async with conf.bets_placed() as bp:
             bp += 1
 
-    async def record_win(
-        self, guild_id: int, user_id: int, profit: float
-    ) -> None:
+    async def record_win(self, guild_id: int, user_id: int, payout: float) -> None:
+        """
+        Record a win.  payout = full amount returned to player (stake + profit).
+        This is what gets added to total_returned so that P/L = returned - wagered is correct.
+        """
         conf = self.config.member_from_ids(guild_id, user_id)
         async with conf.total_returned() as tr:
-            tr += profit
+            tr += payout
         async with conf.bets_won() as bw:
             bw += 1
 
@@ -74,27 +70,25 @@ class Economy:
         async with self.config.member_from_ids(guild_id, user_id).bets_lost() as bl:
             bl += 1
 
-    async def record_push(self, guild_id: int, user_id: int) -> None:
-        async with self.config.member_from_ids(guild_id, user_id).bets_push() as bp:
+    async def record_push(self, guild_id: int, user_id: int, stake: float) -> None:
+        """Record a push.  stake is returned, so add it to total_returned."""
+        conf = self.config.member_from_ids(guild_id, user_id)
+        async with conf.total_returned() as tr:
+            tr += stake
+        async with conf.bets_push() as bp:
             bp += 1
 
     # ── Bulk operations (admin) ────────────────────────────────────────────────
 
-    async def reset_balance(
-        self, guild_id: int, user_id: int
-    ) -> None:
-        await self.config.member_from_ids(guild_id, user_id).balance.set(
-            STARTING_BALANCE
-        )
+    async def reset_balance(self, guild_id: int, user_id: int) -> None:
+        await self.config.member_from_ids(guild_id, user_id).balance.set(STARTING_BALANCE)
 
     async def reset_all_balances(self, guild: discord.Guild) -> int:
         """Reset every member's balance to starting value. Returns count."""
         all_data = await self.config.all_members(guild)
         count = 0
         for uid in all_data:
-            await self.config.member_from_ids(guild.id, int(uid)).balance.set(
-                STARTING_BALANCE
-            )
+            await self.config.member_from_ids(guild.id, int(uid)).balance.set(STARTING_BALANCE)
             count += 1
         return count
 
@@ -118,8 +112,6 @@ class Economy:
     async def get_leaderboard(self, guild: discord.Guild) -> List[Dict]:
         """Return top-100 members sorted by balance desc."""
         all_data = await self.config.all_members(guild)
-        entries = []
-        for uid, data in all_data.items():
-            entries.append({"user_id": str(uid), **data})
+        entries = [{"user_id": str(uid), **data} for uid, data in all_data.items()]
         entries.sort(key=lambda e: e.get("balance", 0.0), reverse=True)
         return entries[:100]

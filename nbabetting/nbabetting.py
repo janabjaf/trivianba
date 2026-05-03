@@ -12,7 +12,7 @@ from redbot.core.bot import Red
 
 from .data import BetsManager
 from .economy import CURRENCY, STARTING_BALANCE, Economy
-from .odds import OddsFetcher, calc_profit, evaluate_bet, fmt_odds
+from .odds import OddsFetcher, calc_profit, evaluate_bet, fmt_odds, fmt_prop_selection
 from .views import (
     BetFlowView,
     ConfirmView,
@@ -22,8 +22,6 @@ from .views import (
 )
 
 log = logging.getLogger("red.jaffar-cogs.nbabetting")
-
-ADMIN_SERVER_ID = 1440962506796433519
 
 
 # ── Admin check ───────────────────────────────────────────────────────────────
@@ -49,7 +47,7 @@ def admin_only():
 # ══════════════════════════════════════════════════════════════════════════════
 
 class NBABetting(commands.Cog):
-    """NBA betting with live odds, economy, and auto-settlement. Slash-command first."""
+    """NBA betting with live odds, injury-aware lines, player props, and auto-settlement."""
 
     def __init__(self, bot: Red) -> None:
         self.bot = bot
@@ -132,12 +130,31 @@ class NBABetting(commands.Cog):
             if not pending:
                 continue
 
+            # Pre-fetch box scores only for events that have pending player-prop bets
+            prop_event_ids = {
+                b["event_id"] for b in pending
+                if b["bet_type"] == "player_props"
+            }
+            box_scores: dict = {}
+            for eid in prop_event_ids:
+                if eid in completed_by_id:
+                    bs = await self.fetcher.get_game_box_score(eid)
+                    if bs:
+                        box_scores[eid] = bs
+
             for bet in pending:
                 game = completed_by_id.get(bet["event_id"])
                 if not game:
                     continue
                 if game.get("home_score") is None or game.get("away_score") is None:
                     continue
+
+                # For player props we need the box score; skip until available
+                player_stats = None
+                if bet["bet_type"] == "player_props":
+                    player_stats = box_scores.get(bet["event_id"])
+                    if player_stats is None:
+                        continue   # Box score not available yet; settle next cycle
 
                 result = evaluate_bet(
                     bet_type=bet["bet_type"],
@@ -147,28 +164,29 @@ class NBABetting(commands.Cog):
                     away_team=bet["away_team"],
                     home_score=game["home_score"],
                     away_score=game["away_score"],
+                    player_stats=player_stats,
                 )
 
                 user_id = int(bet["user_id"])
                 stake   = bet["stake"]
-                profit  = bet["potential_payout"]
+                profit  = bet["potential_payout"]   # stored profit-only amount
 
                 if result == "won":
                     payout = stake + profit
                     await self.economy.add(guild_id, user_id, payout)
-                    await self.economy.record_win(guild_id, user_id, profit)
+                    await self.economy.record_win(guild_id, user_id, payout)   # full payout
                 elif result == "push":
                     payout = stake
                     await self.economy.add(guild_id, user_id, payout)
-                    await self.economy.record_push(guild_id, user_id)
+                    await self.economy.record_push(guild_id, user_id, stake)   # stake returned
                 else:   # lost
                     payout = 0.0
                     await self.economy.record_loss(guild_id, user_id)
 
                 self.bets.settle_bet(guild_id, bet["id"], result, payout)
-                await self._notify_user(guild_id, user_id, bet, result, payout)
+                await self._notify_result(guild_id, user_id, bet, result, payout)
 
-    async def _notify_user(
+    async def _notify_result(
         self,
         guild_id: int,
         user_id: int,
@@ -176,10 +194,7 @@ class NBABetting(commands.Cog):
         result: str,
         payout: float,
     ) -> None:
-        """DM the user their bet result."""
-        user = self.bot.get_user(user_id)
-        if not user:
-            return
+        """DM the user their bet result AND post to the guild's notify_channel if set."""
         emoji = {"won": "✅", "lost": "❌", "push": "🔄"}.get(result, "❓")
         color = {
             "won":  discord.Color.green(),
@@ -187,22 +202,42 @@ class NBABetting(commands.Cog):
             "push": discord.Color.gold(),
         }.get(result, discord.Color.greyple())
 
+        sel_display = bet["selection"]
+        if bet.get("bet_type") == "player_props":
+            sel_display = fmt_prop_selection(bet["selection"])
+
         embed = discord.Embed(
             title=f"{emoji} Bet Settled — {result.upper()}",
             color=color,
         )
-        embed.add_field(name="Bet ID",   value=f"`{bet['id']}`",                        inline=True)
-        embed.add_field(name="Game",     value=f"{bet['away_team']} @ {bet['home_team']}",inline=False)
-        embed.add_field(name="Your Pick",value=f"{bet['selection']}  ({fmt_odds(bet['odds'])})",inline=True)
-        embed.add_field(name="Stake",    value=f"{CURRENCY}{bet['stake']:.0f}",           inline=True)
+        embed.add_field(name="Bet ID",    value=f"`{bet['id']}`",                         inline=True)
+        embed.add_field(name="Game",      value=f"{bet['away_team']} @ {bet['home_team']}", inline=False)
+        embed.add_field(name="Your Pick", value=f"{sel_display}  ({fmt_odds(bet['odds'])})", inline=True)
+        embed.add_field(name="Stake",     value=f"{CURRENCY}{bet['stake']:.0f}",           inline=True)
         if result == "won":
             embed.add_field(name="You Won!", value=f"{CURRENCY}**{payout:.0f}**", inline=True)
         elif result == "push":
-            embed.add_field(name="Push",     value="Stake returned.", inline=True)
-        try:
-            await user.send(embed=embed)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
+            embed.add_field(name="Push", value="Stake returned.", inline=True)
+
+        # ── DM the user ───────────────────────────────────────────────────────
+        user = self.bot.get_user(user_id)
+        if user:
+            try:
+                await user.send(embed=embed)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        # ── Post to notify_channel if configured ──────────────────────────────
+        channel_id: Optional[int] = await self.config.guild_from_id(guild_id).notify_channel()
+        if channel_id:
+            channel = self.bot.get_channel(channel_id)
+            if channel:
+                try:
+                    member = channel.guild.get_member(user_id)
+                    mention = member.mention if member else f"<@{user_id}>"
+                    await channel.send(content=mention, embed=embed)
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
 
     # ══════════════════════════════════════════════════════════════════════════
     # /economy  commands
@@ -221,10 +256,10 @@ class NBABetting(commands.Cog):
         l      = data.get("bets_lost", 0)
         p      = data.get("bets_push", 0)
         placed = data.get("bets_placed", 0)
-        wagered   = data.get("total_wagered",  0.0)
-        returned  = data.get("total_returned", 0.0)
-        profit    = returned - wagered
-        win_pct   = f"{w / (w + l) * 100:.1f}%" if (w + l) > 0 else "—"
+        wagered  = data.get("total_wagered",  0.0)
+        returned = data.get("total_returned", 0.0)
+        profit   = returned - wagered
+        win_pct  = f"{w / (w + l) * 100:.1f}%" if (w + l) > 0 else "—"
 
         embed = discord.Embed(
             title=f"{CURRENCY} Economy — {target.display_name}",
@@ -237,7 +272,7 @@ class NBABetting(commands.Cog):
         embed.add_field(name="Win Rate",      value=win_pct,                    inline=True)
         embed.add_field(name="Total Wagered", value=f"{CURRENCY}{wagered:.0f}", inline=True)
         profit_str = f"+{profit:.0f}" if profit >= 0 else f"{profit:.0f}"
-        embed.add_field(name="Profit / Loss", value=f"{CURRENCY}{profit_str}", inline=True)
+        embed.add_field(name="Profit / Loss", value=f"{CURRENCY}{profit_str}",  inline=True)
         await ctx.send(embed=embed)
 
     @economy_group.command(name="leaderboard", aliases=["lb"])
@@ -248,8 +283,8 @@ class NBABetting(commands.Cog):
             entries = await self.economy.get_leaderboard(ctx.guild)
         if not entries:
             return await ctx.send("No economy data yet. Use `/economy balance` to get started!")
-        view    = LeaderboardView(entries, ctx.guild, ctx.author.id)
-        msg     = await ctx.send(embed=view.build_embed(), view=view)
+        view = LeaderboardView(entries, ctx.guild, ctx.author.id)
+        msg  = await ctx.send(embed=view.build_embed(), view=view)
         view.message = msg
 
     @economy_group.command(name="transfer")
@@ -269,16 +304,28 @@ class NBABetting(commands.Cog):
         if amount < 1:
             return await ctx.send("❌ Minimum transfer is 1.", ephemeral=True)
 
+        # Confirm before moving money
+        view = ConfirmView(ctx.author.id, timeout=30)
+        msg  = await ctx.send(
+            f"Transfer {CURRENCY}**{amount:.0f}** to **{recipient.display_name}**?",
+            view=view,
+        )
+        await view.wait()
+        if not view.confirmed:
+            return await msg.edit(content="Transfer cancelled.", view=None)
+
         ok = await self.economy.deduct(ctx.guild.id, ctx.author.id, amount)
         if not ok:
-            return await ctx.send("❌ Insufficient balance.", ephemeral=True)
+            return await msg.edit(
+                content="❌ Insufficient balance.", view=None
+            )
         await self.economy.add(ctx.guild.id, recipient.id, amount)
 
         embed = discord.Embed(title="💸 Transfer Complete", color=discord.Color.green())
-        embed.add_field(name="From",   value=ctx.author.mention,   inline=True)
-        embed.add_field(name="To",     value=recipient.mention,    inline=True)
-        embed.add_field(name="Amount", value=f"{CURRENCY}**{amount:.0f}**", inline=True)
-        await ctx.send(embed=embed)
+        embed.add_field(name="From",   value=ctx.author.mention,              inline=True)
+        embed.add_field(name="To",     value=recipient.mention,               inline=True)
+        embed.add_field(name="Amount", value=f"{CURRENCY}**{amount:.0f}**",   inline=True)
+        await msg.edit(content=None, embed=embed, view=None)
 
     # ══════════════════════════════════════════════════════════════════════════
     # /bet  commands
@@ -311,10 +358,16 @@ class NBABetting(commands.Cog):
             games   = await self.fetcher.get_games()
             balance = await self.economy.get_balance(ctx.guild.id, ctx.author.id)
 
-        upcoming = [g for g in games if not g.get("completed")]
+        # ── Only show games that haven't started yet ───────────────────────────
+        # Completed games AND in-progress (live) games are excluded.
+        upcoming = [
+            g for g in games
+            if not g.get("completed") and g.get("state") != "STATUS_IN_PROGRESS"
+        ]
         if not upcoming:
             return await ctx.send(
-                "No upcoming NBA games found right now. Try again when games are scheduled!"
+                "🔒 No upcoming NBA games available for betting right now. "
+                "All games today have either started or finished — try again when new games are scheduled!"
             )
 
         view = BetFlowView(self, ctx.author.id, upcoming, balance)
@@ -328,7 +381,7 @@ class NBABetting(commands.Cog):
         if not bets:
             return await ctx.send("You have no pending bets. Use `/bet place` to get started!")
         view = MyBetsView(bets, self, ctx.author.id, ctx.guild.id,
-                          title="📋 My Active Bets", show_cancel=True)
+                          title="📋 My Active Bets")
         msg  = await ctx.send(embed=view.build_embed(), view=view)
         view.message = msg
 
@@ -345,61 +398,9 @@ class NBABetting(commands.Cog):
                 f"{'You have' if target == ctx.author else f'{target.display_name} has'} no bet history yet."
             )
         view = MyBetsView(bets, self, ctx.author.id, ctx.guild.id,
-                          title=f"📜 Bet History — {target.display_name}",
-                          show_cancel=False)
+                          title=f"📜 Bet History — {target.display_name}")
         msg  = await ctx.send(embed=view.build_embed(), view=view)
         view.message = msg
-
-    @bet_group.command(name="cancel")
-    @app_commands.describe(bet_id="Bet ID to cancel (use autocomplete)")
-    async def bet_cancel(self, ctx: commands.Context, bet_id: str) -> None:
-        """Cancel a specific pending bet and get your stake refunded."""
-        bet_id = bet_id.upper().strip()
-        bet    = self.bets.get_bet(ctx.guild.id, bet_id)
-        if not bet:
-            return await ctx.send(f"❌ Bet `{bet_id}` not found.", ephemeral=True)
-        if bet["user_id"] != str(ctx.author.id):
-            return await ctx.send("❌ That's not your bet.", ephemeral=True)
-        if bet["status"] != "pending":
-            return await ctx.send(
-                f"❌ Bet `{bet_id}` is already **{bet['status']}** and cannot be cancelled.",
-                ephemeral=True,
-            )
-
-        view = ConfirmView(ctx.author.id, timeout=30)
-        msg  = await ctx.send(
-            f"Cancel bet `{bet_id}` (**{bet['selection']}**,  "
-            f"{CURRENCY}{bet['stake']:.0f} stake) and get refunded?",
-            view=view,
-        )
-        await view.wait()
-        if not view.confirmed:
-            return await msg.edit(content="Cancellation aborted.", view=None)
-
-        cancelled = self.bets.cancel_bet(ctx.guild.id, bet_id)
-        if not cancelled:
-            return await msg.edit(content="❌ Could not cancel — bet may have already settled.", view=None)
-
-        await self.economy.add(ctx.guild.id, ctx.author.id, cancelled["stake"])
-        await msg.edit(
-            content=f"✅ Bet `{bet_id}` cancelled. {CURRENCY}**{cancelled['stake']:.0f}** refunded.",
-            view=None,
-        )
-
-    @bet_cancel.autocomplete("bet_id")
-    async def _autocomplete_bet_id(
-        self, interaction: discord.Interaction, current: str
-    ) -> List[app_commands.Choice[str]]:
-        bets = self.bets.get_user_bets(interaction.guild_id, interaction.user.id, "pending")
-        cur  = current.upper()
-        return [
-            app_commands.Choice(
-                name=f"[{b['id']}] {b['away_team']} @ {b['home_team']} — {b['selection']}  ({fmt_odds(b['odds'])})",
-                value=b["id"],
-            )
-            for b in bets
-            if cur in b["id"]
-        ][:25]
 
     # ══════════════════════════════════════════════════════════════════════════
     # /admin  commands  (admin-only)
@@ -460,7 +461,7 @@ class NBABetting(commands.Cog):
 
     @admin_group.command(name="reseteco")
     async def admin_reseteco(self, ctx: commands.Context) -> None:
-        """Reset ALL members' balances to 100💰 (asks for confirmation)."""
+        """Reset ALL members' balances to the starting amount (asks for confirmation)."""
         view = ConfirmView(ctx.author.id, timeout=30)
         msg  = await ctx.send(
             f"⚠️ This will reset **every member's balance** to {CURRENCY}**{STARTING_BALANCE:.0f}**.\n"
@@ -505,13 +506,16 @@ class NBABetting(commands.Cog):
             title=f"🔍 Admin Lookup — {user.display_name}", color=discord.Color.blurple()
         )
         embed.set_thumbnail(url=user.display_avatar.url)
-        embed.add_field(name="Balance",       value=f"{CURRENCY}{data.get('balance', 0):.0f}", inline=True)
-        embed.add_field(name="Bets Placed",   value=str(data.get("bets_placed", 0)),           inline=True)
+        embed.add_field(name="Balance",        value=f"{CURRENCY}{data.get('balance', 0):.0f}",       inline=True)
+        embed.add_field(name="Bets Placed",    value=str(data.get("bets_placed", 0)),                  inline=True)
         embed.add_field(name="Record",
             value=f"{data.get('bets_won',0)}W – {data.get('bets_lost',0)}L – {data.get('bets_push',0)}P",
             inline=True)
-        embed.add_field(name="Total Wagered", value=f"{CURRENCY}{data.get('total_wagered',0):.0f}", inline=True)
-        embed.add_field(name="Total Returned",value=f"{CURRENCY}{data.get('total_returned',0):.0f}",inline=True)
+        embed.add_field(name="Total Wagered",  value=f"{CURRENCY}{data.get('total_wagered',0):.0f}",  inline=True)
+        embed.add_field(name="Total Returned", value=f"{CURRENCY}{data.get('total_returned',0):.0f}", inline=True)
+        profit = data.get("total_returned", 0.0) - data.get("total_wagered", 0.0)
+        p_str  = f"+{profit:.0f}" if profit >= 0 else f"{profit:.0f}"
+        embed.add_field(name="Net P/L", value=f"{CURRENCY}{p_str}", inline=True)
 
         if bets:
             recent = "\n".join(
@@ -535,7 +539,7 @@ class NBABetting(commands.Cog):
     @app_commands.describe(event_id="ESPN Event ID to void all bets for")
     async def admin_voidgame(self, ctx: commands.Context, event_id: str) -> None:
         """Void all pending bets for a specific game and refund stakes."""
-        pending = self.bets.get_all_pending(ctx.guild.id)
+        pending   = self.bets.get_all_pending(ctx.guild.id)
         game_bets = [b for b in pending if b["event_id"] == event_id]
         if not game_bets:
             return await ctx.send(f"No pending bets found for event `{event_id}`.")
@@ -553,9 +557,52 @@ class NBABetting(commands.Cog):
         for bet in game_bets:
             self.bets.settle_bet(ctx.guild.id, bet["id"], "push", bet["stake"])
             await self.economy.add(ctx.guild.id, int(bet["user_id"]), bet["stake"])
+            await self.economy.record_push(ctx.guild.id, int(bet["user_id"]), bet["stake"])
             count += 1
 
         await msg.edit(content=f"✅ Voided {count} bet(s). All stakes refunded.", view=None)
+
+    @admin_group.command(name="voidbet")
+    @app_commands.describe(bet_id="Specific Bet ID to void and refund")
+    async def admin_voidbet(self, ctx: commands.Context, bet_id: str) -> None:
+        """Void a single bet by ID and refund the stake to the bettor."""
+        bet_id = bet_id.upper().strip()
+        bet    = self.bets.get_bet(ctx.guild.id, bet_id)
+        if not bet:
+            return await ctx.send(f"❌ Bet `{bet_id}` not found.", ephemeral=True)
+        if bet["status"] != "pending":
+            return await ctx.send(
+                f"❌ Bet `{bet_id}` is already **{bet['status']}** — only pending bets can be voided.",
+                ephemeral=True,
+            )
+
+        user_id = int(bet["user_id"])
+        sel_display = bet["selection"]
+        if bet.get("bet_type") == "player_props":
+            sel_display = fmt_prop_selection(bet["selection"])
+
+        view = ConfirmView(ctx.author.id, timeout=30)
+        msg  = await ctx.send(
+            f"⚠️ Void bet `{bet_id}` (**{sel_display}**, {CURRENCY}{bet['stake']:.0f}) "
+            f"and refund the stake to <@{user_id}>?",
+            view=view,
+        )
+        await view.wait()
+        if not view.confirmed:
+            return await msg.edit(content="Void cancelled.", view=None)
+
+        ok = self.bets.settle_bet(ctx.guild.id, bet_id, "push", bet["stake"])
+        if not ok:
+            return await msg.edit(
+                content="❌ Could not void — bet may have already settled.", view=None
+            )
+
+        await self.economy.add(ctx.guild.id, user_id, bet["stake"])
+        await self.economy.record_push(ctx.guild.id, user_id, bet["stake"])
+        await msg.edit(
+            content=f"✅ Bet `{bet_id}` voided. {CURRENCY}**{bet['stake']:.0f}** refunded to <@{user_id}>.",
+            view=None,
+        )
 
     # ── Config ────────────────────────────────────────────────────────────────
 
@@ -592,10 +639,10 @@ class NBABetting(commands.Cog):
         pending_cnt = len(self.bets.get_all_pending(ctx.guild.id))
 
         embed = discord.Embed(title="⚙️ NBABetting Status", color=discord.Color.blurple())
-        embed.add_field(name="Odds Source",     value="🟢 Auto-generated (ESPN)", inline=True)
+        embed.add_field(name="Odds Source",     value="🟢 ESPN (injury-adjusted)", inline=True)
         embed.add_field(name="Admin Role",      value=role.mention if role else "Admins only", inline=True)
         embed.add_field(name="Notify Channel",  value=channel.mention if channel else "DMs only", inline=True)
         embed.add_field(name="Pending Bets",    value=str(pending_cnt), inline=True)
-        embed.add_field(name="Settlement Loop", value="🟢 Running", inline=True)
-        embed.set_footer(text="Settlement runs every 10 minutes. Use /admin settle to trigger immediately.")
+        embed.add_field(name="Settlement Loop", value="🟢 Running (every 10 min)", inline=True)
+        embed.set_footer(text="Use /admin settle to trigger settlement immediately.")
         await ctx.send(embed=embed)

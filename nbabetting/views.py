@@ -2,24 +2,40 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from datetime import datetime
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import discord
 
-from .odds import calc_profit, evaluate_bet, fmt_odds, implied_prob
+from .odds import (
+    calc_profit,
+    fmt_odds,
+    fmt_prop_selection,
+    implied_prob,
+)
 
 if TYPE_CHECKING:
     from .nbabetting import NBABetting
 
 CURRENCY = "\U0001f4b0"
-TYPE_LABELS = {"h2h": "Moneyline", "spreads": "Point Spread", "totals": "Over/Under"}
+TYPE_LABELS = {
+    "h2h":          "Moneyline",
+    "spreads":      "Point Spread",
+    "totals":       "Over/Under",
+    "player_props": "Player Props",
+}
 STATUS_EMOJI = {
     "pending":   "⏳",
     "won":       "✅",
     "lost":      "❌",
     "push":      "🔄",
     "cancelled": "🚫",
+}
+PROP_STAT_LABELS = {
+    "pts": "Points",
+    "reb": "Rebounds",
+    "ast": "Assists",
+    "pra": "Pts+Reb+Ast",
 }
 
 
@@ -46,8 +62,8 @@ class AmountModal(discord.ui.Modal, title="Enter Bet Amount"):
 
     def __init__(self, max_balance: float) -> None:
         super().__init__()
-        self.max_balance    = max_balance
-        self.value: Optional[float]  = None
+        self.max_balance = max_balance
+        self.value: Optional[float] = None
         self.modal_interaction: Optional[discord.Interaction] = None
         self.amount.placeholder = f"1 – {int(max_balance)}"
 
@@ -68,8 +84,8 @@ class AmountModal(discord.ui.Modal, title="Enter Bet Amount"):
                 ephemeral=True,
             )
             return
-        self.value              = v
-        self.modal_interaction  = interaction
+        self.value = v
+        self.modal_interaction = interaction
         await interaction.response.defer()
         self.stop()
 
@@ -97,7 +113,7 @@ class BetFlowView(discord.ui.View):
 
         # State
         self.selected_game: Optional[Dict]    = None
-        self.selected_type: Optional[str]     = None   # "h2h" | "spreads" | "totals"
+        self.selected_type: Optional[str]     = None
         self.selected_outcome: Optional[Dict] = None   # {selection, odds, point}
         self.stake: Optional[float]           = None
 
@@ -109,17 +125,12 @@ class BetFlowView(discord.ui.View):
         self.clear_items()
         options: List[discord.SelectOption] = []
         for g in self.games[:25]:
-            label = f"{g['away_abbr']} @ {g['home_abbr']}"
+            label    = f"{g['away_abbr']} @ {g['home_abbr']}"
             away_rec = f" ({g['away_record']})" if g.get("away_record") else ""
             home_rec = f" ({g['home_record']})" if g.get("home_record") else ""
-            desc = f"{g['away_team']}{away_rec} at {g['home_team']}{home_rec}"[:100]
-            state_tag = ""
-            if g.get("state") == "STATUS_IN_PROGRESS":
-                state_tag = " 🔴 LIVE"
-            elif g.get("completed"):
-                state_tag = " ✅ Final"
+            desc     = f"{g['away_team']}{away_rec} at {g['home_team']}{home_rec}"[:100]
             options.append(
-                discord.SelectOption(label=label + state_tag, description=desc, value=g["event_id"])
+                discord.SelectOption(label=label, description=desc, value=g["event_id"])
             )
         if not options:
             options.append(discord.SelectOption(label="No games available", value="__none__"))
@@ -132,20 +143,25 @@ class BetFlowView(discord.ui.View):
         self.clear_items()
         g    = self.selected_game or {}
         odds = g.get("odds", {})
+        props = g.get("player_props", {})
         options: List[discord.SelectOption] = []
         if odds.get("h2h"):
-            options.append(discord.SelectOption(label="🏆 Moneyline (Match Winner)", value="h2h"))
+            options.append(discord.SelectOption(
+                label="🏆 Moneyline (Match Winner)", value="h2h"))
         if odds.get("spreads"):
-            options.append(discord.SelectOption(label="📊 Point Spread", value="spreads"))
+            options.append(discord.SelectOption(
+                label="📊 Point Spread", value="spreads"))
         if odds.get("totals"):
-            options.append(discord.SelectOption(label="📈 Total Points (Over / Under)", value="totals"))
+            options.append(discord.SelectOption(
+                label="📈 Total Points (Over / Under)", value="totals"))
+        if props:
+            options.append(discord.SelectOption(
+                label="🎯 Player Props (Pts / Reb / Ast)", value="player_props"))
         if not options:
-            options.append(
-                discord.SelectOption(
-                    label="⚠️ No odds available yet – try closer to tip-off",
-                    value="__none__",
-                )
-            )
+            options.append(discord.SelectOption(
+                label="⚠️ No odds available yet – try closer to tip-off",
+                value="__none__",
+            ))
         sel = discord.ui.Select(placeholder="📋 Select bet type…", options=options)
         sel.callback = self._cb_type
         self.add_item(sel)
@@ -154,18 +170,19 @@ class BetFlowView(discord.ui.View):
 
     def _render_step_outcome(self) -> None:
         self.clear_items()
-        g    = self.selected_game or {}
-        odds = g.get("odds", {})
+        g        = self.selected_game or {}
+        odds     = g.get("odds", {})
         bet_type = self.selected_type
         options: List[discord.SelectOption] = []
 
         if bet_type == "h2h":
             for team, price in (odds.get("h2h") or {}).items():
-                prob = int(implied_prob(price) * 100)
+                prob  = int(implied_prob(price) * 100)
                 label = f"{team}  ({fmt_odds(price)})"[:100]
                 desc  = f"Implied win probability: ~{prob}%"
-                options.append(discord.SelectOption(label=label, description=desc,
-                                                    value=f"{team}|{price}|None", emoji="🏆"))
+                options.append(discord.SelectOption(
+                    label=label, description=desc,
+                    value=f"{team}|{price}|None", emoji="🏆"))
 
         elif bet_type == "spreads":
             for team, d in (odds.get("spreads") or {}).items():
@@ -173,8 +190,8 @@ class BetFlowView(discord.ui.View):
                 price = d["price"]
                 pt_str = f"{'+' if pt > 0 else ''}{pt}"
                 label = f"{team}  {pt_str}  ({fmt_odds(price)})"[:100]
-                options.append(discord.SelectOption(label=label,
-                                                    value=f"{team}|{price}|{pt}", emoji="📊"))
+                options.append(discord.SelectOption(
+                    label=label, value=f"{team}|{price}|{pt}", emoji="📊"))
 
         elif bet_type == "totals":
             for side, d in (odds.get("totals") or {}).items():
@@ -182,27 +199,78 @@ class BetFlowView(discord.ui.View):
                 price = d["price"]
                 label = f"{side} {pt}  ({fmt_odds(price)})"[:100]
                 emoji = "📈" if side == "Over" else "📉"
-                options.append(discord.SelectOption(label=label,
-                                                    value=f"{side}|{price}|{pt}", emoji=emoji))
+                options.append(discord.SelectOption(
+                    label=label, value=f"{side}|{price}|{pt}", emoji=emoji))
+
+        elif bet_type == "player_props":
+            # Step 1 of props: pick a player
+            props = g.get("player_props", {})
+            for pname, pdata in list(props.items())[:25]:
+                tier_star = "⭐" if pdata.get("tier") == 1 else ""
+                label = f"{tier_star}{pname}"[:100]
+                desc  = (
+                    f"Pts {pdata['pts']} | Reb {pdata['reb']} | "
+                    f"Ast {pdata['ast']} | PRA {pdata['pra']}"
+                )[:100]
+                options.append(discord.SelectOption(
+                    label=label, description=desc,
+                    value=f"__player__{pname}", emoji="🎯"))
 
         if not options:
-            options.append(discord.SelectOption(label="No odds available", value="__none__"))
+            options.append(discord.SelectOption(
+                label="No options available", value="__none__"))
 
-        sel = discord.ui.Select(placeholder="🎯 Select your pick…", options=options)
+        placeholder = (
+            "🎯 Select a player…"
+            if bet_type == "player_props"
+            else "🎯 Select your pick…"
+        )
+        sel = discord.ui.Select(placeholder=placeholder, options=options)
         sel.callback = self._cb_outcome
+        self.add_item(sel)
+        self._add_back(self._cb_back_to_type, row=1)
+        self._add_quit(row=1)
+
+    def _render_step_prop_stat(self, player_name: str) -> None:
+        """After picking a player, choose which stat to bet on."""
+        self.clear_items()
+        g     = self.selected_game or {}
+        props = g.get("player_props", {})
+        pdata = props.get(player_name, {})
+
+        options: List[discord.SelectOption] = []
+        stat_emojis = {"pts": "🏀", "reb": "💪", "ast": "🎯", "pra": "📊"}
+        for stat, label in PROP_STAT_LABELS.items():
+            line = pdata.get(stat)
+            if line is None:
+                continue
+            for direction in ("Over", "Under"):
+                emoji = stat_emojis.get(stat, "📊")
+                d_emoji = "📈" if direction == "Over" else "📉"
+                val_label = f"{direction} {line} {label} — {player_name}"[:100]
+                options.append(discord.SelectOption(
+                    label=val_label,
+                    value=f"{player_name}|{stat}|{direction}|-110|{line}",
+                    emoji=d_emoji,
+                ))
+
+        if not options:
+            options.append(discord.SelectOption(label="No props available", value="__none__"))
+
+        sel = discord.ui.Select(placeholder="📊 Choose stat & direction…", options=options)
+        sel.callback = self._cb_prop_stat
         self.add_item(sel)
         self._add_back(self._cb_back_to_type, row=1)
         self._add_quit(row=1)
 
     def _render_step_confirm(self) -> None:
         self.clear_items()
-        g       = self.selected_game or {}
         outcome = self.selected_outcome or {}
         profit  = calc_profit(self.stake or 0, outcome.get("odds", -110))
         total   = (self.stake or 0) + profit
 
         confirm = discord.ui.Button(
-            label=f"✅  Place Bet  ({CURRENCY}{total:.0f} return)",
+            label=f"✅  Confirm Bet  ({CURRENCY}{total:.0f} return)",
             style=discord.ButtonStyle.green,
         )
         confirm.callback = self._cb_confirm
@@ -223,8 +291,12 @@ class BetFlowView(discord.ui.View):
         if val == "__none__":
             return await interaction.response.send_message("No game selected.", ephemeral=True)
         await interaction.response.defer()
-        full = await self.cog.fetcher.get_game_with_odds(val)
-        self.selected_game = full or next((g for g in self.games if g["event_id"] == val), None)
+        full = await self.cog.fetcher.get_game_with_odds(
+            val,
+            guild_id=interaction.guild_id,
+            bets_manager=self.cog.bets,
+        )
+        self.selected_game    = full or next((g for g in self.games if g["event_id"] == val), None)
         self.selected_type    = None
         self.selected_outcome = None
         self.stake            = None
@@ -253,6 +325,15 @@ class BetFlowView(discord.ui.View):
         val = interaction.data["values"][0]
         if val == "__none__":
             return await interaction.response.send_message("No odds available.", ephemeral=True)
+
+        # Player props: first pick is the player, then we show stat selector
+        if val.startswith("__player__"):
+            player_name = val[len("__player__"):]
+            await interaction.response.defer()
+            self._render_step_prop_stat(player_name)
+            await self.message.edit(embed=self._build_embed(), view=self)
+            return
+
         parts = val.split("|")
         self.selected_outcome = {
             "selection": parts[0],
@@ -272,15 +353,83 @@ class BetFlowView(discord.ui.View):
         self._render_step_confirm()
         await self.message.edit(embed=self._build_embed(), view=self)
 
+    async def _cb_prop_stat(self, interaction: discord.Interaction) -> None:
+        """Callback after the player-stat direction is selected."""
+        if not await self._check(interaction):
+            return
+        val = interaction.data["values"][0]
+        if val == "__none__":
+            return await interaction.response.send_message("No props available.", ephemeral=True)
+
+        # value format: "PlayerName|stat|direction|price|line"
+        parts = val.split("|")
+        if len(parts) < 5:
+            return await interaction.response.send_message("Malformed option.", ephemeral=True)
+
+        pname, stat, direction, price_str, line_str = (
+            parts[0], parts[1], parts[2], parts[3], parts[4]
+        )
+        # Encode selection as pipe-delimited string for settlement
+        selection = f"{pname}|{stat}|{direction}"
+
+        self.selected_outcome = {
+            "selection":      selection,
+            "odds":           int(price_str),
+            "point":          float(line_str),
+            "display":        fmt_prop_selection(selection),
+        }
+        self.balance = await self.cog.economy.get_balance(
+            interaction.guild_id, self.author_id
+        )
+        modal = AmountModal(max_balance=self.balance)
+        await interaction.response.send_modal(modal)
+        timed_out = await modal.wait()
+        if timed_out or modal.value is None:
+            return
+        self.stake = modal.value
+        self._render_step_confirm()
+        await self.message.edit(embed=self._build_embed(), view=self)
+
     async def _cb_confirm(self, interaction: discord.Interaction) -> None:
+        """Show a final Yes/No confirmation before deducting balance."""
         if not await self._check(interaction):
             return
         await interaction.response.defer()
-        g       = self.selected_game or {}
+
         outcome = self.selected_outcome or {}
         stake   = self.stake or 0.0
         profit  = calc_profit(stake, outcome["odds"])
+        g       = self.selected_game or {}
 
+        # Show a clear confirmation prompt — money moves after this
+        confirm_view = ConfirmView(self.author_id, timeout=30)
+        pick_display = outcome.get("display") or outcome.get("selection", "")
+        if self.selected_type in ("spreads", "totals") and outcome.get("point") is not None:
+            pt = outcome["point"]
+            pick_display += f"  ({'+' if pt > 0 else ''}{pt})"
+
+        await self.message.edit(
+            content=(
+                f"⚠️ **Final confirmation — are you sure?**\n"
+                f"**{g.get('away_team')} @ {g.get('home_team')}**\n"
+                f"Pick: **{pick_display}** `({fmt_odds(outcome['odds'])})`\n"
+                f"Stake: {CURRENCY}**{stake:.0f}**  →  Potential return: {CURRENCY}**{stake + profit:.0f}**\n"
+                f"*This cannot be undone once confirmed.*"
+            ),
+            embed=None,
+            view=confirm_view,
+        )
+        await confirm_view.wait()
+
+        if not confirm_view.confirmed:
+            # User backed out — restore the confirm screen
+            self._render_step_confirm()
+            await self.message.edit(
+                content=None, embed=self._build_embed(), view=self
+            )
+            return
+
+        # ── Actually place the bet ─────────────────────────────────────────────
         ok = await self.cog.economy.deduct(interaction.guild_id, self.author_id, stake)
         if not ok:
             await self.message.edit(
@@ -307,18 +456,22 @@ class BetFlowView(discord.ui.View):
         await self.cog.economy.record_bet_placed(interaction.guild_id, self.author_id, stake)
 
         embed = discord.Embed(title="✅ Bet Placed!", color=discord.Color.green())
-        embed.add_field(name="Bet ID",    value=f"`{bet_id}`",                       inline=True)
-        embed.add_field(name="Game",      value=f"{g['away_team']} @ {g['home_team']}",inline=False)
+        embed.add_field(name="Bet ID",    value=f"`{bet_id}`",                              inline=True)
+        embed.add_field(name="Game",      value=f"{g['away_team']} @ {g['home_team']}",     inline=False)
         embed.add_field(name="Bet Type",  value=TYPE_LABELS.get(self.selected_type, self.selected_type), inline=True)
-        embed.add_field(name="Your Pick", value=f"**{outcome['selection']}**  ({fmt_odds(outcome['odds'])})", inline=True)
-        if outcome.get("point") is not None:
+        embed.add_field(name="Your Pick",
+                        value=f"**{outcome.get('display') or outcome['selection']}**  ({fmt_odds(outcome['odds'])})",
+                        inline=True)
+        if self.selected_type not in ("player_props",) and outcome.get("point") is not None:
             pt = outcome["point"]
             embed.add_field(name="Line", value=f"{'+' if pt > 0 else ''}{pt}", inline=True)
-        embed.add_field(name="Stake",           value=f"{CURRENCY}**{stake:.0f}**",       inline=True)
-        embed.add_field(name="Potential Profit", value=f"{CURRENCY}**{profit:.0f}**",      inline=True)
-        embed.add_field(name="Total Return",    value=f"{CURRENCY}**{stake + profit:.0f}**",inline=True)
-        embed.set_footer(text="Results settle automatically after the game ends. Use /bet mybets to check.")
-        await self.message.edit(embed=embed, view=None)
+        if self.selected_type == "player_props" and outcome.get("point") is not None:
+            embed.add_field(name="Line", value=str(outcome["point"]), inline=True)
+        embed.add_field(name="Stake",            value=f"{CURRENCY}**{stake:.0f}**",          inline=True)
+        embed.add_field(name="Potential Profit", value=f"{CURRENCY}**{profit:.0f}**",         inline=True)
+        embed.add_field(name="Total Return",     value=f"{CURRENCY}**{stake + profit:.0f}**", inline=True)
+        embed.set_footer(text="Results settle automatically after the game ends. Use /bet mybets to track.")
+        await self.message.edit(content=None, embed=embed, view=None)
         self.stop()
 
     async def _cb_back_to_game(self, interaction: discord.Interaction) -> None:
@@ -378,9 +531,6 @@ class BetFlowView(discord.ui.View):
         self.add_item(btn)
 
     def _build_embed(self) -> discord.Embed:
-        steps = {
-            None: "Step 1 / 4 — Select a Game",
-        }
         if self.selected_game is None:
             title = "🏀 NBA Bet — Step 1 / 4 — Select a Game"
         elif self.selected_type is None:
@@ -397,28 +547,33 @@ class BetFlowView(discord.ui.View):
 
         if self.selected_game:
             g   = self.selected_game
-            bm  = g.get("bookmaker", "")
             val = f"**{g['away_team']}** @ **{g['home_team']}**\n{_discord_ts(g['commence_time'])}"
-            if bm:
-                val += f"\nOdds: {bm}"
+            # Show injury notes if any
+            inj_notes = g.get("odds", {}).get("injury_notes", [])
+            if inj_notes:
+                val += "\n" + "\n".join(inj_notes[:4])
             embed.add_field(name="Game", value=val, inline=False)
 
         if self.selected_type:
-            embed.add_field(name="Bet Type", value=TYPE_LABELS.get(self.selected_type, self.selected_type), inline=True)
+            embed.add_field(
+                name="Bet Type",
+                value=TYPE_LABELS.get(self.selected_type, self.selected_type),
+                inline=True,
+            )
 
         if self.selected_outcome:
             o = self.selected_outcome
-            pick_str = f"**{o['selection']}**  ({fmt_odds(o['odds'])})"
-            if o.get("point") is not None:
+            pick_str = f"**{o.get('display') or o['selection']}**  ({fmt_odds(o['odds'])})"
+            if self.selected_type not in ("player_props",) and o.get("point") is not None:
                 pt = o["point"]
                 pick_str += f"  Line: {'+' if pt > 0 else ''}{pt}"
             embed.add_field(name="Your Pick", value=pick_str, inline=True)
 
         if self.stake is not None and self.selected_outcome:
             profit = calc_profit(self.stake, self.selected_outcome["odds"])
-            embed.add_field(name="Stake",          value=f"{CURRENCY}**{self.stake:.0f}**", inline=True)
-            embed.add_field(name="Profit If Win",  value=f"{CURRENCY}**{profit:.0f}**",    inline=True)
-            embed.add_field(name="Total Return",   value=f"{CURRENCY}**{self.stake+profit:.0f}**", inline=True)
+            embed.add_field(name="Stake",         value=f"{CURRENCY}**{self.stake:.0f}**",         inline=True)
+            embed.add_field(name="Profit If Win", value=f"{CURRENCY}**{profit:.0f}**",             inline=True)
+            embed.add_field(name="Total Return",  value=f"{CURRENCY}**{self.stake + profit:.0f}**", inline=True)
 
         embed.set_footer(text="Times out in 3 min  •  Use Back / Quit to navigate")
         return embed
@@ -439,7 +594,7 @@ class BetFlowView(discord.ui.View):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class GamesView(discord.ui.View):
-    """Paginated NBA schedule with live scores."""
+    """Paginated NBA schedule with live scores and injury flags."""
 
     PAGE_SIZE = 5
 
@@ -479,7 +634,7 @@ class GamesView(discord.ui.View):
             name = f"{g['away_team']}{away_rec} @ {g['home_team']}{home_rec}"
             embed.add_field(name=name, value=status, inline=False)
 
-        embed.set_footer(text="Use /bet place to place a bet on any upcoming game.")
+        embed.set_footer(text="🔒 Betting locks once a game tips off. Use /bet place for upcoming games.")
         return embed
 
     @discord.ui.button(emoji="⬅️", style=discord.ButtonStyle.secondary)
@@ -501,7 +656,6 @@ class GamesView(discord.ui.View):
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, emoji="🔄")
     async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer()
-        # Caller refreshes the games list from outside; here we just re-render
         await self.message.edit(embed=self.build_embed(), view=self)
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, emoji="❌")
@@ -552,10 +706,10 @@ class LeaderboardView(discord.ui.View):
             medal  = medals.get(rank, f"**#{rank + 1}**")
             member = self.guild.get_member(int(e["user_id"]))
             name   = member.display_name if member else f"Unknown ({e['user_id']})"
-            w      = e.get("bets_won", 0)
+            w      = e.get("bets_won",  0)
             l      = e.get("bets_lost", 0)
             total_bets = w + l
-            win_pct = f"{w/total_bets*100:.0f}%" if total_bets > 0 else "—"
+            win_pct = f"{w / total_bets * 100:.0f}%" if total_bets > 0 else "—"
             profit  = e.get("total_returned", 0.0) - e.get("total_wagered", 0.0)
             p_str   = f"+{profit:.0f}" if profit >= 0 else f"{profit:.0f}"
             lines.append(
@@ -564,9 +718,7 @@ class LeaderboardView(discord.ui.View):
                 f"W/L `{w}/{l}` · Win% `{win_pct}` · P/L `{p_str}`"
             )
         embed.description = "\n".join(lines) if lines else "No players yet."
-        embed.set_footer(
-            text=f"{start + 1}–{start + len(chunk)} of {len(self.entries)} players"
-        )
+        embed.set_footer(text=f"{start + 1}–{start + len(chunk)} of {len(self.entries)} players")
         return embed
 
     @discord.ui.button(emoji="⬅️", style=discord.ButtonStyle.secondary)
@@ -599,45 +751,11 @@ class LeaderboardView(discord.ui.View):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# My Bets view (with per-item cancel buttons)
+# My Bets / History view
 # ══════════════════════════════════════════════════════════════════════════════
 
-class _CancelBetButton(discord.ui.Button):
-    """A cancel button that knows which bet ID it belongs to."""
-
-    def __init__(self, bet_id: str, row: int = 1) -> None:
-        super().__init__(
-            label=f"Cancel {bet_id}",
-            style=discord.ButtonStyle.secondary,
-            emoji="🗑️",
-            row=row,
-        )
-        self.bet_id = bet_id
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        v: MyBetsView = self.view  # type: ignore[assignment]
-        if interaction.user.id != v.author_id:
-            return await interaction.response.send_message("Not your bets.", ephemeral=True)
-
-        await interaction.response.defer()
-        cancelled = v.cog.bets.cancel_bet(v.guild_id, self.bet_id)
-        if cancelled:
-            await v.cog.economy.add(v.guild_id, v.author_id, cancelled["stake"])
-            # Refresh list
-            v.bets = v.cog.bets.get_user_bets(v.guild_id, v.author_id, "pending")
-            v.page = min(v.page, max(0, math.ceil(len(v.bets) / v.PAGE_SIZE) - 1))
-            v._rebuild()
-            await v.message.edit(
-                content=f"✅ Bet `{self.bet_id}` cancelled. {CURRENCY}**{cancelled['stake']:.0f}** refunded.",
-                embed=v.build_embed(),
-                view=v,
-            )
-        else:
-            await interaction.followup.send("Bet not found or already settled.", ephemeral=True)
-
-
 class MyBetsView(discord.ui.View):
-    """Paginated active-bets view with inline cancel buttons."""
+    """Paginated bets view — no cancellation, bets are final once placed."""
 
     PAGE_SIZE = 3
 
@@ -648,16 +766,14 @@ class MyBetsView(discord.ui.View):
         author_id: int,
         guild_id: int,
         title: str = "📋 My Active Bets",
-        show_cancel: bool = True,
     ) -> None:
         super().__init__(timeout=120)
-        self.bets        = bets
-        self.cog         = cog
-        self.author_id   = author_id
-        self.guild_id    = guild_id
-        self.title       = title
-        self.show_cancel = show_cancel
-        self.page        = 0
+        self.bets      = bets
+        self.cog       = cog
+        self.author_id = author_id
+        self.guild_id  = guild_id
+        self.title     = title
+        self.page      = 0
         self.message: Optional[discord.Message] = None
         self._rebuild()
 
@@ -681,13 +797,6 @@ class MyBetsView(discord.ui.View):
         self.add_item(nxt)
         self.add_item(close)
 
-        if self.show_cancel:
-            start = self.page * self.PAGE_SIZE
-            chunk = self.bets[start: start + self.PAGE_SIZE]
-            for bet in chunk:
-                if bet["status"] == "pending":
-                    self.add_item(_CancelBetButton(bet_id=bet["id"], row=1))
-
     def build_embed(self) -> discord.Embed:
         start = self.page * self.PAGE_SIZE
         chunk = self.bets[start: start + self.PAGE_SIZE]
@@ -699,23 +808,36 @@ class MyBetsView(discord.ui.View):
             emoji = STATUS_EMOJI.get(bet["status"], "❓")
             tl    = TYPE_LABELS.get(bet["bet_type"], bet["bet_type"])
             line  = ""
-            if bet.get("point") is not None:
+            if bet.get("point") is not None and bet["bet_type"] != "player_props":
                 pt   = bet["point"]
                 line = f"  Line: {'+' if pt > 0 else ''}{pt}"
+            elif bet.get("point") is not None and bet["bet_type"] == "player_props":
+                line = f"  Line: {bet['point']}"
+
+            # Nice display for selection
+            sel_display = bet["selection"]
+            if bet["bet_type"] == "player_props":
+                sel_display = fmt_prop_selection(bet["selection"])
+
             payout_str = ""
             if bet["status"] == "won" and bet.get("actual_payout") is not None:
                 payout_str = f"\n**Won:** {CURRENCY}**{bet['actual_payout']:.0f}**"
             elif bet["status"] == "push":
-                payout_str = f"\n**Push** – stake returned"
+                payout_str = "\n**Push** – stake returned"
+
             val = (
                 f"**Game:** {bet['away_team']} @ {bet['home_team']}\n"
-                f"**Type:** {tl}  |  **Pick:** {bet['selection']}  ({fmt_odds(bet['odds'])}){line}\n"
+                f"**Type:** {tl}  |  **Pick:** {sel_display}  ({fmt_odds(bet['odds'])}){line}\n"
                 f"**Stake:** {CURRENCY}{bet['stake']:.0f}  →  "
                 f"**Potential Win:** {CURRENCY}{bet['potential_payout']:.0f}"
                 f"{payout_str}\n"
                 f"**Placed:** {_discord_ts(bet['placed_at'])}"
             )
-            embed.add_field(name=f"{emoji} `{bet['id']}`  —  {bet['status'].upper()}", value=val, inline=False)
+            embed.add_field(
+                name=f"{emoji} `{bet['id']}`  —  {bet['status'].upper()}",
+                value=val,
+                inline=False,
+            )
         total = max(1, math.ceil(len(self.bets) / self.PAGE_SIZE))
         embed.set_footer(text=f"Page {self.page+1}/{total} · {len(self.bets)} total bet(s)")
         return embed

@@ -142,20 +142,26 @@ class BetsManager:
         self._save(guild_id)
         return True
 
-    def cancel_bet(self, guild_id: int, bet_id: str) -> Optional[Dict]:
-        """Cancel a pending bet. Returns the bet dict on success, None otherwise."""
+    def get_bet_distribution(self, guild_id: int, event_id: str) -> Dict[str, float]:
+        """
+        Return total money wagered per selection for an event.
+        Used by the odds engine for line movement.
+        e.g. {"Lakers": 1500.0, "Warriors": 800.0, "Over": 600.0, "Under": 200.0}
+        """
         data = self._load(guild_id)
-        if bet_id not in data["active"]:
-            return None
-        bet = data["active"][bet_id]
-        if bet["status"] != "pending":
-            return None
-        data["active"].pop(bet_id)
-        bet["status"]     = "cancelled"
-        bet["settled_at"] = _now()
-        data["settled"][bet_id] = bet
-        self._save(guild_id)
-        return bet
+        dist: Dict[str, float] = {}
+        for pool in ("active", "settled"):
+            for bet in data[pool].values():
+                if bet.get("event_id") != event_id:
+                    continue
+                if bet.get("status") == "cancelled":
+                    continue
+                if bet.get("bet_type") == "player_props":
+                    continue   # props don't affect spread/total lines
+                sel = bet.get("selection", "")
+                if sel:
+                    dist[sel] = dist.get(sel, 0.0) + bet.get("stake", 0.0)
+        return dist
 
     def get_all_guilds(self) -> List[int]:
         return [int(p.stem) for p in self._base.glob("*.json")]
