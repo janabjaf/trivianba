@@ -1,0 +1,15 @@
+{
+  "name": "NBABetting",
+  "short": "NBA betting with real odds, live economy, and auto-settlement.",
+  "description": "Full NBA betting cog. Real game schedules from ESPN, live odds from The Odds API, per-guild economy (starting balance 100\ud83d\udcb0), auto-settlement background task, leaderboard, admin controls, and interactive slash-command UI with dropdowns, buttons, and modals.",
+  "end_user_data_statement": "This cog stores per-user economy balances and bet history (user ID, amounts, picks) per guild. Data can be cleared by a guild admin at any time.",
+  "hidden": false,
+  "disabled": false,
+  "min_bot_version": "3.5.0",
+  "min_python_version": [3, 8, 0],
+  "requirements": ["aiohttp>=3.8.0"],
+  "tags": ["nba", "betting", "economy", "sports", "slash", "casino"],
+  "install_msg": "**NBABetting setup:**\n1. Get a free Odds API key at https://the-odds-api.com (500 req/month free).\n2. Run `/admin config oddskey YOUR_KEY` in your server.\n3. Optionally set an admin role: `/admin config setrole @Role`.\n\nWithout an Odds API key the cog still works \u2014 game schedules load from ESPN but odds won\u2019t display.",
+  "author": ["jaffar21"],
+  "version": "1.0.0"
+}
