@@ -14,7 +14,8 @@ ESPN_SCOREBOARD  = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba
 ESPN_INJURIES    = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
 ESPN_SUMMARY     = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary"
 ESPN_LEADERS     = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/leaders"
-ESPN_TEAM_STATS  = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/statistics"
+ESPN_TEAM_STATS    = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/statistics"
+ESPN_TEAM_LEADERS  = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/leaders"
 
 # ── Cache TTLs (seconds) ──────────────────────────────────────────────────────
 GAMES_TTL        = 120     # 2 min
@@ -543,9 +544,13 @@ class OddsFetcher:
         self._leaders_cache:    Dict[str, Dict] = {}
         self._leaders_ts:       float = 0.0
 
-        # Per-team stats cache: {abbr: {ppg, papg, off_rtg, def_rtg, ...}}
+        # Per-team scoring stats cache: {abbr: {ppg, papg, ...}}
         self._team_stats_cache: Dict[str, Dict] = {}
         self._team_stats_ts:    Dict[str, float] = {}
+
+        # Per-team player leaders cache: {abbr: {player_name: {pts, reb, ast, ...}}}
+        self._team_leaders_cache: Dict[str, Dict] = {}
+        self._team_leaders_ts:    Dict[str, float] = {}
 
         # Set of team abbrs that played yesterday (for B2B detection)
         self._played_yesterday: Set[str] = set()
@@ -681,6 +686,87 @@ class OddsFetcher:
         self._played_yesterday    = played
         self._played_yesterday_ts = now
         return played
+
+    # ── Per-team player leaders (for props) ───────────────────────────────────
+
+    async def get_team_player_leaders(self, abbr: str) -> Dict[str, Dict]:
+        """
+        Fetch the top scorers/rebounders/assisters for a specific team from ESPN.
+        Returns {player_name: {pts, reb, ast, pra, team_abbr, tier}}.
+        Falls back to empty dict on failure; merged with global leaders in caller.
+        """
+        now = time.monotonic()
+        if (
+            abbr in self._team_leaders_cache
+            and now - self._team_leaders_ts.get(abbr, 0) < LEADERS_TTL
+        ):
+            return self._team_leaders_cache[abbr]
+
+        team_id = TEAM_IDS.get(abbr)
+        if not team_id:
+            return {}
+
+        session = await self._get_session()
+        result: Dict[str, Dict] = {}
+
+        try:
+            url = ESPN_TEAM_LEADERS.format(team_id=team_id)
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return {}
+                data = await resp.json(content_type=None)
+
+            # ESPN team leaders: data["leaders"] is a list of stat categories
+            # Each category has "leaders" list with athlete + value
+            stat_name_map = {
+                "points":   "pts",
+                "avgpoints": "pts",
+                "rebounds":  "reb",
+                "avgrebounds": "reb",
+                "assists":   "ast",
+                "avgassists": "ast",
+            }
+
+            for category in data.get("leaders", []):
+                cat_name = category.get("name", "").lower().replace(" ", "")
+                stat_key = stat_name_map.get(cat_name)
+                if not stat_key:
+                    # Try abbreviation field
+                    abbrev_map = {"pts": "pts", "reb": "reb", "ast": "ast",
+                                  "rpg": "reb", "apg": "ast", "ppg": "pts"}
+                    stat_key = abbrev_map.get(
+                        category.get("abbreviation", "").lower()
+                    )
+                if not stat_key:
+                    continue
+
+                for entry in category.get("leaders", [])[:5]:
+                    athlete = entry.get("athlete", {})
+                    pname   = athlete.get("displayName", "")
+                    if not pname:
+                        continue
+                    try:
+                        value = float(entry.get("value", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if pname not in result:
+                        result[pname] = {
+                            "pts": 0.0, "reb": 0.0, "ast": 0.0,
+                            "team_abbr": abbr,
+                        }
+                    result[pname][stat_key] = value
+
+        except Exception:
+            pass
+
+        # Compute PRA and tier for each player
+        for pname, d in result.items():
+            d["pra"]  = d["pts"] + d["reb"] + d["ast"]
+            d["tier"] = _player_tier(d["pts"])
+
+        self._team_leaders_cache[abbr] = result
+        self._team_leaders_ts[abbr]    = now
+        return result
 
     # ── Season stat leaders ───────────────────────────────────────────────────
 
@@ -863,13 +949,37 @@ class OddsFetcher:
         if not game:
             return None
 
+        home_abbr = game.get("home_abbr", "")
+        away_abbr = game.get("away_abbr", "")
+
         # Fetch all data in parallel
-        injuries, stat_leaders, home_ts, away_ts = await asyncio.gather(
+        (
+            injuries, stat_leaders,
+            home_ts, away_ts,
+            home_team_leaders, away_team_leaders,
+        ) = await asyncio.gather(
             self.get_injuries(),
             self.get_stat_leaders(),
-            self.get_team_stats(game.get("home_abbr", "")),
-            self.get_team_stats(game.get("away_abbr", "")),
+            self.get_team_stats(home_abbr),
+            self.get_team_stats(away_abbr),
+            self.get_team_player_leaders(home_abbr),
+            self.get_team_player_leaders(away_abbr),
         )
+
+        # Merge team-specific leaders (guaranteed to have players from both teams)
+        # into global leaders. Team leaders take precedence if both have the player.
+        props_leaders: Dict[str, Dict] = {}
+        for src in (stat_leaders, home_team_leaders, away_team_leaders):
+            for pname, pdata in src.items():
+                if pdata.get("team_abbr") in (home_abbr, away_abbr):
+                    if pname not in props_leaders:
+                        props_leaders[pname] = pdata
+                    else:
+                        # Merge: keep the higher stat values (team leaders are more accurate)
+                        existing = props_leaders[pname]
+                        for key in ("pts", "reb", "ast", "pra"):
+                            if pdata.get(key, 0) > existing.get(key, 0):
+                                existing[key] = pdata[key]
 
         # Line movement from server's bet volume (optional)
         bet_dist: Dict[str, float] = {}
@@ -880,7 +990,7 @@ class OddsFetcher:
                 pass
 
         odds  = generate_odds_for_game(game, injuries, stat_leaders, home_ts, away_ts, bet_dist)
-        props = generate_player_props_for_game(game, stat_leaders)
+        props = generate_player_props_for_game(game, props_leaders)
 
         return {**game, "odds": odds, "player_props": props}
 

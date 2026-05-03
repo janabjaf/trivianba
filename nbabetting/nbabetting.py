@@ -373,7 +373,7 @@ class NBABetting(commands.Cog):
                 "All games today have either started or finished — try again when new games are scheduled!"
             )
 
-        view = BetFlowView(self, ctx.author.id, upcoming, balance)
+        view = BetFlowView(self, ctx.author.id, ctx.guild.id, upcoming, balance)
         msg  = await ctx.send(embed=view._build_embed(), view=view)
         view.message = msg
 

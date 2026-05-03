@@ -30,8 +30,8 @@ class Economy:
 
     async def add(self, guild_id: int, user_id: int, amount: float) -> float:
         """Add amount and return new balance."""
-        conf = self.config.member_from_ids(guild_id, user_id)
-        bal = await conf.balance()
+        conf    = self.config.member_from_ids(guild_id, user_id)
+        bal     = await conf.balance()
         new_bal = round(bal + amount, 2)
         await conf.balance.set(new_bal)
         return new_bal
@@ -39,7 +39,7 @@ class Economy:
     async def deduct(self, guild_id: int, user_id: int, amount: float) -> bool:
         """Deduct amount. Returns False if insufficient funds."""
         conf = self.config.member_from_ids(guild_id, user_id)
-        bal = await conf.balance()
+        bal  = await conf.balance()
         if bal < amount:
             return False
         await conf.balance.set(round(bal - amount, 2))
@@ -50,10 +50,10 @@ class Economy:
 
     async def record_bet_placed(self, guild_id: int, user_id: int, stake: float) -> None:
         conf = self.config.member_from_ids(guild_id, user_id)
-        async with conf.total_wagered() as tw:
-            tw += stake
-        async with conf.bets_placed() as bp:
-            bp += 1
+        tw   = await conf.total_wagered()
+        await conf.total_wagered.set(round(tw + stake, 2))
+        bp   = await conf.bets_placed()
+        await conf.bets_placed.set(bp + 1)
 
     async def record_win(self, guild_id: int, user_id: int, payout: float) -> None:
         """
@@ -61,22 +61,23 @@ class Economy:
         This is what gets added to total_returned so that P/L = returned - wagered is correct.
         """
         conf = self.config.member_from_ids(guild_id, user_id)
-        async with conf.total_returned() as tr:
-            tr += payout
-        async with conf.bets_won() as bw:
-            bw += 1
+        tr   = await conf.total_returned()
+        await conf.total_returned.set(round(tr + payout, 2))
+        bw   = await conf.bets_won()
+        await conf.bets_won.set(bw + 1)
 
     async def record_loss(self, guild_id: int, user_id: int) -> None:
-        async with self.config.member_from_ids(guild_id, user_id).bets_lost() as bl:
-            bl += 1
+        conf = self.config.member_from_ids(guild_id, user_id)
+        bl   = await conf.bets_lost()
+        await conf.bets_lost.set(bl + 1)
 
     async def record_push(self, guild_id: int, user_id: int, stake: float) -> None:
         """Record a push.  stake is returned, so add it to total_returned."""
         conf = self.config.member_from_ids(guild_id, user_id)
-        async with conf.total_returned() as tr:
-            tr += stake
-        async with conf.bets_push() as bp:
-            bp += 1
+        tr   = await conf.total_returned()
+        await conf.total_returned.set(round(tr + stake, 2))
+        bpush = await conf.bets_push()
+        await conf.bets_push.set(bpush + 1)
 
     # ── Bulk operations (admin) ────────────────────────────────────────────────
 
@@ -112,6 +113,6 @@ class Economy:
     async def get_leaderboard(self, guild: discord.Guild) -> List[Dict]:
         """Return top-100 members sorted by balance desc."""
         all_data = await self.config.all_members(guild)
-        entries = [{"user_id": str(uid), **data} for uid, data in all_data.items()]
+        entries  = [{"user_id": str(uid), **data} for uid, data in all_data.items()]
         entries.sort(key=lambda e: e.get("balance", 0.0), reverse=True)
         return entries[:100]

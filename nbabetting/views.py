@@ -101,12 +101,14 @@ class BetFlowView(discord.ui.View):
         self,
         cog: "NBABetting",
         author_id: int,
+        guild_id: int,
         games: List[Dict],
         balance: float,
     ) -> None:
         super().__init__(timeout=180)
         self.cog       = cog
         self.author_id = author_id
+        self.guild_id  = guild_id
         self.games     = games
         self.balance   = balance
         self.message: Optional[discord.Message] = None
@@ -402,7 +404,7 @@ class BetFlowView(discord.ui.View):
         g       = self.selected_game or {}
 
         # Show a clear confirmation prompt — money moves after this
-        confirm_view = ConfirmView(self.author_id, timeout=30)
+        confirm_view = ConfirmView(self.author_id, timeout=60)
         pick_display = outcome.get("display") or outcome.get("selection", "")
         if self.selected_type in ("spreads", "totals") and outcome.get("point") is not None:
             pt = outcome["point"]
@@ -422,7 +424,7 @@ class BetFlowView(discord.ui.View):
         await confirm_view.wait()
 
         if not confirm_view.confirmed:
-            # User backed out — restore the confirm screen
+            # User cancelled or timed out — restore the confirm screen
             self._render_step_confirm()
             await self.message.edit(
                 content=None, embed=self._build_embed(), view=self
@@ -430,49 +432,64 @@ class BetFlowView(discord.ui.View):
             return
 
         # ── Actually place the bet ─────────────────────────────────────────────
-        ok = await self.cog.economy.deduct(interaction.guild_id, self.author_id, stake)
-        if not ok:
+        try:
+            ok = await self.cog.economy.deduct(self.guild_id, self.author_id, stake)
+            if not ok:
+                await self.message.edit(
+                    content="❌ Insufficient balance.", embed=None, view=None
+                )
+                self.stop()
+                return
+
+            bet_id = self.cog.bets.place_bet(
+                self.guild_id,
+                self.author_id,
+                event_id=g["event_id"],
+                home_team=g["home_team"],
+                away_team=g["away_team"],
+                game_name=g.get("name", ""),
+                commence_time=g.get("commence_time", ""),
+                bet_type=self.selected_type,
+                selection=outcome["selection"],
+                odds=outcome["odds"],
+                point=outcome["point"],
+                stake=stake,
+                potential_payout=profit,
+            )
+            await self.cog.economy.record_bet_placed(self.guild_id, self.author_id, stake)
+
+            embed = discord.Embed(title="✅ Bet Placed!", color=discord.Color.green())
+            embed.add_field(name="Bet ID",   value=f"`{bet_id}`",                          inline=True)
+            embed.add_field(name="Game",     value=f"{g['away_team']} @ {g['home_team']}", inline=False)
+            embed.add_field(
+                name="Bet Type",
+                value=TYPE_LABELS.get(self.selected_type, self.selected_type),
+                inline=True,
+            )
+            embed.add_field(
+                name="Your Pick",
+                value=f"**{outcome.get('display') or outcome['selection']}**  ({fmt_odds(outcome['odds'])})",
+                inline=True,
+            )
+            if self.selected_type != "player_props" and outcome.get("point") is not None:
+                pt = outcome["point"]
+                embed.add_field(name="Line", value=f"{'+' if pt > 0 else ''}{pt}", inline=True)
+            elif self.selected_type == "player_props" and outcome.get("point") is not None:
+                embed.add_field(name="Line", value=str(outcome["point"]), inline=True)
+            embed.add_field(name="Stake",            value=f"{CURRENCY}**{stake:.0f}**",          inline=True)
+            embed.add_field(name="Potential Profit", value=f"{CURRENCY}**{profit:.0f}**",         inline=True)
+            embed.add_field(name="Total Return",     value=f"{CURRENCY}**{stake + profit:.0f}**", inline=True)
+            embed.set_footer(text="Results settle automatically after the game ends. Use /bet history to track.")
+            await self.message.edit(content=None, embed=embed, view=None)
+            self.stop()
+
+        except Exception as exc:
             await self.message.edit(
-                content="❌ Insufficient balance.", embed=None, view=None
+                content=f"❌ Something went wrong placing your bet: `{exc}`\nPlease try again.",
+                embed=None,
+                view=None,
             )
             self.stop()
-            return
-
-        bet_id = self.cog.bets.place_bet(
-            interaction.guild_id,
-            self.author_id,
-            event_id=g["event_id"],
-            home_team=g["home_team"],
-            away_team=g["away_team"],
-            game_name=g.get("name", ""),
-            commence_time=g.get("commence_time", ""),
-            bet_type=self.selected_type,
-            selection=outcome["selection"],
-            odds=outcome["odds"],
-            point=outcome["point"],
-            stake=stake,
-            potential_payout=profit,
-        )
-        await self.cog.economy.record_bet_placed(interaction.guild_id, self.author_id, stake)
-
-        embed = discord.Embed(title="✅ Bet Placed!", color=discord.Color.green())
-        embed.add_field(name="Bet ID",    value=f"`{bet_id}`",                              inline=True)
-        embed.add_field(name="Game",      value=f"{g['away_team']} @ {g['home_team']}",     inline=False)
-        embed.add_field(name="Bet Type",  value=TYPE_LABELS.get(self.selected_type, self.selected_type), inline=True)
-        embed.add_field(name="Your Pick",
-                        value=f"**{outcome.get('display') or outcome['selection']}**  ({fmt_odds(outcome['odds'])})",
-                        inline=True)
-        if self.selected_type not in ("player_props",) and outcome.get("point") is not None:
-            pt = outcome["point"]
-            embed.add_field(name="Line", value=f"{'+' if pt > 0 else ''}{pt}", inline=True)
-        if self.selected_type == "player_props" and outcome.get("point") is not None:
-            embed.add_field(name="Line", value=str(outcome["point"]), inline=True)
-        embed.add_field(name="Stake",            value=f"{CURRENCY}**{stake:.0f}**",          inline=True)
-        embed.add_field(name="Potential Profit", value=f"{CURRENCY}**{profit:.0f}**",         inline=True)
-        embed.add_field(name="Total Return",     value=f"{CURRENCY}**{stake + profit:.0f}**", inline=True)
-        embed.set_footer(text="Results settle automatically after the game ends. Use /bet mybets to track.")
-        await self.message.edit(content=None, embed=embed, view=None)
-        self.stop()
 
     async def _cb_back_to_game(self, interaction: discord.Interaction) -> None:
         if not await self._check(interaction):
