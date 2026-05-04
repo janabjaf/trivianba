@@ -176,5 +176,64 @@ class BetsManager:
                     dist[sel] = dist.get(sel, 0.0) + bet.get("stake", 0.0)
         return dist
 
+    def place_parlay(
+        self,
+        guild_id: int,
+        user_id: int,
+        *,
+        legs: List[Dict],
+        combined_odds: int,
+        stake: float,
+        potential_payout: float,
+    ) -> str:
+        """Save a parlay bet and return its ID (prefixed 'P')."""
+        bet_id = "P" + str(uuid.uuid4())[:7].upper()
+        data   = self._load(guild_id)
+        data["active"][bet_id] = {
+            "id":               bet_id,
+            "guild_id":         str(guild_id),
+            "user_id":          str(user_id),
+            "bet_type":         "parlay",
+            "legs":             legs,
+            "odds":             combined_odds,
+            "stake":            stake,
+            "potential_payout": potential_payout,
+            "status":           "pending",
+            "placed_at":        _now(),
+            "settled_at":       None,
+            "result":           None,
+            "actual_payout":    None,
+        }
+        self._save(guild_id)
+        return bet_id
+
+    def get_bets_placed_today(self, guild_id: int, user_id: int) -> int:
+        """Count how many bets this user has placed today (UTC calendar day)."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        data  = self._load(guild_id)
+        uid   = str(user_id)
+        count = 0
+        for pool in ("active", "settled"):
+            for bet in data[pool].values():
+                if bet.get("user_id") != uid:
+                    continue
+                if (bet.get("placed_at") or "").startswith(today):
+                    count += 1
+        return count
+
+    def get_wagered_today(self, guild_id: int, user_id: int) -> float:
+        """Return total amount wagered today (UTC) by this user."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        data  = self._load(guild_id)
+        uid   = str(user_id)
+        total = 0.0
+        for pool in ("active", "settled"):
+            for bet in data[pool].values():
+                if bet.get("user_id") != uid:
+                    continue
+                if (bet.get("placed_at") or "").startswith(today):
+                    total += float(bet.get("stake", 0.0))
+        return total
+
     def get_all_guilds(self) -> List[int]:
         return [int(p.stem) for p in self._base.glob("*.json")]

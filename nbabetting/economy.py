@@ -12,6 +12,10 @@ if TYPE_CHECKING:
 STARTING_BALANCE: float = 1000.0
 CURRENCY: str = "\U0001f4b0"
 
+# Bet limits (server-wide defaults, configurable per guild via /admin setlimits)
+DEFAULT_MAX_BET_PCT: float  = 0.50   # max single bet as fraction of current balance
+DEFAULT_MAX_DAILY_BETS: int = 20     # max individual bets placed per user per day
+
 
 class Economy:
     """Wraps Red Config to provide per-guild, per-user economy operations."""

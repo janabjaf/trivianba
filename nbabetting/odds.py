@@ -16,6 +16,7 @@ ESPN_SUMMARY     = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba
 ESPN_LEADERS     = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/leaders"
 ESPN_TEAM_STATS    = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/statistics"
 ESPN_TEAM_LEADERS  = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/leaders"
+ESPN_TEAM_ROSTER   = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/roster"
 
 # ── Cache TTLs (seconds) ──────────────────────────────────────────────────────
 GAMES_TTL        = 120     # 2 min
@@ -110,6 +111,89 @@ def _spread_vig(spread_abs: float) -> Tuple[int, int]:
     if spread_abs <= 6.0:   return -112, -108
     if spread_abs <= 9.0:   return -115, -105
     return -118, -102
+
+
+# ── Opening line tracking (in-memory, never overwritten after first set) ──────
+
+_opening_lines: Dict[str, Dict[str, float]] = {}
+
+
+def record_opening_line(event_id: str, spread: float, total: float) -> None:
+    """Record the first computed spread/total for an event. Never updates after set."""
+    if event_id not in _opening_lines:
+        _opening_lines[event_id] = {"spread": spread, "total": total}
+
+
+def get_opening_line(event_id: str) -> Optional[Dict[str, float]]:
+    """Return the opening spread/total dict if we have seen this event before."""
+    return _opening_lines.get(event_id)
+
+
+# ── Parlay odds combiner ───────────────────────────────────────────────────────
+
+def calc_parlay_odds(prices: List[int]) -> int:
+    """
+    Convert a list of American odds into combined parlay odds.
+    Each price is converted to a decimal multiplier, multiplied together,
+    then converted back to American.
+
+    Examples:
+        [-110, -110]        → +264  (2-team parlay, standard juice)
+        [-110, -110, -110]  → +596  (3-team parlay)
+        [-150, +130, -110]  → approximately +350
+    """
+    if not prices:
+        return -110
+    if len(prices) == 1:
+        return prices[0]
+    decimal = 1.0
+    for p in prices:
+        if p >= 0:
+            decimal *= (p / 100.0) + 1.0
+        else:
+            decimal *= (100.0 / abs(p)) + 1.0
+    if decimal >= 2.0:
+        return int(round((decimal - 1.0) * 100))
+    return int(round(-100.0 / (decimal - 1.0)))
+
+
+# ── Prop juice engine ─────────────────────────────────────────────────────────
+
+def _prop_juice(tier: int, is_questionable: bool = False) -> Tuple[int, int]:
+    """
+    Return (over_price, under_price) for a player prop.
+
+    Real bookmakers shade props based on:
+    - Stars attract massive public over action → over is more expensive
+    - Questionable players → wider spread (uncertainty premium)
+    - Bench players → near-standard juice
+    """
+    if is_questionable:
+        if tier == 1:
+            return (-108, -112)   # star questionable: slight under-juice edge
+        return (-105, -115)       # role player questionable: under is the sharper side
+    if tier == 1:
+        return (-118, +100)       # public hammers star overs — charge extra vig
+    if tier == 2:
+        return (-115, -105)       # rotation players: mild public over lean
+    return (-110, -110)           # bench: standard flat juice
+
+
+# ── Public-action vig boost ───────────────────────────────────────────────────
+
+def _public_vig_boost(pct_on_popular_side: float) -> int:
+    """
+    Extra juice (pts magnitude) charged to the popular side.
+    When 65%+ of server money is on one side, the book shades the price.
+    Returns a non-negative int to ADD to the popular side's juice magnitude.
+    """
+    if pct_on_popular_side >= 0.82:
+        return 12
+    if pct_on_popular_side >= 0.74:
+        return 8
+    if pct_on_popular_side >= 0.65:
+        return 4
+    return 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -358,6 +442,17 @@ def generate_odds_for_game(
     if spread_abs < 0.5:  # pick'em
         h_ml = a_ml = -110
 
+    # ── Public action vig boost ───────────────────────────────────────────────
+    # When the server's bettors heavily lean one side, charge that side extra vig
+    h2h_money = bet_dist.get(home_team, 0.0) + bet_dist.get(away_team, 0.0)
+    if h2h_money >= 50:
+        home_pct = bet_dist.get(home_team, 0.0) / h2h_money
+        away_pct = 1.0 - home_pct
+        if home_pct >= 0.65:
+            h_ml -= _public_vig_boost(home_pct)
+        elif away_pct >= 0.65:
+            a_ml -= _public_vig_boost(away_pct)
+
     # ── Total ─────────────────────────────────────────────────────────────────
     if h_ppg and h_papg and a_ppg and a_papg:
         h_expected = (h_ppg + a_papg) / 2
@@ -387,6 +482,28 @@ def generate_odds_for_game(
     else:
         h_spread_price, a_spread_price = dog_price, fav_price
 
+    # ── Totals juice (varies with public action) ──────────────────────────────
+    over_price  = -110
+    under_price = -110
+    ou_money = bet_dist.get("Over", 0.0) + bet_dist.get("Under", 0.0)
+    if ou_money >= 50:
+        over_pct  = bet_dist.get("Over",  0.0) / ou_money
+        under_pct = 1.0 - over_pct
+        if over_pct >= 0.65:
+            boost       = _public_vig_boost(over_pct)
+            over_price  -= boost
+            under_price  = min(under_price + boost - 2, -102)
+        elif under_pct >= 0.65:
+            boost       = _public_vig_boost(under_pct)
+            under_price -= boost
+            over_price   = min(over_price + boost - 2, -102)
+
+    # ── Record opening line & compute movement ────────────────────────────────
+    record_opening_line(game["event_id"], spread, total)
+    opening        = get_opening_line(game["event_id"]) or {}
+    opening_spread = opening.get("spread", spread)
+    opening_total  = opening.get("total",  total)
+
     # ── Line movement note ────────────────────────────────────────────────────
     if abs(spread_mv) >= 0.5 or abs(total_mv) >= 0.5:
         injury_notes.append("📊 Line has moved due to betting action on this server.")
@@ -401,13 +518,17 @@ def generate_odds_for_game(
             away_team: {"price": a_spread_price, "point":  spread},
         },
         "totals": {
-            "Over":  {"price": -110, "point": total},
-            "Under": {"price": -110, "point": total},
+            "Over":  {"price": over_price,  "point": total},
+            "Under": {"price": under_price, "point": total},
         },
         "injury_notes": injury_notes,
         "_meta": {
             "spread":           spread,
             "total":            total,
+            "opening_spread":   opening_spread,
+            "opening_total":    opening_total,
+            "spread_move":      round(spread - opening_spread, 1),
+            "total_move":       round(total  - opening_total,  1),
             "h_power":          round(h_power, 3),
             "a_power":          round(a_power, 3),
             "h_back_to_back":   home_ts.get("is_back_to_back", False),
@@ -424,33 +545,80 @@ def generate_odds_for_game(
 
 def generate_player_props_for_game(
     game: Dict,
-    stat_leaders: Dict[str, Dict],
+    props_pool: Dict[str, Dict],
+    questionable_players: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
-    """Build player prop lines from live ESPN season-leader data."""
+    """
+    Build player prop over/under lines for every available player.
+
+    props_pool keys: {player_name: {pts, reb, ast, pra, tier, team_abbr}}
+
+    Line logic:
+    - Star players (tier 1, pts >= 20):  line = avg - 0.5, rounded to nearest 0.5
+    - Rotation players (tier 2, pts >= 12): same formula
+    - Bench players (tier 3 / pts < 12): minimum lines set (pts 7.5, reb 3.5, ast 1.5)
+      so betting is still meaningful rather than on trivially small numbers.
+
+    Players with completely zero stats AND not in the game summary are skipped —
+    they are likely two-way / G-League call-ups with no ESPN data.
+    """
     props: Dict[str, Any] = {}
     home_abbr = game.get("home_abbr", "")
     away_abbr = game.get("away_abbr", "")
 
-    for pname, pdata in stat_leaders.items():
-        if pdata.get("team_abbr") not in (home_abbr, away_abbr):
+    def _line(val: float, offset: float = -0.5) -> float:
+        """Round to nearest 0.5 with the given offset."""
+        return round((val + offset) * 2) / 2
+
+    def _bench_line(val: float, minimum: float, offset: float = -0.5) -> float:
+        raw = _line(val, offset)
+        return max(raw, minimum)
+
+    for pname, pdata in props_pool.items():
+        if pdata.get("team_abbr", "") not in (home_abbr, away_abbr):
             continue
 
-        pts = pdata.get("pts", 0.0)
-        reb = pdata.get("reb", 0.0)
-        ast = pdata.get("ast", 0.0)
-        pra = pts + reb + ast
+        pts  = float(pdata.get("pts", 0.0))
+        reb  = float(pdata.get("reb", 0.0))
+        ast  = float(pdata.get("ast", 0.0))
+        pra  = pts + reb + ast
         tier = _player_tier(pts)
 
-        def _line(val: float, offset: float = -0.5) -> float:
-            return round((val + offset) * 2) / 2
+        # Skip players with no stats at all (truly unknown bench players)
+        if pts == 0.0 and reb == 0.0 and ast == 0.0:
+            continue
+
+        if tier == 3:
+            # Bench players: enforce minimum lines so bets are meaningful
+            pts_line = _bench_line(pts, 7.5)
+            reb_line = _bench_line(reb, 3.5)
+            ast_line = _bench_line(ast, 1.5)
+            pra_line = _bench_line(pra, 13.5, -1.0)
+        else:
+            pts_line = _line(pts)
+            reb_line = _line(reb)
+            ast_line = _line(ast)
+            pra_line = _line(pra, -1.0)
+
+        is_questionable = pname in (questionable_players or set())
+        over_p, under_p = _prop_juice(tier, is_questionable)
 
         props[pname] = {
-            "pts":       _line(pts),
-            "reb":       _line(reb),
-            "ast":       _line(ast),
-            "pra":       _line(pra, -1.0),
-            "team_abbr": pdata["team_abbr"],
-            "tier":      tier,
+            "pts":        pts_line,
+            "pts_over":   over_p,
+            "pts_under":  under_p,
+            "reb":        reb_line,
+            "reb_over":   over_p,
+            "reb_under":  under_p,
+            "ast":        ast_line,
+            "ast_over":   over_p,
+            "ast_under":  under_p,
+            "pra":        pra_line,
+            "pra_over":   over_p,
+            "pra_under":  under_p,
+            "team_abbr":  pdata.get("team_abbr", ""),
+            "tier":       tier,
+            "status":     "questionable" if is_questionable else "active",
         }
 
     return props
@@ -548,9 +716,13 @@ class OddsFetcher:
         self._team_stats_cache: Dict[str, Dict] = {}
         self._team_stats_ts:    Dict[str, float] = {}
 
-        # Per-team player leaders cache: {abbr: {player_name: {pts, reb, ast, ...}}}
-        self._team_leaders_cache: Dict[str, Dict] = {}
-        self._team_leaders_ts:    Dict[str, float] = {}
+        # Per-team roster cache: {abbr: {player_name: status_str}}
+        self._team_roster_cache: Dict[str, Dict] = {}
+        self._team_roster_ts:    Dict[str, float] = {}
+
+        # Per-game summary roster cache: {event_id: {player_name: {pts,reb,ast,pra,team_abbr,available}}}
+        self._summary_roster_cache: Dict[str, Dict] = {}
+        self._summary_roster_ts:    Dict[str, float] = {}
 
         # Set of team abbrs that played yesterday (for B2B detection)
         self._played_yesterday: Set[str] = set()
@@ -687,129 +859,267 @@ class OddsFetcher:
         self._played_yesterday_ts = now
         return played
 
-    # ── Per-team player leaders (for props) ───────────────────────────────────
+    # ── Per-team roster (availability) ───────────────────────────────────────
 
-    async def get_team_player_leaders(self, abbr: str) -> Dict[str, Dict]:
+    async def get_team_roster(self, abbr: str) -> Dict[str, str]:
         """
-        Fetch the top scorers/rebounders/assisters for a specific team from ESPN.
-        Returns {player_name: {pts, reb, ast, pra, team_abbr, tier}}.
-        Falls back to empty dict on failure; merged with global leaders in caller.
+        Fetch the full active roster for a team from ESPN.
+        Returns {player_name: status} where status is lowercase e.g. "active", "out",
+        "questionable", "doubtful", "day-to-day", "inactive".
+        Used to know every player on the team and filter unavailable ones.
         """
         now = time.monotonic()
         if (
-            abbr in self._team_leaders_cache
-            and now - self._team_leaders_ts.get(abbr, 0) < LEADERS_TTL
+            abbr in self._team_roster_cache
+            and now - self._team_roster_ts.get(abbr, 0) < LEADERS_TTL
         ):
-            return self._team_leaders_cache[abbr]
+            return self._team_roster_cache[abbr]
 
         team_id = TEAM_IDS.get(abbr)
         if not team_id:
             return {}
 
-        session = await self._get_session()
-        result: Dict[str, Dict] = {}
+        session  = await self._get_session()
+        result: Dict[str, str] = {}
 
         try:
-            url = ESPN_TEAM_LEADERS.format(team_id=team_id)
+            url = ESPN_TEAM_ROSTER.format(team_id=team_id)
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
                     return {}
                 data = await resp.json(content_type=None)
 
-            # ESPN team leaders: data["leaders"] is a list of stat categories
-            # Each category has "leaders" list with athlete + value
-            stat_name_map = {
-                "points":   "pts",
-                "avgpoints": "pts",
-                "rebounds":  "reb",
-                "avgrebounds": "reb",
-                "assists":   "ast",
-                "avgassists": "ast",
-            }
+            # ESPN roster: top-level "athletes" can be:
+            #   (a) flat list of athlete dicts, OR
+            #   (b) list of position-group dicts each with "items" list
+            raw_athletes: List[Dict] = []
+            for item in data.get("athletes", []):
+                if "items" in item:
+                    raw_athletes.extend(item["items"])
+                elif "displayName" in item or "fullName" in item:
+                    raw_athletes.append(item)
 
-            for category in data.get("leaders", []):
-                cat_name = category.get("name", "").lower().replace(" ", "")
-                stat_key = stat_name_map.get(cat_name)
-                if not stat_key:
-                    # Try abbreviation field
-                    abbrev_map = {"pts": "pts", "reb": "reb", "ast": "ast",
-                                  "rpg": "reb", "apg": "ast", "ppg": "pts"}
-                    stat_key = abbrev_map.get(
-                        category.get("abbreviation", "").lower()
-                    )
-                if not stat_key:
+            for athlete in raw_athletes:
+                pname = athlete.get("displayName") or athlete.get("fullName", "")
+                if not pname:
                     continue
 
-                for entry in category.get("leaders", [])[:5]:
-                    athlete = entry.get("athlete", {})
-                    pname   = athlete.get("displayName", "")
-                    if not pname:
-                        continue
-                    try:
-                        value = float(entry.get("value", 0))
-                    except (TypeError, ValueError):
-                        continue
-                    if pname not in result:
-                        result[pname] = {
-                            "pts": 0.0, "reb": 0.0, "ast": 0.0,
-                            "team_abbr": abbr,
-                        }
-                    result[pname][stat_key] = value
+                # Determine availability status
+                # injuries is a list; if empty or first entry is "Active" → active
+                injuries = athlete.get("injuries", [])
+                if not injuries:
+                    status = "active"
+                else:
+                    raw_status = (injuries[0].get("status", "") or "").lower()
+                    # Normalise ESPN status strings
+                    if raw_status in ("", "active"):
+                        status = "active"
+                    elif "out" in raw_status:
+                        status = "out"
+                    elif "questionable" in raw_status:
+                        status = "questionable"
+                    elif "doubtful" in raw_status:
+                        status = "doubtful"
+                    elif "day" in raw_status:
+                        status = "day-to-day"
+                    elif "inactive" in raw_status or "suspension" in raw_status:
+                        status = "inactive"
+                    else:
+                        status = "active"
+
+                result[pname] = status
 
         except Exception:
             pass
 
-        # Compute PRA and tier for each player
-        for pname, d in result.items():
-            d["pra"]  = d["pts"] + d["reb"] + d["ast"]
-            d["tier"] = _player_tier(d["pts"])
+        if result:
+            self._team_roster_cache[abbr] = result
+            self._team_roster_ts[abbr]    = now
+        return result
 
-        self._team_leaders_cache[abbr] = result
-        self._team_leaders_ts[abbr]    = now
+    # ── Per-game summary roster (player stats from ESPN pre-game data) ─────────
+
+    async def _parse_summary_roster(
+        self, event_id: str, home_abbr: str, away_abbr: str
+    ) -> Dict[str, Dict]:
+        """
+        Parse the ESPN game summary's 'rosters' section.
+        Returns {player_name: {pts, reb, ast, pra, tier, team_abbr, available}}.
+        ESPN pre-game summaries include every expected player with season averages
+        and their game-day availability status.
+        Falls back to empty dict if the section is missing or the call fails.
+        """
+        now = time.monotonic()
+        if (
+            event_id in self._summary_roster_cache
+            and now - self._summary_roster_ts.get(event_id, 0) < LEADERS_TTL
+        ):
+            return self._summary_roster_cache[event_id]
+
+        session = await self._get_session()
+        result: Dict[str, Dict] = {}
+        valid_abbrs = {home_abbr, away_abbr}
+
+        # ESPN stat name → our internal key
+        stat_name_map: Dict[str, str] = {
+            "avgpoints":    "pts", "points":    "pts", "pointspergame":    "pts",
+            "avgrebounds":  "reb", "rebounds":  "reb", "reboundspergame":  "reb",
+            "avgassists":   "ast", "assists":   "ast", "assistspergame":   "ast",
+            "ppg": "pts", "rpg": "reb", "apg": "ast",
+        }
+
+        def _extract_stats(athlete: Dict) -> Dict[str, float]:
+            """Walk the nested statistics tree ESPN uses."""
+            out: Dict[str, float] = {"pts": 0.0, "reb": 0.0, "ast": 0.0}
+            stats_obj = athlete.get("statistics") or {}
+            splits    = stats_obj.get("splits") or {}
+            categories = splits.get("categories") or []
+            for cat in categories:
+                for s in cat.get("stats") or []:
+                    sname = (s.get("name") or "").lower().replace(" ", "").replace("_", "")
+                    skey  = stat_name_map.get(sname)
+                    if skey and s.get("value") is not None:
+                        try:
+                            out[skey] = float(s["value"])
+                        except (TypeError, ValueError):
+                            pass
+            return out
+
+        try:
+            async with session.get(
+                ESPN_SUMMARY,
+                params={"event": event_id},
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                if resp.status != 200:
+                    return {}
+                data = await resp.json(content_type=None)
+
+            for team_block in data.get("rosters", []):
+                team_abbr = (
+                    team_block.get("team", {}).get("abbreviation", "")
+                    or team_block.get("team", {}).get("abbrev", "")
+                ).upper()
+                if team_abbr not in valid_abbrs:
+                    continue
+
+                for entry in team_block.get("roster") or []:
+                    athlete = entry.get("athlete") or {}
+                    pname   = athlete.get("displayName") or athlete.get("fullName", "")
+                    if not pname:
+                        continue
+
+                    # Availability
+                    did_not_play = entry.get("didNotPlay", False)
+                    status_name  = (
+                        (entry.get("status") or {})
+                        .get("type", {})
+                        .get("name", "")
+                    ).lower()
+                    available = (
+                        not did_not_play
+                        and status_name not in ("inactive", "out", "suspended")
+                    )
+
+                    stats = _extract_stats(athlete)
+                    pts, reb, ast = stats["pts"], stats["reb"], stats["ast"]
+                    pra   = pts + reb + ast
+                    tier  = _player_tier(pts)
+
+                    result[pname] = {
+                        "pts":       pts,
+                        "reb":       reb,
+                        "ast":       ast,
+                        "pra":       pra,
+                        "tier":      tier,
+                        "team_abbr": team_abbr,
+                        "available": available,
+                    }
+
+        except Exception:
+            pass
+
+        if result:
+            self._summary_roster_cache[event_id] = result
+            self._summary_roster_ts[event_id]    = now
         return result
 
     # ── Season stat leaders ───────────────────────────────────────────────────
 
     async def get_stat_leaders(self, force: bool = False) -> Dict[str, Dict]:
+        """
+        Fetch season stat leaders from ESPN with a high limit (500).
+        Tries multiple paths to extract team abbreviation from each athlete entry.
+        """
         now = time.monotonic()
         if not force and self._leaders_cache and now - self._leaders_ts < LEADERS_TTL:
             return self._leaders_cache
 
         session = await self._get_session()
         merged: Dict[str, Dict] = {}
+
+        # ESPN uses different category names depending on endpoint version
         category_key_map = {
-            "pointsPerGame":   "pts",
-            "reboundsPerGame": "reb",
-            "assistsPerGame":  "ast",
+            "pointspergame":   "pts",
+            "reboundspergame": "reb",
+            "assistspergame":  "ast",
+            "points":          "pts",
+            "rebounds":        "reb",
+            "assists":         "ast",
+            "scoring":         "pts",
+            "ppg":             "pts",
+            "rpg":             "reb",
+            "apg":             "ast",
         }
+
+        def _abbr_from_athlete(athlete: Dict) -> str:
+            """Try every known path ESPN uses to store team abbreviation."""
+            checks = [
+                lambda a: a.get("team", {}).get("abbreviation", ""),
+                lambda a: a.get("teamAbbrev", ""),
+                lambda a: a.get("team", {}).get("abbrev", ""),
+                lambda a: (a.get("team") or {}).get("shortDisplayName", ""),
+                lambda a: a.get("teamShortName", ""),
+            ]
+            for fn in checks:
+                try:
+                    v = fn(athlete)
+                    if v and len(v) <= 4:
+                        return v.upper()
+                except Exception:
+                    pass
+            return ""
 
         try:
             async with session.get(
                 ESPN_LEADERS,
-                params={"limit": 50},
-                timeout=aiohttp.ClientTimeout(total=10),
+                params={"limit": 500},
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status != 200:
                     return self._leaders_cache
                 data = await resp.json(content_type=None)
 
             for category in data.get("leaders", []):
-                stat_key = category_key_map.get(category.get("name", ""))
+                cat_name = (
+                    category.get("name", "")
+                    or category.get("abbreviation", "")
+                ).lower().replace(" ", "").replace("_", "")
+                stat_key = category_key_map.get(cat_name)
                 if not stat_key:
                     continue
                 for entry in category.get("leaders", []):
                     try:
-                        athlete   = entry["athlete"]
-                        pname     = athlete["displayName"]
-                        team_abbr = (
-                            athlete.get("team", {}).get("abbreviation", "")
-                            or athlete.get("teamAbbrev", "")
-                        ).upper()
-                        value = float(entry.get("value", 0))
+                        athlete    = entry["athlete"]
+                        pname      = athlete.get("displayName", "") or athlete.get("fullName", "")
+                        if not pname:
+                            continue
+                        team_abbr  = _abbr_from_athlete(athlete)
+                        value      = float(entry.get("value", 0))
                     except (KeyError, TypeError, ValueError):
                         continue
                     if pname not in merged:
-                        merged[pname] = {"pts": 0.0, "reb": 0.0, "ast": 0.0, "team_abbr": team_abbr}
+                        merged[pname] = {"pts": 0.0, "reb": 0.0, "ast": 0.0, "team_abbr": ""}
                     merged[pname][stat_key] = value
                     if team_abbr:
                         merged[pname]["team_abbr"] = team_abbr
@@ -818,7 +1128,8 @@ class OddsFetcher:
             for pname, d in merged.items():
                 if d["pts"] == 0.0 and d["reb"] == 0.0 and d["ast"] == 0.0:
                     continue
-                d["pra"] = d["pts"] + d["reb"] + d["ast"]
+                d["pra"]  = d["pts"] + d["reb"] + d["ast"]
+                d["tier"] = _player_tier(d["pts"])
                 leaders[pname] = d
 
             if leaders:
@@ -952,34 +1263,94 @@ class OddsFetcher:
         home_abbr = game.get("home_abbr", "")
         away_abbr = game.get("away_abbr", "")
 
-        # Fetch all data in parallel
+        # Fetch all data sources in parallel
         (
             injuries, stat_leaders,
             home_ts, away_ts,
-            home_team_leaders, away_team_leaders,
+            home_roster, away_roster,
+            summary_roster,
         ) = await asyncio.gather(
             self.get_injuries(),
             self.get_stat_leaders(),
             self.get_team_stats(home_abbr),
             self.get_team_stats(away_abbr),
-            self.get_team_player_leaders(home_abbr),
-            self.get_team_player_leaders(away_abbr),
+            self.get_team_roster(home_abbr),
+            self.get_team_roster(away_abbr),
+            self._parse_summary_roster(event_id, home_abbr, away_abbr),
         )
 
-        # Merge team-specific leaders (guaranteed to have players from both teams)
-        # into global leaders. Team leaders take precedence if both have the player.
-        props_leaders: Dict[str, Dict] = {}
-        for src in (stat_leaders, home_team_leaders, away_team_leaders):
-            for pname, pdata in src.items():
-                if pdata.get("team_abbr") in (home_abbr, away_abbr):
-                    if pname not in props_leaders:
-                        props_leaders[pname] = pdata
-                    else:
-                        # Merge: keep the higher stat values (team leaders are more accurate)
-                        existing = props_leaders[pname]
-                        for key in ("pts", "reb", "ast", "pra"):
-                            if pdata.get(key, 0) > existing.get(key, 0):
-                                existing[key] = pdata[key]
+        # ── Build props player pool ────────────────────────────────────────────
+        #
+        # Priority (highest → lowest):
+        #   1. ESPN game summary rosters  — game-specific players + season avgs
+        #   2. Global stat leaders        — wide coverage, season avgs
+        #   3. Team roster names          — guarantees every player appears
+        #
+        # Availability filter:
+        #   - Players marked "out" or "inactive" in team roster are excluded.
+        #   - Players marked unavailable in the game summary are also excluded.
+        #   - Injured players from the injuries endpoint (status "out") are excluded.
+        # ──────────────────────────────────────────────────────────────────────
+
+        # Collect injury "out" names from the injuries report
+        injury_out: set = set()
+        for team_abbr_key in (home_abbr, away_abbr):
+            for inj in injuries.get(team_abbr_key, []):
+                if inj.get("status", "").lower() in ("out",):
+                    injury_out.add(inj["name"])
+
+        # Merge availability from team rosters
+        combined_roster: Dict[str, str] = {}
+        for pname, status in home_roster.items():
+            combined_roster[pname] = status
+        for pname, status in away_roster.items():
+            combined_roster[pname] = status
+
+        def _is_available(pname: str, summary_entry: Optional[Dict] = None) -> bool:
+            if pname in injury_out:
+                return False
+            if summary_entry is not None and not summary_entry.get("available", True):
+                return False
+            roster_status = combined_roster.get(pname, "active")
+            return roster_status not in ("out", "inactive")
+
+        # Start with global leaders that belong to either team in this game
+        props_pool: Dict[str, Dict] = {}
+
+        for pname, pdata in stat_leaders.items():
+            t = pdata.get("team_abbr", "")
+            if t in (home_abbr, away_abbr):
+                if _is_available(pname):
+                    props_pool[pname] = dict(pdata)
+
+        # Overlay/add from game summary (most authoritative for this specific game)
+        for pname, sdata in summary_roster.items():
+            if not _is_available(pname, sdata):
+                continue
+            if pname in props_pool:
+                # Keep the higher stats (summary may have more recent data)
+                ex = props_pool[pname]
+                for key in ("pts", "reb", "ast", "pra"):
+                    if sdata.get(key, 0) > ex.get(key, 0):
+                        ex[key] = sdata[key]
+                ex["tier"] = _player_tier(ex["pts"])
+            else:
+                props_pool[pname] = dict(sdata)
+
+        # Fill in any roster player not yet in the pool with zero-stats placeholder
+        # (they still appear as bettable — bench contribution bets are valid)
+        for pname, status in combined_roster.items():
+            if status in ("out", "inactive"):
+                continue
+            if pname in injury_out:
+                continue
+            if pname not in props_pool:
+                # Determine team_abbr from which roster they're in
+                t = home_abbr if pname in home_roster else away_abbr
+                props_pool[pname] = {
+                    "pts": 0.0, "reb": 0.0, "ast": 0.0, "pra": 0.0,
+                    "tier": 3, "team_abbr": t,
+                }
 
         # Line movement from server's bet volume (optional)
         bet_dist: Dict[str, float] = {}
@@ -989,10 +1360,29 @@ class OddsFetcher:
             except Exception:
                 pass
 
-        odds  = generate_odds_for_game(game, injuries, stat_leaders, home_ts, away_ts, bet_dist)
-        props = generate_player_props_for_game(game, props_leaders)
+        # Build questionable/doubtful players set for prop juice shading
+        questionable_players: Set[str] = set()
+        for team_abbr_key in (home_abbr, away_abbr):
+            for inj in injuries.get(team_abbr_key, []):
+                if inj.get("status", "").lower() in ("questionable", "doubtful", "day-to-day"):
+                    questionable_players.add(inj["name"])
 
-        return {**game, "odds": odds, "player_props": props}
+        odds  = generate_odds_for_game(game, injuries, stat_leaders, home_ts, away_ts, bet_dist)
+        props = generate_player_props_for_game(game, props_pool, questionable_players)
+
+        # Build public betting action percentages for UI display
+        h2h_money = bet_dist.get(game["home_team"], 0.0) + bet_dist.get(game["away_team"], 0.0)
+        ou_money  = bet_dist.get("Over", 0.0) + bet_dist.get("Under", 0.0)
+        public_action = {
+            "h2h_total": int(h2h_money),
+            "ou_total":  int(ou_money),
+            "home_pct":  round(bet_dist.get(game["home_team"], 0.0) / h2h_money, 3) if h2h_money > 0 else 0.5,
+            "away_pct":  round(bet_dist.get(game["away_team"], 0.0) / h2h_money, 3) if h2h_money > 0 else 0.5,
+            "over_pct":  round(bet_dist.get("Over",  0.0) / ou_money, 3) if ou_money > 0 else 0.5,
+            "under_pct": round(bet_dist.get("Under", 0.0) / ou_money, 3) if ou_money > 0 else 0.5,
+        }
+
+        return {**game, "odds": odds, "player_props": props, "public_action": public_action}
 
     # ── Box score ─────────────────────────────────────────────────────────────
 

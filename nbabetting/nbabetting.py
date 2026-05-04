@@ -11,14 +11,16 @@ from redbot.core import Config, commands
 from redbot.core.bot import Red
 
 from .data import BetsManager
-from .economy import CURRENCY, STARTING_BALANCE, Economy
-from .odds import OddsFetcher, calc_profit, evaluate_bet, fmt_odds, fmt_prop_selection
+from .economy import CURRENCY, DEFAULT_MAX_BET_PCT, DEFAULT_MAX_DAILY_BETS, STARTING_BALANCE, Economy
+from .odds import OddsFetcher, calc_parlay_odds, calc_profit, evaluate_bet, fmt_odds, fmt_prop_selection
 from .views import (
     BetFlowView,
     ConfirmView,
     GamesView,
     LeaderboardView,
     MyBetsView,
+    OddsView,
+    ParlayBuilderView,
 )
 
 log = logging.getLogger("red.jaffar-cogs.nbabetting")
@@ -66,6 +68,8 @@ class NBABetting(commands.Cog):
         self.config.register_guild(
             admin_role=None,
             notify_channel=None,
+            max_bet_pct=DEFAULT_MAX_BET_PCT,
+            max_daily_bets=DEFAULT_MAX_DAILY_BETS,
         )
 
         # ── Helpers ───────────────────────────────────────────────────────────
@@ -130,11 +134,15 @@ class NBABetting(commands.Cog):
             if not pending:
                 continue
 
-            # Pre-fetch box scores only for events that have pending player-prop bets
-            prop_event_ids = {
-                b["event_id"] for b in pending
-                if b["bet_type"] == "player_props"
-            }
+            # Pre-fetch box scores for all events with player-prop or parlay bets
+            prop_event_ids: set = set()
+            for b in pending:
+                if b["bet_type"] == "player_props":
+                    prop_event_ids.add(b["event_id"])
+                elif b["bet_type"] == "parlay":
+                    for leg in b.get("legs", []):
+                        if leg.get("leg_type") == "player_props":
+                            prop_event_ids.add(leg["event_id"])
             box_scores: dict = {}
             for eid in prop_event_ids:
                 if eid in completed_by_id:
@@ -143,18 +151,100 @@ class NBABetting(commands.Cog):
                         box_scores[eid] = bs
 
             for bet in pending:
+                user_id = int(bet["user_id"])
+                stake   = bet["stake"]
+
+                # ── Parlay settlement ──────────────────────────────────────────
+                if bet["bet_type"] == "parlay":
+                    legs = bet.get("legs", [])
+                    if not legs:
+                        continue
+
+                    leg_results: List[str] = []
+                    can_settle = True
+
+                    for leg in legs:
+                        leg_game = completed_by_id.get(leg["event_id"])
+                        if not leg_game or leg_game.get("home_score") is None:
+                            can_settle = False
+                            break
+
+                        if leg.get("leg_type") == "player_props":
+                            ps = box_scores.get(leg["event_id"])
+                            if ps is None:
+                                can_settle = False
+                                break
+                            leg_result = evaluate_bet(
+                                bet_type="player_props",
+                                selection=leg["selection"],
+                                point=leg.get("point"),
+                                home_team=leg_game["home_team"],
+                                away_team=leg_game["away_team"],
+                                home_score=leg_game["home_score"],
+                                away_score=leg_game["away_score"],
+                                player_stats=ps,
+                            )
+                        else:
+                            leg_result = evaluate_bet(
+                                bet_type=leg["leg_type"],
+                                selection=leg["selection"],
+                                point=leg.get("point"),
+                                home_team=leg_game["home_team"],
+                                away_team=leg_game["away_team"],
+                                home_score=leg_game["home_score"],
+                                away_score=leg_game["away_score"],
+                            )
+                        leg_results.append(leg_result)
+
+                    if not can_settle:
+                        continue
+
+                    if "lost" in leg_results:
+                        result = "lost"
+                        payout = 0.0
+                    elif all(r == "won" for r in leg_results):
+                        result = "won"
+                        payout = stake + bet["potential_payout"]
+                    else:
+                        # Some legs pushed — reduce parlay to surviving legs
+                        surviving = [
+                            legs[i] for i, r in enumerate(leg_results) if r != "push"
+                        ]
+                        if len(surviving) < 2:
+                            result = "push"
+                            payout = stake
+                        else:
+                            new_odds   = calc_parlay_odds([lg["odds"] for lg in surviving])
+                            new_profit = calc_profit(stake, new_odds)
+                            result     = "won"
+                            payout     = stake + new_profit
+
+                    if result == "won":
+                        await self.economy.add(guild_id, user_id, payout)
+                        await self.economy.record_win(guild_id, user_id, payout)
+                    elif result == "push":
+                        await self.economy.add(guild_id, user_id, payout)
+                        await self.economy.record_push(guild_id, user_id, stake)
+                    else:
+                        payout = 0.0
+                        await self.economy.record_loss(guild_id, user_id)
+
+                    self.bets.settle_bet(guild_id, bet["id"], result, payout)
+                    await self._notify_result(guild_id, user_id, bet, result, payout)
+                    continue
+
+                # ── Single bet settlement ──────────────────────────────────────
                 game = completed_by_id.get(bet["event_id"])
                 if not game:
                     continue
                 if game.get("home_score") is None or game.get("away_score") is None:
                     continue
 
-                # For player props we need the box score; skip until available
                 player_stats = None
                 if bet["bet_type"] == "player_props":
                     player_stats = box_scores.get(bet["event_id"])
                     if player_stats is None:
-                        continue   # Box score not available yet; settle next cycle
+                        continue
 
                 result = evaluate_bet(
                     bet_type=bet["bet_type"],
@@ -167,19 +257,17 @@ class NBABetting(commands.Cog):
                     player_stats=player_stats,
                 )
 
-                user_id = int(bet["user_id"])
-                stake   = bet["stake"]
-                profit  = bet["potential_payout"]   # stored profit-only amount
+                profit = bet["potential_payout"]
 
                 if result == "won":
                     payout = stake + profit
                     await self.economy.add(guild_id, user_id, payout)
-                    await self.economy.record_win(guild_id, user_id, payout)   # full payout
+                    await self.economy.record_win(guild_id, user_id, payout)
                 elif result == "push":
                     payout = stake
                     await self.economy.add(guild_id, user_id, payout)
-                    await self.economy.record_push(guild_id, user_id, stake)   # stake returned
-                else:   # lost
+                    await self.economy.record_push(guild_id, user_id, stake)
+                else:
                     payout = 0.0
                     await self.economy.record_loss(guild_id, user_id)
 
@@ -351,6 +439,53 @@ class NBABetting(commands.Cog):
         msg  = await ctx.send(embed=view.build_embed(), view=view)
         view.message = msg
 
+    @bet_group.command(name="odds")
+    @app_commands.describe(game="Game abbreviation or number from /bet games (default: first available)")
+    async def bet_odds(self, ctx: commands.Context, game: Optional[str] = None) -> None:
+        """Show the full odds board for a game — spreads, moneyline, totals, injuries, public action."""
+        async with ctx.typing():
+            games = await self.fetcher.get_games()
+
+        _BETTABLE_STATES = {"STATUS_SCHEDULED", "STATUS_PREGAME", ""}
+        upcoming = [
+            g for g in games
+            if not g.get("completed") and g.get("state", "") in _BETTABLE_STATES
+        ]
+        if not upcoming:
+            return await ctx.send("No upcoming games available right now.")
+
+        # Match game argument: check abbr or index (1-based)
+        target_game = None
+        if game:
+            game_lower = game.lower()
+            for g in upcoming:
+                if (
+                    game_lower in g.get("home_abbr", "").lower()
+                    or game_lower in g.get("away_abbr", "").lower()
+                    or game_lower in g.get("home_team", "").lower()
+                    or game_lower in g.get("away_team", "").lower()
+                ):
+                    target_game = g
+                    break
+            if target_game is None and game.isdigit():
+                idx = int(game) - 1
+                if 0 <= idx < len(upcoming):
+                    target_game = upcoming[idx]
+        if target_game is None:
+            target_game = upcoming[0]
+
+        full = await self.fetcher.get_game_with_odds(
+            target_game["event_id"],
+            guild_id=ctx.guild.id,
+            bets_manager=self.bets,
+        )
+        if not full:
+            return await ctx.send("Could not fetch odds for that game.")
+
+        view = OddsView(full, ctx.author.id)
+        msg  = await ctx.send(embed=view.build_embed(), view=view)
+        view.message = msg
+
     @bet_group.command(name="place")
     async def bet_place(self, ctx: commands.Context) -> None:
         """Open the interactive bet placement menu."""
@@ -359,9 +494,6 @@ class NBABetting(commands.Cog):
             balance = await self.economy.get_balance(ctx.guild.id, ctx.author.id)
 
         # ── Only show games that haven't started yet ───────────────────────────
-        # Whitelist approach: only allow clearly pre-game states.
-        # Catches STATUS_IN_PROGRESS, STATUS_HALFTIME, STATUS_END_PERIOD,
-        # STATUS_FINAL, and any other mid/post-game state automatically.
         _BETTABLE_STATES = {"STATUS_SCHEDULED", "STATUS_PREGAME", ""}
         upcoming = [
             g for g in games
@@ -373,7 +505,55 @@ class NBABetting(commands.Cog):
                 "All games today have either started or finished — try again when new games are scheduled!"
             )
 
-        view = BetFlowView(self, ctx.author.id, ctx.guild.id, upcoming, balance)
+        # ── Bet limit checks ──────────────────────────────────────────────────
+        cfg          = await self.config.guild(ctx.guild).all()
+        max_daily    = cfg.get("max_daily_bets", DEFAULT_MAX_DAILY_BETS)
+        bets_today   = self.bets.get_bets_placed_today(ctx.guild.id, ctx.author.id)
+        if bets_today >= max_daily:
+            return await ctx.send(
+                f"🔒 You've reached the daily limit of **{max_daily}** bets. "
+                f"Limits reset at midnight UTC."
+            )
+
+        max_pct = cfg.get("max_bet_pct", DEFAULT_MAX_BET_PCT)
+        max_bet = round(balance * max_pct, 2) if max_pct > 0 else 0.0
+
+        view = BetFlowView(self, ctx.author.id, ctx.guild.id, upcoming, balance, max_bet=max_bet)
+        msg  = await ctx.send(embed=view._build_embed(), view=view)
+        view.message = msg
+
+    @bet_group.command(name="parlay")
+    async def bet_parlay(self, ctx: commands.Context) -> None:
+        """Build a multi-leg parlay (2–5 legs). Combined odds multiply together."""
+        async with ctx.typing():
+            games   = await self.fetcher.get_games()
+            balance = await self.economy.get_balance(ctx.guild.id, ctx.author.id)
+
+        _BETTABLE_STATES = {"STATUS_SCHEDULED", "STATUS_PREGAME", ""}
+        upcoming = [
+            g for g in games
+            if not g.get("completed") and g.get("state", "") in _BETTABLE_STATES
+        ]
+        if not upcoming:
+            return await ctx.send(
+                "🔒 No upcoming NBA games available for parlays right now."
+            )
+
+        # ── Daily limit check ─────────────────────────────────────────────────
+        cfg        = await self.config.guild(ctx.guild).all()
+        max_daily  = cfg.get("max_daily_bets", DEFAULT_MAX_DAILY_BETS)
+        bets_today = self.bets.get_bets_placed_today(ctx.guild.id, ctx.author.id)
+        if bets_today >= max_daily:
+            return await ctx.send(
+                f"🔒 You've reached the daily limit of **{max_daily}** bets. "
+                f"Limits reset at midnight UTC."
+            )
+
+        cfg     = await self.config.guild(ctx.guild).all()
+        max_pct = cfg.get("max_bet_pct", DEFAULT_MAX_BET_PCT)
+        max_bet = round(balance * max_pct, 2) if max_pct > 0 else 0.0
+
+        view = ParlayBuilderView(self, ctx.author.id, ctx.guild.id, upcoming, balance, max_bet=max_bet)
         msg  = await ctx.send(embed=view._build_embed(), view=view)
         view.message = msg
 
@@ -645,6 +825,44 @@ class NBABetting(commands.Cog):
             await ctx.send(f"✅ Admin role set to **{role.name}**.")
         else:
             await ctx.send("✅ Admin role cleared. Only server administrators can use admin commands.")
+
+    @admin_group.command(name="setlimits")
+    @app_commands.describe(
+        max_daily_bets="Max bets per user per day (0 = unlimited)",
+        max_bet_pct="Max single bet as % of balance, e.g. 50 = 50% (0 = unlimited)",
+    )
+    async def admin_setlimits(
+        self,
+        ctx: commands.Context,
+        max_daily_bets: Optional[int] = None,
+        max_bet_pct: Optional[float] = None,
+    ) -> None:
+        """Configure per-user betting limits for this server."""
+        changed = []
+        if max_daily_bets is not None:
+            if max_daily_bets < 0:
+                return await ctx.send("❌ max_daily_bets must be 0 or greater.", ephemeral=True)
+            await self.config.guild(ctx.guild).max_daily_bets.set(max_daily_bets)
+            label = "unlimited" if max_daily_bets == 0 else str(max_daily_bets)
+            changed.append(f"Max daily bets → **{label}**")
+        if max_bet_pct is not None:
+            if not (0 <= max_bet_pct <= 100):
+                return await ctx.send("❌ max_bet_pct must be between 0 and 100.", ephemeral=True)
+            frac = max_bet_pct / 100.0
+            await self.config.guild(ctx.guild).max_bet_pct.set(frac)
+            label = "unlimited" if max_bet_pct == 0 else f"{max_bet_pct:.0f}% of balance"
+            changed.append(f"Max single bet → **{label}**")
+        if not changed:
+            cfg = await self.config.guild(ctx.guild).all()
+            mdb  = cfg.get("max_daily_bets", DEFAULT_MAX_DAILY_BETS)
+            mbp  = cfg.get("max_bet_pct", DEFAULT_MAX_BET_PCT) * 100
+            return await ctx.send(
+                f"**Current limits:**\n"
+                f"• Max daily bets: **{mdb if mdb > 0 else 'unlimited'}**\n"
+                f"• Max single bet: **{f'{mbp:.0f}% of balance' if mbp > 0 else 'unlimited'}**\n\n"
+                f"Use `/admin setlimits max_daily_bets:<n> max_bet_pct:<pct>` to change."
+            )
+        await ctx.send("✅ Limits updated:\n" + "\n".join(f"• {c}" for c in changed))
 
     @admin_group.command(name="notifychannel")
     @app_commands.describe(channel="Channel for settlement announcements (leave blank to disable)")
