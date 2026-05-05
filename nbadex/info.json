@@ -1,0 +1,14 @@
+{
+    "name": "NBAdex",
+    "short": "The ultimate NBA draft simulator with full historical player database.",
+    "description": "NBAdex is a fully featured NBA fantasy draft game with 400+ all-time players, multiple draft modes (Snake, Auction, Best Ball, Random), position requirements, Discord UI dropdowns & buttons, season simulation, and rankings. Draft legends from every era and find out who built the best team.",
+    "end_user_data_statement": "NBAdex stores Discord user IDs and draft data (team rosters, draft picks, settings) per guild. Data is retained until the guild data is cleared or NBAdex is removed.",
+    "install_msg": "**NBAdex is ready!** Use `[p]nbadraft modes` to see all draft modes, then `[p]nbadraft create` to start a draft. Type `[p]help nbadraft` for all commands.",
+    "author": ["jaffar21"],
+    "requirements": [],
+    "tags": ["nba", "basketball", "draft", "fantasy", "sports", "game"],
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG"
+}
