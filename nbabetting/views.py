@@ -674,10 +674,11 @@ class GamesView(discord.ui.View):
 
     PAGE_SIZE = 5
 
-    def __init__(self, games: List[Dict], author_id: int) -> None:
+    def __init__(self, games: List[Dict], author_id: int, *, cog=None) -> None:
         super().__init__(timeout=120)
         self.games     = games
         self.author_id = author_id
+        self.cog       = cog
         self.page      = 0
         self.total     = max(1, math.ceil(len(games) / self.PAGE_SIZE))
         self.message: Optional[discord.Message] = None
@@ -698,10 +699,14 @@ class GamesView(discord.ui.View):
         )
         for g in chunk:
             state = g.get("state", "")
-            if state == "STATUS_IN_PROGRESS":
-                status = f"🔴 **LIVE**  {g['away_score']} – {g['home_score']}"
+            h_sc = g.get("home_score")
+            a_sc = g.get("away_score")
+            if state == "STATUS_IN_PROGRESS" and h_sc is not None and a_sc is not None:
+                status = f"🔴 **LIVE**  {a_sc} – {h_sc}"
+            elif g.get("completed") and h_sc is not None and a_sc is not None:
+                status = f"✅ Final  **{a_sc} – {h_sc}**"
             elif g.get("completed"):
-                status = f"✅ Final  **{g['away_score']} – {g['home_score']}**"
+                status = "✅ Final"
             else:
                 status = _discord_ts(g.get("commence_time", ""))
 
@@ -732,6 +737,16 @@ class GamesView(discord.ui.View):
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, emoji="🔄")
     async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer()
+        if self.cog is not None:
+            try:
+                fresh = await self.cog.fetcher.get_games(force=True)
+                if fresh:
+                    self.games = fresh
+                    self.total = max(1, math.ceil(len(fresh) / self.PAGE_SIZE))
+                    self.page  = min(self.page, self.total - 1)
+                    self._sync_buttons()
+            except Exception:
+                pass
         await self.message.edit(embed=self.build_embed(), view=self)
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, emoji="❌")
@@ -904,7 +919,12 @@ class MyBetsView(discord.ui.View):
             if bet.get("bet_type") == "parlay":
                 legs         = bet.get("legs", [])
                 legs_summary = "  ·  ".join(
-                    f"{lg['selection']} ({fmt_odds(lg['odds'])})" for lg in legs[:4]
+                    (
+                        fmt_prop_selection(lg.get("selection", ""))
+                        if lg.get("leg_type") == "player_props"
+                        else lg.get("selection", "?")
+                    ) + f" ({fmt_odds(lg['odds'])})"
+                    for lg in legs[:4]
                 )
                 if len(legs) > 4:
                     legs_summary += f"  +{len(legs)-4} more"
@@ -1000,10 +1020,20 @@ class ConfirmView(discord.ui.View):
 class OddsView(discord.ui.View):
     """Read-only full odds board for a single game."""
 
-    def __init__(self, game: Dict, author_id: int) -> None:
+    def __init__(
+        self,
+        game: Dict,
+        author_id: int,
+        cog: Optional["NBABetting"] = None,
+        guild_id: Optional[int] = None,
+        event_id: Optional[str] = None,
+    ) -> None:
         super().__init__(timeout=120)
         self.game      = game
         self.author_id = author_id
+        self.cog       = cog
+        self.guild_id  = guild_id
+        self.event_id  = event_id
         self.message: Optional[discord.Message] = None
 
     def build_embed(self) -> discord.Embed:
@@ -1117,8 +1147,17 @@ class OddsView(discord.ui.View):
     @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.primary)
     async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer()
-        full = await self.game.get("_cog_ref_fetcher")  # type: ignore
-        # Best-effort refresh: just rebuild from existing data
+        if self.cog and self.event_id:
+            try:
+                fresh = await self.cog.fetcher.get_game_with_odds(
+                    self.event_id,
+                    guild_id=self.guild_id,
+                    bets_manager=self.cog.bets,
+                )
+                if fresh:
+                    self.game = fresh
+            except Exception:
+                pass
         await self.message.edit(embed=self.build_embed(), view=self)
 
     @discord.ui.button(label="❌ Close", style=discord.ButtonStyle.danger)
@@ -1166,11 +1205,12 @@ class ParlayBuilderView(discord.ui.View):
         self.max_bet   = max_bet if max_bet > 0 else balance
         self.message: Optional[discord.Message] = None
 
-        self.legs: List[Dict]              = []
-        self.building_game: Optional[Dict] = None
-        self.building_type: Optional[str]  = None
-        self.stake: Optional[float]        = None
-        self._step: str                    = "game"
+        self.legs: List[Dict]                = []
+        self.building_game: Optional[Dict]  = None
+        self.building_type: Optional[str]   = None
+        self.building_player: Optional[str] = None
+        self.stake: Optional[float]         = None
+        self._step: str                     = "game"
 
         self._render()
 
@@ -1188,6 +1228,10 @@ class ParlayBuilderView(discord.ui.View):
             self._render_step_type()
         elif self._step == "outcome":
             self._render_step_outcome()
+        elif self._step == "prop_player":
+            self._render_step_prop_player()
+        elif self._step == "prop_stat":
+            self._render_step_prop_stat()
         elif self._step == "done_leg":
             self._render_step_done_leg()
         elif self._step == "confirm":
@@ -1195,17 +1239,18 @@ class ParlayBuilderView(discord.ui.View):
 
     def _render_step_game(self) -> None:
         self.clear_items()
-        used_ids = {leg["event_id"] for leg in self.legs}
+        # Always show all games — same-game outcome restriction is enforced at the
+        # type-selection step, so users can still add a prop from a game that
+        # already has an outcome leg in this parlay.
         options: List[discord.SelectOption] = []
         for g in self.games[:25]:
             label = f"{g['away_abbr']} @ {g['home_abbr']}"
             desc  = f"{g['away_team']} at {g['home_team']}"[:100]
             options.append(discord.SelectOption(
-                label=label, description=desc, value=g["event_id"],
-                emoji="✅" if g["event_id"] in used_ids else "🏀",
+                label=label, description=desc, value=g["event_id"], emoji="🏀",
             ))
         if not options:
-            options.append(discord.SelectOption(label="No games available", value="__none__"))
+            options.append(discord.SelectOption(label="No games available right now", value="__none__"))
         sel = discord.ui.Select(placeholder="🏀 Select a game for this leg…", options=options)
         sel.callback = self._cb_game
         self.add_item(sel)
@@ -1222,15 +1267,27 @@ class ParlayBuilderView(discord.ui.View):
 
     def _render_step_type(self) -> None:
         self.clear_items()
-        g    = self.building_game or {}
-        odds = (g.get("odds") or {})
+        g          = self.building_game or {}
+        odds       = (g.get("odds") or {})
+        props      = (g.get("player_props") or {})
+        event_id   = g.get("event_id", "")
+        # If this game already has an outcome leg in the parlay, only props are
+        # available — prevents correlated same-game outcome stacking.
+        _OUTCOME_TYPES = {"h2h", "spreads", "totals"}
+        has_outcome_leg = any(
+            leg.get("event_id") == event_id and leg.get("leg_type") in _OUTCOME_TYPES
+            for leg in self.legs
+        )
         options: List[discord.SelectOption] = []
-        if odds.get("h2h"):
-            options.append(discord.SelectOption(label="🏆 Moneyline", value="h2h"))
-        if odds.get("spreads"):
-            options.append(discord.SelectOption(label="📊 Point Spread", value="spreads"))
-        if odds.get("totals"):
-            options.append(discord.SelectOption(label="📈 Over / Under", value="totals"))
+        if not has_outcome_leg:
+            if odds.get("h2h"):
+                options.append(discord.SelectOption(label="🏆 Moneyline", value="h2h"))
+            if odds.get("spreads"):
+                options.append(discord.SelectOption(label="📊 Point Spread", value="spreads"))
+            if odds.get("totals"):
+                options.append(discord.SelectOption(label="📈 Over / Under", value="totals"))
+        if props:
+            options.append(discord.SelectOption(label="🎯 Player Props", value="player_props"))
         if not options:
             options.append(discord.SelectOption(label="No odds available", value="__none__"))
         sel = discord.ui.Select(placeholder="📋 Select bet type for this leg…", options=options)
@@ -1238,6 +1295,75 @@ class ParlayBuilderView(discord.ui.View):
         self.add_item(sel)
         back = discord.ui.Button(label="← Back", style=discord.ButtonStyle.secondary, row=1)
         back.callback = self._cb_back_game
+        self.add_item(back)
+        cancel = discord.ui.Button(label="❌ Cancel", style=discord.ButtonStyle.danger, row=1)
+        cancel.callback = self._cb_cancel
+        self.add_item(cancel)
+
+    def _render_step_prop_player(self) -> None:
+        self.clear_items()
+        g     = self.building_game or {}
+        props = (g.get("player_props") or {})
+        sorted_players = sorted(
+            props.items(),
+            key=lambda kv: (kv[1].get("tier", 3), kv[0])
+        )
+        options: List[discord.SelectOption] = []
+        for pname, pdata in sorted_players[:25]:
+            tier   = pdata.get("tier", 3)
+            is_q   = pdata.get("status") == "questionable"
+            emoji  = "⭐" if tier == 1 else ("🔵" if tier == 2 else "⚪")
+            label  = (f"⚠️ {pname} (Q)" if is_q else pname)[:100]
+            pts    = pdata.get("pts", 0.0)
+            reb    = pdata.get("reb", 0.0)
+            ast    = pdata.get("ast", 0.0)
+            pra    = pdata.get("pra", 0.0)
+            desc   = f"O/U Pts {pts} | Reb {reb} | Ast {ast} | PRA {pra}"[:100]
+            options.append(discord.SelectOption(
+                label=label, description=desc, value=pname, emoji=emoji,
+            ))
+        if not options:
+            options.append(discord.SelectOption(label="No players available", value="__none__"))
+        sel = discord.ui.Select(placeholder="🎯 Select a player…", options=options)
+        sel.callback = self._cb_prop_player
+        self.add_item(sel)
+        back = discord.ui.Button(label="← Back", style=discord.ButtonStyle.secondary, row=1)
+        back.callback = self._cb_back_type
+        self.add_item(back)
+        cancel = discord.ui.Button(label="❌ Cancel", style=discord.ButtonStyle.danger, row=1)
+        cancel.callback = self._cb_cancel
+        self.add_item(cancel)
+
+    def _render_step_prop_stat(self) -> None:
+        self.clear_items()
+        g     = self.building_game or {}
+        props = (g.get("player_props") or {})
+        pname = self.building_player or ""
+        pdata = props.get(pname, {})
+        stat_labels = {"pts": "Points", "reb": "Rebounds", "ast": "Assists", "pra": "Pts+Reb+Ast"}
+        is_q = pdata.get("status") == "questionable"
+        options: List[discord.SelectOption] = []
+        for stat, label in stat_labels.items():
+            line_val = pdata.get(stat)      # key is the stat name, not f"{stat}_line"
+            if line_val is None:
+                continue
+            for direction in ("Over", "Under"):
+                price = pdata.get(f"{stat}_{direction.lower()}", -110)
+                d_emoji = "📈" if direction == "Over" else "📉"
+                q_suffix = "  ⚠️Q" if is_q else ""
+                opt_label = f"{direction} {line_val} {label}  ({fmt_odds(price)}){q_suffix}"[:100]
+                options.append(discord.SelectOption(
+                    label=opt_label,
+                    value=f"{pname}|{stat}|{direction}|{price}|{line_val}",
+                    emoji=d_emoji,
+                ))
+        if not options:
+            options.append(discord.SelectOption(label="No props available for this player", value="__none__"))
+        sel = discord.ui.Select(placeholder="📊 Choose stat & direction…", options=options)
+        sel.callback = self._cb_prop_stat_select
+        self.add_item(sel)
+        back = discord.ui.Button(label="← Back", style=discord.ButtonStyle.secondary, row=1)
+        back.callback = self._cb_back_prop_player
         self.add_item(back)
         cancel = discord.ui.Button(label="❌ Cancel", style=discord.ButtonStyle.danger, row=1)
         cancel.callback = self._cb_cancel
@@ -1331,18 +1457,25 @@ class ParlayBuilderView(discord.ui.View):
             embed.add_field(name="Combined Odds", value=fmt_odds(self._combo_odds()), inline=True)
 
         for i, leg in enumerate(self.legs, 1):
-            pt_str = ""
-            if leg.get("point") is not None:
-                pt = leg["point"]
-                pt_str = f" ({'+' if pt > 0 else ''}{pt})"
-            tl = {"h2h": "ML", "spreads": "Spread", "totals": "O/U"}.get(leg["leg_type"], leg["leg_type"])
+            lt = leg.get("leg_type", "")
+            tl = {"h2h": "ML", "spreads": "Spread", "totals": "O/U", "player_props": "Prop"}.get(lt, lt)
+            if lt == "player_props":
+                sel_disp = fmt_prop_selection(leg["selection"])
+                pt_str   = f"  Line: {leg['point']}" if leg.get("point") is not None else ""
+            else:
+                sel_disp = leg["selection"]
+                if leg.get("point") is not None:
+                    pt = leg["point"]
+                    pt_str = f" ({'+' if pt > 0 else ''}{pt})"
+                else:
+                    pt_str = ""
             embed.add_field(
-                name=f"Leg {i}  [{tl}]  {leg['away_team']} @ {leg['home_team']}",
-                value=f"**{leg['selection']}**{pt_str}  ({fmt_odds(leg['odds'])})",
+                name=f"Leg {i}  [{tl}]  {leg.get('away_team','')} @ {leg.get('home_team','')}",
+                value=f"**{sel_disp}**{pt_str}  ({fmt_odds(leg['odds'])})",
                 inline=False,
             )
 
-        if self.building_game and self._step in ("type", "outcome"):
+        if self.building_game and self._step in ("type", "outcome", "prop_player", "prop_stat"):
             g = self.building_game
             embed.add_field(
                 name=f"Adding Leg {len(self.legs) + 1}…",
@@ -1392,7 +1525,10 @@ class ParlayBuilderView(discord.ui.View):
             return await interaction.response.send_message("No odds available.", ephemeral=True)
         await interaction.response.defer()
         self.building_type = val
-        self._step = "outcome"
+        if val == "player_props":
+            self._step = "prop_player"
+        else:
+            self._step = "outcome"
         self._render()
         await self.message.edit(embed=self._build_embed(), view=self)
 
@@ -1424,6 +1560,61 @@ class ParlayBuilderView(discord.ui.View):
         self.building_game = None
         self.building_type = None
         self._step = "done_leg"
+        self._render()
+        await self.message.edit(embed=self._build_embed(), view=self)
+
+    async def _cb_prop_player(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("Not your session.", ephemeral=True)
+        val = interaction.data["values"][0]
+        if val == "__none__":
+            return await interaction.response.send_message("No players available.", ephemeral=True)
+        await interaction.response.defer()
+        self.building_player = val
+        self._step = "prop_stat"
+        self._render()
+        await self.message.edit(embed=self._build_embed(), view=self)
+
+    async def _cb_prop_stat_select(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("Not your session.", ephemeral=True)
+        val = interaction.data["values"][0]
+        if val == "__none__":
+            return await interaction.response.send_message("No props available for this player.", ephemeral=True)
+
+        parts = val.split("|")
+        if len(parts) < 5:
+            return await interaction.response.send_message("Malformed prop option.", ephemeral=True)
+
+        await interaction.response.defer()
+
+        pname, stat, direction, price_str, line_str = parts[0], parts[1], parts[2], parts[3], parts[4]
+        g = self.building_game or {}
+
+        self.legs.append({
+            "event_id":      g.get("event_id", ""),
+            "home_team":     g.get("home_team", ""),
+            "away_team":     g.get("away_team", ""),
+            "game_name":     g.get("name", ""),
+            "commence_time": g.get("commence_time", ""),
+            "leg_type":      "player_props",
+            "selection":     f"{pname}|{stat}|{direction}",
+            "odds":          int(price_str),
+            "point":         float(line_str),
+        })
+        self.building_game   = None
+        self.building_type   = None
+        self.building_player = None
+        self._step = "done_leg"
+        self._render()
+        await self.message.edit(embed=self._build_embed(), view=self)
+
+    async def _cb_back_prop_player(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("Not your session.", ephemeral=True)
+        await interaction.response.defer()
+        self.building_player = None
+        self._step = "prop_player"
         self._render()
         await self.message.edit(embed=self._build_embed(), view=self)
 
@@ -1471,11 +1662,17 @@ class ParlayBuilderView(discord.ui.View):
         profit = calc_profit(self.stake or 0.0, combo)
 
         confirm_view = ConfirmView(self.author_id, timeout=60)
-        legs_lines = "\n".join(
-            f"• **{leg['selection']}** ({fmt_odds(leg['odds'])})  —  "
-            f"{leg['away_team']} @ {leg['home_team']}"
-            for leg in self.legs
-        )
+        legs_lines_parts = []
+        for leg in self.legs:
+            if leg.get("leg_type") == "player_props":
+                sel_str = fmt_prop_selection(leg["selection"])
+            else:
+                sel_str = leg["selection"]
+            legs_lines_parts.append(
+                f"• **{sel_str}** ({fmt_odds(leg['odds'])})  —  "
+                f"{leg.get('away_team','')} @ {leg.get('home_team','')}"
+            )
+        legs_lines = "\n".join(legs_lines_parts)
         await self.message.edit(
             content=(
                 f"⚠️ **Final Parlay Confirmation**\n{legs_lines}\n\n"
@@ -1514,15 +1711,22 @@ class ParlayBuilderView(discord.ui.View):
             embed.add_field(name="Legs",           value=str(len(self.legs)),          inline=True)
             embed.add_field(name="Combined Odds",  value=fmt_odds(combo),             inline=True)
             for i, leg in enumerate(self.legs, 1):
-                pt_str = ""
-                if leg.get("point") is not None:
-                    pt = leg["point"]
-                    pt_str = f" ({'+' if pt > 0 else ''}{pt})"
-                tl = {"h2h": "ML", "spreads": "Spread", "totals": "O/U"}.get(leg["leg_type"], "")
+                lt = leg.get("leg_type", "")
+                tl = {"h2h": "ML", "spreads": "Spread", "totals": "O/U", "player_props": "Prop"}.get(lt, lt)
+                if lt == "player_props":
+                    sel_disp = fmt_prop_selection(leg["selection"])
+                    pt_str   = f"  Line: {leg['point']}" if leg.get("point") is not None else ""
+                else:
+                    sel_disp = leg["selection"]
+                    if leg.get("point") is not None:
+                        pt = leg["point"]
+                        pt_str = f" ({'+' if pt > 0 else ''}{pt})"
+                    else:
+                        pt_str = ""
                 embed.add_field(
                     name=f"Leg {i}  [{tl}]",
-                    value=f"**{leg['selection']}**{pt_str} ({fmt_odds(leg['odds'])})\n"
-                          f"{leg['away_team']} @ {leg['home_team']}",
+                    value=f"**{sel_disp}**{pt_str} ({fmt_odds(leg['odds'])})\n"
+                          f"{leg.get('away_team','')} @ {leg.get('home_team','')}",
                     inline=False,
                 )
             embed.add_field(name="Stake",            value=f"{CURRENCY}**{(self.stake or 0):.0f}**",           inline=True)

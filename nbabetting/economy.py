@@ -1,6 +1,7 @@
 """economy.py – Per-guild economy manager backed by Red's Config."""
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Dict, List
 
 import discord
@@ -23,6 +24,13 @@ class Economy:
     def __init__(self, config: Config, bot: "Red") -> None:
         self.config = config
         self.bot = bot
+        self._locks: Dict[str, asyncio.Lock] = {}
+
+    def _lock(self, guild_id: int, user_id: int) -> asyncio.Lock:
+        key = f"{guild_id}:{user_id}"
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
+        return self._locks[key]
 
     # ── Single-user helpers ────────────────────────────────────────────────────
 
@@ -41,13 +49,18 @@ class Economy:
         return new_bal
 
     async def deduct(self, guild_id: int, user_id: int, amount: float) -> bool:
-        """Deduct amount. Returns False if insufficient funds."""
-        conf = self.config.member_from_ids(guild_id, user_id)
-        bal  = await conf.balance()
-        if bal < amount:
-            return False
-        await conf.balance.set(round(bal - amount, 2))
-        return True
+        """Deduct amount. Returns False if insufficient funds.
+
+        Uses a per-user asyncio lock to prevent race conditions when two
+        concurrent sessions both read the balance before either write it.
+        """
+        async with self._lock(guild_id, user_id):
+            conf = self.config.member_from_ids(guild_id, user_id)
+            bal  = await conf.balance()
+            if bal < amount:
+                return False
+            await conf.balance.set(round(bal - amount, 2))
+            return True
 
     async def set_balance(self, guild_id: int, user_id: int, amount: float) -> None:
         await self.config.member_from_ids(guild_id, user_id).balance.set(round(amount, 2))

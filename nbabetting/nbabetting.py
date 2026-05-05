@@ -219,6 +219,14 @@ class NBABetting(commands.Cog):
                             result     = "won"
                             payout     = stake + new_profit
 
+                    if result != "won" and result != "push":
+                        payout = 0.0
+                    # Settle first — moves bet out of active before crediting money.
+                    # If the bot crashes after settle_bet but before economy.add the
+                    # bet is already settled so it won't be paid twice next cycle.
+                    settled = self.bets.settle_bet(guild_id, bet["id"], result, payout)
+                    if not settled:
+                        continue  # already settled (safety guard)
                     if result == "won":
                         await self.economy.add(guild_id, user_id, payout)
                         await self.economy.record_win(guild_id, user_id, payout)
@@ -226,10 +234,7 @@ class NBABetting(commands.Cog):
                         await self.economy.add(guild_id, user_id, payout)
                         await self.economy.record_push(guild_id, user_id, stake)
                     else:
-                        payout = 0.0
                         await self.economy.record_loss(guild_id, user_id)
-
-                    self.bets.settle_bet(guild_id, bet["id"], result, payout)
                     await self._notify_result(guild_id, user_id, bet, result, payout)
                     continue
 
@@ -261,17 +266,22 @@ class NBABetting(commands.Cog):
 
                 if result == "won":
                     payout = stake + profit
+                elif result == "push":
+                    payout = stake
+                else:
+                    payout = 0.0
+                # Settle first — prevents double payout if the bot restarts mid-loop.
+                settled = self.bets.settle_bet(guild_id, bet["id"], result, payout)
+                if not settled:
+                    continue  # already settled (safety guard)
+                if result == "won":
                     await self.economy.add(guild_id, user_id, payout)
                     await self.economy.record_win(guild_id, user_id, payout)
                 elif result == "push":
-                    payout = stake
                     await self.economy.add(guild_id, user_id, payout)
                     await self.economy.record_push(guild_id, user_id, stake)
                 else:
-                    payout = 0.0
                     await self.economy.record_loss(guild_id, user_id)
-
-                self.bets.settle_bet(guild_id, bet["id"], result, payout)
                 await self._notify_result(guild_id, user_id, bet, result, payout)
 
     async def _notify_result(
@@ -290,18 +300,32 @@ class NBABetting(commands.Cog):
             "push": discord.Color.gold(),
         }.get(result, discord.Color.greyple())
 
-        sel_display = bet["selection"]
-        if bet.get("bet_type") == "player_props":
-            sel_display = fmt_prop_selection(bet["selection"])
+        bet_type = bet.get("bet_type", "")
+
+        # Build selection display and game string safely for all bet types
+        if bet_type == "parlay":
+            legs = bet.get("legs", [])
+            sel_display = f"{len(legs)}-leg parlay"
+            game_str = "  ·  ".join(
+                f"{lg.get('away_team','')} @ {lg.get('home_team','')}" for lg in legs[:3]
+            )
+            if len(legs) > 3:
+                game_str += f"  +{len(legs) - 3} more"
+        elif bet_type == "player_props":
+            sel_display = fmt_prop_selection(bet.get("selection", ""))
+            game_str = f"{bet.get('away_team', '')} @ {bet.get('home_team', '')}"
+        else:
+            sel_display = bet.get("selection", "")
+            game_str = f"{bet.get('away_team', '')} @ {bet.get('home_team', '')}"
 
         embed = discord.Embed(
             title=f"{emoji} Bet Settled — {result.upper()}",
             color=color,
         )
-        embed.add_field(name="Bet ID",    value=f"`{bet['id']}`",                         inline=True)
-        embed.add_field(name="Game",      value=f"{bet['away_team']} @ {bet['home_team']}", inline=False)
+        embed.add_field(name="Bet ID",    value=f"`{bet['id']}`",        inline=True)
+        embed.add_field(name="Game",      value=game_str,                 inline=False)
         embed.add_field(name="Your Pick", value=f"{sel_display}  ({fmt_odds(bet['odds'])})", inline=True)
-        embed.add_field(name="Stake",     value=f"{CURRENCY}{bet['stake']:.0f}",           inline=True)
+        embed.add_field(name="Stake",     value=f"{CURRENCY}{bet['stake']:.0f}", inline=True)
         if result == "won":
             embed.add_field(name="You Won!", value=f"{CURRENCY}**{payout:.0f}**", inline=True)
         elif result == "push":
@@ -435,7 +459,7 @@ class NBABetting(commands.Cog):
         if not games:
             return await ctx.send("No NBA games found for today. Check back later!")
 
-        view = GamesView(games, ctx.author.id)
+        view = GamesView(games, ctx.author.id, cog=self)
         msg  = await ctx.send(embed=view.build_embed(), view=view)
         view.message = msg
 
@@ -446,7 +470,7 @@ class NBABetting(commands.Cog):
         async with ctx.typing():
             games = await self.fetcher.get_games()
 
-        _BETTABLE_STATES = {"STATUS_SCHEDULED", "STATUS_PREGAME", ""}
+        _BETTABLE_STATES = {"STATUS_SCHEDULED", "STATUS_PREGAME"}
         upcoming = [
             g for g in games
             if not g.get("completed") and g.get("state", "") in _BETTABLE_STATES
@@ -482,7 +506,12 @@ class NBABetting(commands.Cog):
         if not full:
             return await ctx.send("Could not fetch odds for that game.")
 
-        view = OddsView(full, ctx.author.id)
+        view = OddsView(
+            full, ctx.author.id,
+            cog=self,
+            guild_id=ctx.guild.id,
+            event_id=target_game["event_id"],
+        )
         msg  = await ctx.send(embed=view.build_embed(), view=view)
         view.message = msg
 
@@ -494,7 +523,7 @@ class NBABetting(commands.Cog):
             balance = await self.economy.get_balance(ctx.guild.id, ctx.author.id)
 
         # ── Only show games that haven't started yet ───────────────────────────
-        _BETTABLE_STATES = {"STATUS_SCHEDULED", "STATUS_PREGAME", ""}
+        _BETTABLE_STATES = {"STATUS_SCHEDULED", "STATUS_PREGAME"}
         upcoming = [
             g for g in games
             if not g.get("completed") and g.get("state", "") in _BETTABLE_STATES
@@ -518,7 +547,24 @@ class NBABetting(commands.Cog):
         max_pct = cfg.get("max_bet_pct", DEFAULT_MAX_BET_PCT)
         max_bet = round(balance * max_pct, 2) if max_pct > 0 else 0.0
 
-        view = BetFlowView(self, ctx.author.id, ctx.guild.id, upcoming, balance, max_bet=max_bet)
+        # ── Filter out games the user already has a pending team-outcome bet on ──
+        # Player prop bets are player-specific and don't create game correlation,
+        # so same-game props are allowed. Only block h2h/spreads/totals same-game.
+        # Use .get() because parlay bets have no top-level event_id (only in legs).
+        _OUTCOME_TYPES = {"h2h", "spreads", "totals"}
+        pending_bets   = self.bets.get_user_bets(ctx.guild.id, ctx.author.id, status="pending")
+        already_bet    = {
+            b.get("event_id") for b in pending_bets
+            if b.get("event_id") and b.get("bet_type") in _OUTCOME_TYPES
+        }
+        available      = [g for g in upcoming if g["event_id"] not in already_bet]
+        if not available:
+            return await ctx.send(
+                "🔒 You already have a pending bet on every available game. "
+                "Wait for those to settle before placing new ones."
+            )
+
+        view = BetFlowView(self, ctx.author.id, ctx.guild.id, available, balance, max_bet=max_bet)
         msg  = await ctx.send(embed=view._build_embed(), view=view)
         view.message = msg
 
@@ -529,7 +575,7 @@ class NBABetting(commands.Cog):
             games   = await self.fetcher.get_games()
             balance = await self.economy.get_balance(ctx.guild.id, ctx.author.id)
 
-        _BETTABLE_STATES = {"STATUS_SCHEDULED", "STATUS_PREGAME", ""}
+        _BETTABLE_STATES = {"STATUS_SCHEDULED", "STATUS_PREGAME"}
         upcoming = [
             g for g in games
             if not g.get("completed") and g.get("state", "") in _BETTABLE_STATES
@@ -549,7 +595,6 @@ class NBABetting(commands.Cog):
                 f"Limits reset at midnight UTC."
             )
 
-        cfg     = await self.config.guild(ctx.guild).all()
         max_pct = cfg.get("max_bet_pct", DEFAULT_MAX_BET_PCT)
         max_bet = round(balance * max_pct, 2) if max_pct > 0 else 0.0
 
@@ -726,10 +771,16 @@ class NBABetting(commands.Cog):
         embed.add_field(name="Net P/L", value=f"{CURRENCY}{p_str}", inline=True)
 
         if bets:
-            recent = "\n".join(
-                f"`{b['id']}` {b['selection']} ({b['status']}) {CURRENCY}{b['stake']:.0f}"
-                for b in bets[:5]
-            )
+            def _bet_label(b: dict) -> str:
+                if b.get("bet_type") == "parlay":
+                    legs = b.get("legs", [])
+                    sel = f"{len(legs)}-leg parlay"
+                else:
+                    sel = b.get("selection", "?")
+                    if b.get("bet_type") == "player_props":
+                        sel = fmt_prop_selection(sel)
+                return f"`{b['id']}` {sel} ({b['status']}) {CURRENCY}{b['stake']:.0f}"
+            recent = "\n".join(_bet_label(b) for b in bets[:5])
             embed.add_field(name="Last 5 Bets", value=recent, inline=False)
 
         await ctx.send(embed=embed)
@@ -748,7 +799,11 @@ class NBABetting(commands.Cog):
     async def admin_voidgame(self, ctx: commands.Context, event_id: str) -> None:
         """Void all pending bets for a specific game and refund stakes."""
         pending   = self.bets.get_all_pending(ctx.guild.id)
-        game_bets = [b for b in pending if b["event_id"] == event_id]
+        game_bets = [
+            b for b in pending
+            if b.get("event_id") == event_id                             # single-game bet
+            or any(leg.get("event_id") == event_id for leg in b.get("legs", []))  # parlay leg
+        ]
         if not game_bets:
             return await ctx.send(f"No pending bets found for event `{event_id}`.")
 
@@ -785,9 +840,13 @@ class NBABetting(commands.Cog):
             )
 
         user_id = int(bet["user_id"])
-        sel_display = bet["selection"]
-        if bet.get("bet_type") == "player_props":
-            sel_display = fmt_prop_selection(bet["selection"])
+        if bet.get("bet_type") == "parlay":
+            legs = bet.get("legs", [])
+            sel_display = f"{len(legs)}-leg parlay"
+        elif bet.get("bet_type") == "player_props":
+            sel_display = fmt_prop_selection(bet.get("selection", ""))
+        else:
+            sel_display = bet.get("selection", "?")
 
         view = ConfirmView(ctx.author.id, timeout=30)
         msg  = await ctx.send(
@@ -889,6 +948,9 @@ class NBABetting(commands.Cog):
         embed.add_field(name="Admin Role",      value=role.mention if role else "Admins only", inline=True)
         embed.add_field(name="Notify Channel",  value=channel.mention if channel else "DMs only", inline=True)
         embed.add_field(name="Pending Bets",    value=str(pending_cnt), inline=True)
-        embed.add_field(name="Settlement Loop", value="🟢 Running (every 10 min)", inline=True)
+        task        = self._settlement_task
+        running     = task is not None and not task.done()
+        loop_status = "🟢 Running" if running else "🔴 Stopped — reload the cog to restart"
+        embed.add_field(name="Settlement Loop", value=f"{loop_status} (every 10 min)", inline=True)
         embed.set_footer(text="Use /admin settle to trigger settlement immediately.")
         await ctx.send(embed=embed)

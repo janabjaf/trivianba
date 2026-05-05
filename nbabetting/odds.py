@@ -19,11 +19,13 @@ ESPN_TEAM_LEADERS  = "https://site.api.espn.com/apis/site/v2/sports/basketball/n
 ESPN_TEAM_ROSTER   = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/roster"
 
 # ── Cache TTLs (seconds) ──────────────────────────────────────────────────────
-GAMES_TTL        = 120     # 2 min
-INJURIES_TTL     = 300     # 5 min
-LEADERS_TTL      = 3600    # 1 hr
-TEAM_STATS_TTL   = 21600   # 6 hrs  — scoring avgs barely shift day-to-day
-YESTERDAY_TTL    = 3600    # 1 hr   — who played yesterday
+GAMES_TTL             = 120     # 2 min
+INJURIES_TTL          = 300     # 5 min
+LEADERS_TTL           = 3600    # 1 hr
+TEAM_STATS_TTL        = 21600   # 6 hrs  — scoring avgs barely shift day-to-day
+YESTERDAY_TTL         = 3600    # 1 hr   — who played yesterday
+RECENT_COMPLETED_TTL  = 3600    # 1 hr   — list of recent completed games
+LAST5_TTL             = 7200    # 2 hrs  — per-team last-5 player averages
 
 # ── ESPN numeric team IDs (permanent, never change) ──────────────────────────
 TEAM_IDS: Dict[str, int] = {
@@ -261,10 +263,15 @@ def _injury_shift(
     if not team_injuries:
         return 0.0, []
 
+    # Build a name-keyed pts lookup for this team's injured players.
+    # We include any leader whose team_abbr matches OR whose team_abbr is blank
+    # (ESPN frequently omits team_abbr from the leaders endpoint).
+    # The injury list itself is already scoped to this team, so false positives
+    # from players with the same name on another team are essentially impossible.
     team_pts: Dict[str, float] = {
         name.lower(): info["pts"]
         for name, info in stat_leaders.items()
-        if info.get("team_abbr") == abbr
+        if info.get("team_abbr", "") in (abbr, "")
     }
 
     shift = 0.0
@@ -601,21 +608,43 @@ def generate_player_props_for_game(
             pra_line = _line(pra, -1.0)
 
         is_questionable = pname in (questionable_players or set())
-        over_p, under_p = _prop_juice(tier, is_questionable)
+
+        # Points: public hammers overs heavily — most biased juice
+        pts_over_p, pts_under_p   = _prop_juice(tier, is_questionable)
+        # Rebounds: more neutral market; slight sharp under lean on stars
+        if tier == 1:
+            reb_over_p, reb_under_p = (-112, -108)
+        elif tier == 2:
+            reb_over_p, reb_under_p = (-110, -110)
+        else:
+            reb_over_p, reb_under_p = (-110, -110)
+        if is_questionable:
+            reb_over_p, reb_under_p = (-105, -115)
+        # Assists: most neutral line — public has no strong lean
+        ast_over_p, ast_under_p   = (-110, -110) if not is_questionable else (-105, -115)
+        # PRA: combined uncertainty → slightly higher vig on both sides
+        if tier == 1:
+            pra_over_p, pra_under_p = (-120, +102)
+        elif tier == 2:
+            pra_over_p, pra_under_p = (-115, -105)
+        else:
+            pra_over_p, pra_under_p = (-112, -108)
+        if is_questionable:
+            pra_over_p, pra_under_p = (-108, -112)
 
         props[pname] = {
             "pts":        pts_line,
-            "pts_over":   over_p,
-            "pts_under":  under_p,
+            "pts_over":   pts_over_p,
+            "pts_under":  pts_under_p,
             "reb":        reb_line,
-            "reb_over":   over_p,
-            "reb_under":  under_p,
+            "reb_over":   reb_over_p,
+            "reb_under":  reb_under_p,
             "ast":        ast_line,
-            "ast_over":   over_p,
-            "ast_under":  under_p,
+            "ast_over":   ast_over_p,
+            "ast_under":  ast_under_p,
             "pra":        pra_line,
-            "pra_over":   over_p,
-            "pra_under":  under_p,
+            "pra_over":   pra_over_p,
+            "pra_under":  pra_under_p,
             "team_abbr":  pdata.get("team_abbr", ""),
             "tier":       tier,
             "status":     "questionable" if is_questionable else "active",
@@ -727,6 +756,17 @@ class OddsFetcher:
         # Set of team abbrs that played yesterday (for B2B detection)
         self._played_yesterday: Set[str] = set()
         self._played_yesterday_ts: float = 0.0
+
+        # Recent completed games list (shared across teams, 1-hr TTL)
+        self._recent_completed_cache: List[Dict] = []
+        self._recent_completed_ts: float = 0.0
+
+        # Per-team last-5-game player averages: {abbr: {player_name: {pts,reb,ast}}}
+        self._last5_cache: Dict[str, Dict] = {}
+        self._last5_ts:    Dict[str, float] = {}
+
+        # Completed game box scores (never expire — completed game stats don't change)
+        self._boxscore_cache: Dict[str, Dict] = {}
 
     # ── Session ───────────────────────────────────────────────────────────────
 
@@ -1263,12 +1303,13 @@ class OddsFetcher:
         home_abbr = game.get("home_abbr", "")
         away_abbr = game.get("away_abbr", "")
 
-        # Fetch all data sources in parallel
+        # Fetch all data sources in parallel (including last-5 game averages)
         (
             injuries, stat_leaders,
             home_ts, away_ts,
             home_roster, away_roster,
             summary_roster,
+            home_last5, away_last5,
         ) = await asyncio.gather(
             self.get_injuries(),
             self.get_stat_leaders(),
@@ -1277,6 +1318,8 @@ class OddsFetcher:
             self.get_team_roster(home_abbr),
             self.get_team_roster(away_abbr),
             self._parse_summary_roster(event_id, home_abbr, away_abbr),
+            self.get_player_last5(home_abbr),
+            self.get_player_last5(away_abbr),
         )
 
         # ── Build props player pool ────────────────────────────────────────────
@@ -1314,14 +1357,30 @@ class OddsFetcher:
             roster_status = combined_roster.get(pname, "active")
             return roster_status not in ("out", "inactive")
 
-        # Start with global leaders that belong to either team in this game
+        # Start with global leaders that belong to either team in this game.
+        # ESPN's leaders endpoint often omits team_abbr from athlete objects,
+        # so we ALSO accept any player whose name appears in the game's
+        # combined_roster (built from the reliable team-roster endpoint).
+        # In that case we infer the correct team_abbr from which sub-roster
+        # the player was found in.
         props_pool: Dict[str, Dict] = {}
 
         for pname, pdata in stat_leaders.items():
             t = pdata.get("team_abbr", "")
-            if t in (home_abbr, away_abbr):
-                if _is_available(pname):
-                    props_pool[pname] = dict(pdata)
+            in_game_by_abbr   = t in (home_abbr, away_abbr)
+            in_game_by_roster = pname in combined_roster
+
+            if not (in_game_by_abbr or in_game_by_roster):
+                continue
+            if not _is_available(pname):
+                continue
+
+            entry = dict(pdata)
+            # Ensure team_abbr is always set so generate_player_props_for_game
+            # can filter correctly even when ESPN omits it.
+            if not in_game_by_abbr:
+                entry["team_abbr"] = home_abbr if pname in home_roster else away_abbr
+            props_pool[pname] = entry
 
         # Overlay/add from game summary (most authoritative for this specific game)
         for pname, sdata in summary_roster.items():
@@ -1351,6 +1410,28 @@ class OddsFetcher:
                     "pts": 0.0, "reb": 0.0, "ast": 0.0, "pra": 0.0,
                     "tier": 3, "team_abbr": t,
                 }
+
+        # ── Blend last-5-game averages into props_pool (65% recent, 35% season) ─
+        # This makes prop lines respond to current form instead of pure season
+        # averages — a cold shooter or a player on a scoring streak will have
+        # lines that actually reflect it.
+        last5_lookup: Dict[str, Dict] = {**home_last5, **away_last5}
+        for pname, pdata in props_pool.items():
+            l5 = last5_lookup.get(pname)
+            if not l5:
+                continue
+            updated = False
+            for stat in ("pts", "reb", "ast"):
+                l5_val = l5.get(stat, 0.0)
+                if l5_val > 0:
+                    season_val = pdata.get(stat, 0.0)
+                    pdata[stat] = round(0.65 * l5_val + 0.35 * season_val, 1)
+                    updated = True
+            if updated:
+                pdata["pra"]  = round(
+                    pdata.get("pts", 0.0) + pdata.get("reb", 0.0) + pdata.get("ast", 0.0), 1
+                )
+                pdata["tier"] = _player_tier(pdata["pts"])
 
         # Line movement from server's bet volume (optional)
         bet_dist: Dict[str, float] = {}
@@ -1384,9 +1465,84 @@ class OddsFetcher:
 
         return {**game, "odds": odds, "player_props": props, "public_action": public_action}
 
+    # ── Recent completed games (shared cache, feeds last-5 logic) ─────────────
+
+    async def get_recent_completed(self, days_back: int = 7) -> List[Dict]:
+        """Return completed games from the last `days_back` days, cached 1 hr."""
+        now = time.monotonic()
+        if now - self._recent_completed_ts < RECENT_COMPLETED_TTL and self._recent_completed_cache:
+            return self._recent_completed_cache
+        games = await self.get_completed_games(days_back=days_back)
+        self._recent_completed_cache = games
+        self._recent_completed_ts    = now
+        return games
+
+    # ── Per-team last-5-game averages ─────────────────────────────────────────
+
+    async def get_player_last5(self, abbr: str) -> Dict[str, Dict]:
+        """
+        Return {player_name: {pts, reb, ast}} averaged over the player's last
+        5 completed games for team `abbr`.  Cached per team for 2 hours.
+        """
+        now = time.monotonic()
+        if abbr in self._last5_cache and now - self._last5_ts.get(abbr, 0) < LAST5_TTL:
+            return self._last5_cache[abbr]
+
+        recent = await self.get_recent_completed(days_back=7)
+        team_games = [
+            g for g in recent
+            if g.get("home_abbr") == abbr or g.get("away_abbr") == abbr
+        ][:5]
+
+        if not team_games:
+            return {}
+
+        box_scores = await asyncio.gather(
+            *[self.get_game_box_score(g["event_id"]) for g in team_games],
+            return_exceptions=True,
+        )
+
+        totals: Dict[str, Dict[str, float]] = {}
+        counts: Dict[str, int] = {}
+        for bs in box_scores:
+            if not isinstance(bs, dict) or not bs:
+                continue
+            for pname, pstats in bs.items():
+                pts = float(pstats.get("pts", pstats.get("points", 0)) or 0)
+                reb = float(pstats.get("reb", pstats.get("rebounds", pstats.get("totalrebounds", 0))) or 0)
+                ast = float(pstats.get("ast", pstats.get("assists", 0)) or 0)
+                if pts + reb + ast == 0:
+                    continue
+                if pname not in totals:
+                    totals[pname] = {"pts": 0.0, "reb": 0.0, "ast": 0.0}
+                    counts[pname] = 0
+                totals[pname]["pts"] += pts
+                totals[pname]["reb"] += reb
+                totals[pname]["ast"] += ast
+                counts[pname] += 1
+
+        result: Dict[str, Dict] = {
+            pname: {
+                "pts": round(totals[pname]["pts"] / counts[pname], 1),
+                "reb": round(totals[pname]["reb"] / counts[pname], 1),
+                "ast": round(totals[pname]["ast"] / counts[pname], 1),
+            }
+            for pname in totals
+            if counts[pname] >= 2   # need at least 2 games for a meaningful average
+        }
+
+        if result:
+            self._last5_cache[abbr] = result
+            self._last5_ts[abbr]    = now
+        return result
+
     # ── Box score ─────────────────────────────────────────────────────────────
 
     async def get_game_box_score(self, event_id: str) -> Optional[Dict[str, Dict]]:
+        # Completed game stats never change — cache indefinitely per session
+        if event_id in self._boxscore_cache:
+            return self._boxscore_cache[event_id]
+
         session = await self._get_session()
         try:
             async with session.get(
@@ -1415,6 +1571,8 @@ class OddsFetcher:
                                 parsed[key.lower()] = 0.0
                         stat_map[display_name] = parsed
 
+            if stat_map:
+                self._boxscore_cache[event_id] = stat_map
             return stat_map or None
         except Exception:
             return None
