@@ -662,7 +662,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: player
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="player", aliases=["info", "stats", "lookup"])
+    @nbadraft.command(name="player", aliases=["stats", "lookup"])
     async def draft_player(self, ctx: commands.Context, *, name: str):
         """Look up detailed info and stats for any NBA player.
 
@@ -787,7 +787,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: status
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="status", aliases=["info", "current"])
+    @nbadraft.command(name="status", aliases=["current"])
     async def draft_status(self, ctx: commands.Context):
         """Show the current draft status and settings."""
         draft = await self.config.guild(ctx.guild).active_draft()
