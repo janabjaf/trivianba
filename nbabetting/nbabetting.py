@@ -1,9 +1,10 @@
-"""nbabetting.py – Main NBABetting cog: commands, economy, auto-settlement."""
+"""nbabetting.py – Main NBABetting cog: commands, economy, auto-settlement, news feed."""
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import List, Optional
+from datetime import datetime
+from typing import Dict, List, Optional, Set
 
 import discord
 from discord import app_commands
@@ -68,6 +69,7 @@ class NBABetting(commands.Cog):
         self.config.register_guild(
             admin_role=None,
             notify_channel=None,
+            news_channel=None,
             max_bet_pct=DEFAULT_MAX_BET_PCT,
             max_daily_bets=DEFAULT_MAX_DAILY_BETS,
         )
@@ -78,19 +80,27 @@ class NBABetting(commands.Cog):
         self.bets    = BetsManager(self)
 
         self._settlement_task: Optional[asyncio.Task] = None
+        self._news_task:       Optional[asyncio.Task] = None
+
+        # Track which news article IDs have already been posted per guild
+        self._news_posted: Dict[int, Set[str]] = {}
+        # Track last known injury statuses per guild for change detection
+        self._injury_snapshot: Dict[int, Dict[str, str]] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def cog_load(self) -> None:
         self._settlement_task = asyncio.create_task(self._settlement_loop())
+        self._news_task       = asyncio.create_task(self._news_loop())
 
     async def cog_unload(self) -> None:
-        if self._settlement_task:
-            self._settlement_task.cancel()
-            try:
-                await self._settlement_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._settlement_task, self._news_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         await self.fetcher.close()
 
     # ── Error handler ─────────────────────────────────────────────────────────
@@ -222,8 +232,6 @@ class NBABetting(commands.Cog):
                     if result != "won" and result != "push":
                         payout = 0.0
                     # Settle first — moves bet out of active before crediting money.
-                    # If the bot crashes after settle_bet but before economy.add the
-                    # bet is already settled so it won't be paid twice next cycle.
                     settled = self.bets.settle_bet(guild_id, bet["id"], result, payout)
                     if not settled:
                         continue  # already settled (safety guard)
@@ -324,7 +332,7 @@ class NBABetting(commands.Cog):
         )
         embed.add_field(name="Bet ID",    value=f"`{bet['id']}`",        inline=True)
         embed.add_field(name="Game",      value=game_str,                 inline=False)
-        embed.add_field(name="Your Pick", value=f"{sel_display}  ({fmt_odds(bet['odds'])})", inline=True)
+        embed.add_field(name="Your Pick", value=f"{sel_display}  ({fmt_odds(bet.get('odds', -110))})", inline=True)
         embed.add_field(name="Stake",     value=f"{CURRENCY}{bet['stake']:.0f}", inline=True)
         if result == "won":
             embed.add_field(name="You Won!", value=f"{CURRENCY}**{payout:.0f}**", inline=True)
@@ -345,11 +353,126 @@ class NBABetting(commands.Cog):
             channel = self.bot.get_channel(channel_id)
             if channel:
                 try:
-                    member = channel.guild.get_member(user_id)
+                    member  = channel.guild.get_member(user_id)
                     mention = member.mention if member else f"<@{user_id}>"
                     await channel.send(content=mention, embed=embed)
                 except (discord.Forbidden, discord.HTTPException):
                     pass
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ESPN news background task
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _news_loop(self) -> None:
+        """Background task: poll ESPN for NBA news and injury updates every 15 minutes."""
+        await self.bot.wait_until_ready()
+        await asyncio.sleep(90)  # Initial delay to let everything else stabilize
+        while True:
+            try:
+                await self._run_news_check()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.exception("News check error: %s", exc)
+            await asyncio.sleep(900)  # every 15 minutes
+
+    async def _run_news_check(self) -> None:
+        """Fetch ESPN NBA news and injury reports, post new items to configured channels."""
+        news_articles = await self.fetcher.get_news(limit=8)
+        injuries      = await self.fetcher.get_injuries()
+
+        for guild in self.bot.guilds:
+            guild_id   = guild.id
+            channel_id: Optional[int] = await self.config.guild_from_id(guild_id).news_channel()
+            if not channel_id:
+                continue
+            channel = self.bot.get_channel(channel_id)
+            if channel is None:
+                continue
+
+            posted_ids = self._news_posted.get(guild_id, set())
+            old_inj    = self._injury_snapshot.get(guild_id, {})
+
+            # ── Post new news articles ─────────────────────────────────────────
+            new_articles = [
+                a for a in news_articles
+                if a.get("id") and a["id"] not in posted_ids
+            ]
+            for article in new_articles[:3]:
+                try:
+                    embed = discord.Embed(
+                        title=(article.get("headline") or "NBA News")[:256],
+                        description=(article.get("description") or "")[:500] or None,
+                        color=discord.Color.orange(),
+                        url=article.get("url") or None,
+                    )
+                    embed.set_author(name="📰 ESPN NBA News")
+                    if article.get("image_url"):
+                        embed.set_thumbnail(url=article["image_url"])
+                    published = article.get("published")
+                    if published:
+                        try:
+                            embed.timestamp = datetime.fromisoformat(
+                                published.replace("Z", "+00:00")
+                            )
+                        except Exception:
+                            pass
+                    await channel.send(embed=embed)
+                    posted_ids.add(article["id"])
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+                except Exception as exc:
+                    log.warning("Failed posting news article: %s", exc)
+
+            # ── Post injury status CHANGES ─────────────────────────────────────
+            # get_injuries() returns {team_abbr: [{"name", "status", "description"}]}
+            # Flatten to {player_name: status} and keep a detail map for display.
+            new_inj: Dict[str, str] = {}
+            inj_detail: Dict[str, Dict] = {}
+            for team_abbr_key, players in (injuries or {}).items():
+                for player_info in players:
+                    pname  = player_info.get("name", "")
+                    status = player_info.get("status", "Active")
+                    if not pname:
+                        continue
+                    new_inj[pname] = status
+                    inj_detail[pname] = {
+                        "team":    team_abbr_key,
+                        "comment": player_info.get("description", ""),
+                    }
+
+            if old_inj:  # Only compare after we have a baseline snapshot
+                changes: List[str] = []
+                for pname, new_status in new_inj.items():
+                    old_status = old_inj.get(pname)
+                    if old_status and old_status != new_status:
+                        # Status changed — worth flagging
+                        inj_info = inj_detail.get(pname, {})
+                        team     = inj_info.get("team", "")
+                        comment  = inj_info.get("comment", "")
+                        emoji    = "🔴" if new_status in ("Out", "Doubtful") else (
+                                   "🟡" if new_status == "Questionable" else "🟢")
+                        line = f"{emoji} **{pname}** ({team}): {old_status} → **{new_status}**"
+                        if comment:
+                            line += f"\n　_{comment[:120]}_"
+                        changes.append(line)
+
+                if changes:
+                    try:
+                        embed = discord.Embed(
+                            title="🏥 NBA Injury Report Update",
+                            description="\n".join(changes[:10]),
+                            color=discord.Color.red(),
+                        )
+                        embed.set_footer(text="Source: ESPN  ·  Updates every 15 minutes")
+                        await channel.send(embed=embed)
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                    except Exception as exc:
+                        log.warning("Failed posting injury update: %s", exc)
+
+            self._news_posted[guild_id]       = posted_ids
+            self._injury_snapshot[guild_id]   = new_inj
 
     # ══════════════════════════════════════════════════════════════════════════
     # /economy  commands
@@ -416,7 +539,6 @@ class NBABetting(commands.Cog):
         if amount < 1:
             return await ctx.send("❌ Minimum transfer is 1.", ephemeral=True)
 
-        # Confirm before moving money
         view = ConfirmView(ctx.author.id, timeout=30)
         msg  = await ctx.send(
             f"Transfer {CURRENCY}**{amount:.0f}** to **{recipient.display_name}**?",
@@ -428,15 +550,13 @@ class NBABetting(commands.Cog):
 
         ok = await self.economy.deduct(ctx.guild.id, ctx.author.id, amount)
         if not ok:
-            return await msg.edit(
-                content="❌ Insufficient balance.", view=None
-            )
+            return await msg.edit(content="❌ Insufficient balance.", view=None)
         await self.economy.add(ctx.guild.id, recipient.id, amount)
 
         embed = discord.Embed(title="💸 Transfer Complete", color=discord.Color.green())
-        embed.add_field(name="From",   value=ctx.author.mention,              inline=True)
-        embed.add_field(name="To",     value=recipient.mention,               inline=True)
-        embed.add_field(name="Amount", value=f"{CURRENCY}**{amount:.0f}**",   inline=True)
+        embed.add_field(name="From",   value=ctx.author.mention,            inline=True)
+        embed.add_field(name="To",     value=recipient.mention,             inline=True)
+        embed.add_field(name="Amount", value=f"{CURRENCY}**{amount:.0f}**", inline=True)
         await msg.edit(content=None, embed=embed, view=None)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -478,7 +598,6 @@ class NBABetting(commands.Cog):
         if not upcoming:
             return await ctx.send("No upcoming games available right now.")
 
-        # Match game argument: check abbr or index (1-based)
         target_game = None
         if game:
             game_lower = game.lower()
@@ -535,9 +654,9 @@ class NBABetting(commands.Cog):
             )
 
         # ── Bet limit checks ──────────────────────────────────────────────────
-        cfg          = await self.config.guild(ctx.guild).all()
-        max_daily    = cfg.get("max_daily_bets", DEFAULT_MAX_DAILY_BETS)
-        bets_today   = self.bets.get_bets_placed_today(ctx.guild.id, ctx.author.id)
+        cfg        = await self.config.guild(ctx.guild).all()
+        max_daily  = cfg.get("max_daily_bets", DEFAULT_MAX_DAILY_BETS)
+        bets_today = self.bets.get_bets_placed_today(ctx.guild.id, ctx.author.id)
         if bets_today >= max_daily:
             return await ctx.send(
                 f"🔒 You've reached the daily limit of **{max_daily}** bets. "
@@ -547,24 +666,34 @@ class NBABetting(commands.Cog):
         max_pct = cfg.get("max_bet_pct", DEFAULT_MAX_BET_PCT)
         max_bet = round(balance * max_pct, 2) if max_pct > 0 else 0.0
 
-        # ── Filter out games the user already has a pending team-outcome bet on ──
-        # Player prop bets are player-specific and don't create game correlation,
-        # so same-game props are allowed. Only block h2h/spreads/totals same-game.
-        # Use .get() because parlay bets have no top-level event_id (only in legs).
+        # ── Build per-game restriction maps — block only the specific type/player ──
+        # h2h/spreads/totals block the whole bet-type for that game (can't bet both sides).
+        # Player props block the specific player only (other players are still available).
         _OUTCOME_TYPES = {"h2h", "spreads", "totals"}
         pending_bets   = self.bets.get_user_bets(ctx.guild.id, ctx.author.id, status="pending")
-        already_bet    = {
-            b.get("event_id") for b in pending_bets
-            if b.get("event_id") and b.get("bet_type") in _OUTCOME_TYPES
-        }
-        available      = [g for g in upcoming if g["event_id"] not in already_bet]
-        if not available:
-            return await ctx.send(
-                "🔒 You already have a pending bet on every available game. "
-                "Wait for those to settle before placing new ones."
-            )
 
-        view = BetFlowView(self, ctx.author.id, ctx.guild.id, available, balance, max_bet=max_bet)
+        locked_types:   Dict[str, Set[str]] = {}
+        locked_players: Dict[str, Set[str]] = {}
+
+        for b in pending_bets:
+            event_id = b.get("event_id")
+            if not event_id:
+                continue  # skip parlays (handled separately via legs)
+            bet_type = b.get("bet_type", "")
+            if bet_type in _OUTCOME_TYPES:
+                locked_types.setdefault(event_id, set()).add(bet_type)
+            elif bet_type == "player_props":
+                sel   = b.get("selection", "")
+                pname = sel.split("|")[0] if sel else ""
+                if pname:
+                    locked_players.setdefault(event_id, set()).add(pname)
+
+        view = BetFlowView(
+            self, ctx.author.id, ctx.guild.id, upcoming, balance,
+            max_bet=max_bet,
+            locked_types=locked_types,
+            locked_players=locked_players,
+        )
         msg  = await ctx.send(embed=view._build_embed(), view=view)
         view.message = msg
 
@@ -604,7 +733,7 @@ class NBABetting(commands.Cog):
 
     @bet_group.command(name="mybets")
     async def bet_mybets(self, ctx: commands.Context) -> None:
-        """View and cancel your active (pending) bets."""
+        """View your active (pending) bets."""
         bets = self.bets.get_user_bets(ctx.guild.id, ctx.author.id, "pending")
         if not bets:
             return await ctx.send("You have no pending bets. Use `/bet place` to get started!")
@@ -761,9 +890,11 @@ class NBABetting(commands.Cog):
         embed.set_thumbnail(url=user.display_avatar.url)
         embed.add_field(name="Balance",        value=f"{CURRENCY}{data.get('balance', 0):.0f}",       inline=True)
         embed.add_field(name="Bets Placed",    value=str(data.get("bets_placed", 0)),                  inline=True)
-        embed.add_field(name="Record",
+        embed.add_field(
+            name="Record",
             value=f"{data.get('bets_won',0)}W – {data.get('bets_lost',0)}L – {data.get('bets_push',0)}P",
-            inline=True)
+            inline=True,
+        )
         embed.add_field(name="Total Wagered",  value=f"{CURRENCY}{data.get('total_wagered',0):.0f}",  inline=True)
         embed.add_field(name="Total Returned", value=f"{CURRENCY}{data.get('total_returned',0):.0f}", inline=True)
         profit = data.get("total_returned", 0.0) - data.get("total_wagered", 0.0)
@@ -774,7 +905,7 @@ class NBABetting(commands.Cog):
             def _bet_label(b: dict) -> str:
                 if b.get("bet_type") == "parlay":
                     legs = b.get("legs", [])
-                    sel = f"{len(legs)}-leg parlay"
+                    sel  = f"{len(legs)}-leg parlay"
                 else:
                     sel = b.get("selection", "?")
                     if b.get("bet_type") == "player_props":
@@ -801,8 +932,8 @@ class NBABetting(commands.Cog):
         pending   = self.bets.get_all_pending(ctx.guild.id)
         game_bets = [
             b for b in pending
-            if b.get("event_id") == event_id                             # single-game bet
-            or any(leg.get("event_id") == event_id for leg in b.get("legs", []))  # parlay leg
+            if b.get("event_id") == event_id
+            or any(leg.get("event_id") == event_id for leg in b.get("legs", []))
         ]
         if not game_bets:
             return await ctx.send(f"No pending bets found for event `{event_id}`.")
@@ -913,8 +1044,8 @@ class NBABetting(commands.Cog):
             changed.append(f"Max single bet → **{label}**")
         if not changed:
             cfg = await self.config.guild(ctx.guild).all()
-            mdb  = cfg.get("max_daily_bets", DEFAULT_MAX_DAILY_BETS)
-            mbp  = cfg.get("max_bet_pct", DEFAULT_MAX_BET_PCT) * 100
+            mdb = cfg.get("max_daily_bets", DEFAULT_MAX_DAILY_BETS)
+            mbp = cfg.get("max_bet_pct", DEFAULT_MAX_BET_PCT) * 100
             return await ctx.send(
                 f"**Current limits:**\n"
                 f"• Max daily bets: **{mdb if mdb > 0 else 'unlimited'}**\n"
@@ -935,22 +1066,66 @@ class NBABetting(commands.Cog):
         else:
             await ctx.send("✅ Settlement channel cleared. Results will only be sent via DM.")
 
+    @admin_group.command(name="setnewschannel")
+    @app_commands.describe(channel="Channel for ESPN NBA news & injury updates (leave blank to disable)")
+    async def admin_setnewschannel(
+        self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None
+    ) -> None:
+        """Set a channel to receive ESPN NBA news headlines and injury updates every 15 minutes."""
+        await self.config.guild(ctx.guild).news_channel.set(channel.id if channel else None)
+        if channel:
+            # Reset cached state so it posts fresh articles to the new channel
+            self._news_posted.pop(ctx.guild.id, None)
+            self._injury_snapshot.pop(ctx.guild.id, None)
+            await ctx.send(
+                f"✅ ESPN NBA news & injury updates will post in {channel.mention}.\n"
+                f"New articles and injury status changes will appear every ~15 minutes."
+            )
+        else:
+            await ctx.send("✅ News channel cleared. ESPN updates disabled for this server.")
+
+    @admin_group.command(name="newsnow")
+    async def admin_newsnow(self, ctx: commands.Context) -> None:
+        """Force an immediate ESPN news check and post to the configured news channel."""
+        channel_id: Optional[int] = await self.config.guild(ctx.guild).news_channel()
+        if not channel_id:
+            return await ctx.send(
+                "❌ No news channel configured. Use `/admin setnewschannel` first.",
+                ephemeral=True,
+            )
+        async with ctx.typing():
+            await self._run_news_check()
+        await ctx.send("✅ News check complete — new items (if any) have been posted.")
+
     @admin_group.command(name="status")
     async def admin_status(self, ctx: commands.Context) -> None:
         """Show current cog configuration and pending bet count."""
         cfg         = await self.config.guild(ctx.guild).all()
-        role        = ctx.guild.get_role(cfg["admin_role"]) if cfg["admin_role"] else None
-        channel     = ctx.guild.get_channel(cfg["notify_channel"]) if cfg["notify_channel"] else None
+        role        = ctx.guild.get_role(cfg["admin_role"]) if cfg.get("admin_role") else None
+        notify_ch   = ctx.guild.get_channel(cfg["notify_channel"]) if cfg.get("notify_channel") else None
+        news_ch     = ctx.guild.get_channel(cfg["news_channel"]) if cfg.get("news_channel") else None
         pending_cnt = len(self.bets.get_all_pending(ctx.guild.id))
 
         embed = discord.Embed(title="⚙️ NBABetting Status", color=discord.Color.blurple())
         embed.add_field(name="Odds Source",     value="🟢 ESPN (injury-adjusted)", inline=True)
         embed.add_field(name="Admin Role",      value=role.mention if role else "Admins only", inline=True)
-        embed.add_field(name="Notify Channel",  value=channel.mention if channel else "DMs only", inline=True)
+        embed.add_field(name="Notify Channel",  value=notify_ch.mention if notify_ch else "DMs only", inline=True)
+        embed.add_field(name="News Channel",    value=news_ch.mention if news_ch else "Disabled", inline=True)
         embed.add_field(name="Pending Bets",    value=str(pending_cnt), inline=True)
-        task        = self._settlement_task
-        running     = task is not None and not task.done()
-        loop_status = "🟢 Running" if running else "🔴 Stopped — reload the cog to restart"
-        embed.add_field(name="Settlement Loop", value=f"{loop_status} (every 10 min)", inline=True)
-        embed.set_footer(text="Use /admin settle to trigger settlement immediately.")
+
+        settle_task  = self._settlement_task
+        settle_ok    = settle_task is not None and not settle_task.done()
+        news_task    = self._news_task
+        news_ok      = news_task is not None and not news_task.done()
+        embed.add_field(
+            name="Settlement Loop",
+            value=f"{'🟢 Running' if settle_ok else '🔴 Stopped'} (every 10 min)",
+            inline=True,
+        )
+        embed.add_field(
+            name="News Loop",
+            value=f"{'🟢 Running' if news_ok else '🔴 Stopped'} (every 15 min)",
+            inline=True,
+        )
+        embed.set_footer(text="Use /admin settle to trigger settlement  ·  /admin newsnow for news check")
         await ctx.send(embed=embed)

@@ -17,6 +17,7 @@ ESPN_LEADERS     = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba
 ESPN_TEAM_STATS    = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/statistics"
 ESPN_TEAM_LEADERS  = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/leaders"
 ESPN_TEAM_ROSTER   = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/roster"
+ESPN_NEWS          = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/news"
 
 # ── Cache TTLs (seconds) ──────────────────────────────────────────────────────
 GAMES_TTL             = 120     # 2 min
@@ -1535,6 +1536,65 @@ class OddsFetcher:
             self._last5_cache[abbr] = result
             self._last5_ts[abbr]    = now
         return result
+
+    # ── ESPN news ─────────────────────────────────────────────────────────────
+
+    async def get_news(self, limit: int = 8) -> List[Dict]:
+        """Fetch the latest NBA news headlines from ESPN.
+
+        Returns a list of dicts with keys:
+          id, headline, description, published, url, image_url
+        """
+        session = await self._get_session()
+        try:
+            async with session.get(
+                ESPN_NEWS,
+                params={"limit": limit},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json(content_type=None)
+
+            articles: List[Dict] = []
+            for item in data.get("articles", [])[:limit]:
+                # Prefer dataSourceIdentifier as stable ID, fall back to id field
+                article_id = (
+                    str(item.get("dataSourceIdentifier") or item.get("id") or "")
+                )
+                headline    = item.get("headline", "")
+                description = item.get("description", "")
+                published   = item.get("published", "")
+
+                # Extract web URL from links
+                url = ""
+                links = item.get("links", {})
+                web   = links.get("web", {})
+                if isinstance(web, dict):
+                    url = web.get("href", "")
+                elif isinstance(links, dict):
+                    url = links.get("mobile", {}).get("href", "") or url
+
+                # Extract thumbnail
+                image_url = ""
+                images = item.get("images", [])
+                if images and isinstance(images[0], dict):
+                    image_url = images[0].get("url", "")
+
+                if not headline:
+                    continue  # skip empty/malformed articles
+
+                articles.append({
+                    "id":          article_id,
+                    "headline":    headline,
+                    "description": description,
+                    "published":   published,
+                    "url":         url,
+                    "image_url":   image_url,
+                })
+            return articles
+        except Exception:
+            return []
 
     # ── Box score ─────────────────────────────────────────────────────────────
 
