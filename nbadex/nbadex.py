@@ -153,7 +153,7 @@ class NBAdex(commands.Cog):
     # COMMAND GROUP
     # ──────────────────────────────────────────────────────────────────────────
 
-    @commands.group(name="nbadraft", aliases=["nba", "nbadex"])
+    @commands.group(name="nbadraft")
     @commands.guild_only()
     async def nbadraft(self, ctx: commands.Context):
         """🏀 NBAdex — NBA All-Time Player Draft System.
@@ -169,7 +169,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: create
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="create", aliases=["new", "start"])
+    @nbadraft.command(name="create")
     @commands.has_permissions(manage_messages=True)
     async def draft_create(
         self,
@@ -377,7 +377,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: begin
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="begin", aliases=["go", "startdraft"])
+    @nbadraft.command(name="begin")
     async def draft_begin(self, ctx: commands.Context):
         """Begin the draft (host only). Locks the draft and starts picks."""
         draft = await self.config.guild(ctx.guild).active_draft()
@@ -438,7 +438,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: pick
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="pick", aliases=["select", "draft"])
+    @nbadraft.command(name="pick")
     async def draft_pick(self, ctx: commands.Context, *, player_name: str):
         """Pick a player by name during your turn.
 
@@ -481,7 +481,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: board
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="board", aliases=["picks", "log"])
+    @nbadraft.command(name="board")
     async def draft_board(self, ctx: commands.Context):
         """Show the current draft board — all picks made so far."""
         draft = await self.config.guild(ctx.guild).active_draft()
@@ -532,7 +532,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: team
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="team", aliases=["roster", "myteam"])
+    @nbadraft.command(name="team")
     async def draft_team(self, ctx: commands.Context, user: Optional[discord.Member] = None):
         """View a team's current roster. Defaults to your own team.
 
@@ -566,7 +566,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: teams
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="teams", aliases=["allteams", "standings"])
+    @nbadraft.command(name="teams")
     async def draft_teams(self, ctx: commands.Context):
         """View all teams' rosters with navigation buttons."""
         draft = await self.config.guild(ctx.guild).active_draft()
@@ -597,7 +597,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: remaining
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="remaining", aliases=["available", "pool"])
+    @nbadraft.command(name="remaining")
     async def draft_remaining(self, ctx: commands.Context, position: str = "ALL"):
         """Show remaining available players.
 
@@ -662,7 +662,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: player
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="player", aliases=["stats", "lookup"])
+    @nbadraft.command(name="player")
     async def draft_player(self, ctx: commands.Context, *, name: str):
         """Look up detailed info and stats for any NBA player.
 
@@ -730,7 +730,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: search
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="search", aliases=["find", "s"])
+    @nbadraft.command(name="search")
     async def draft_search(self, ctx: commands.Context, *, query: str):
         """Search for players by name.
 
@@ -766,7 +766,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: rankings
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="rankings", aliases=["rank", "top"])
+    @nbadraft.command(name="rankings")
     async def draft_rankings(self, ctx: commands.Context, position: str = "ALL"):
         """Browse all-time player rankings with interactive position filter.
 
@@ -787,7 +787,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: status
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="status", aliases=["current"])
+    @nbadraft.command(name="status")
     async def draft_status(self, ctx: commands.Context):
         """Show the current draft status and settings."""
         draft = await self.config.guild(ctx.guild).active_draft()
@@ -852,7 +852,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: simulate
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="simulate", aliases=["sim", "results", "winner"])
+    @nbadraft.command(name="simulate")
     async def draft_simulate(self, ctx: commands.Context):
         """Simulate a full season and determine the draft champion.
 
@@ -1035,7 +1035,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: compare
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="compare", aliases=["vs", "h2h"])
+    @nbadraft.command(name="compare")
     async def draft_compare(self, ctx: commands.Context, *, players: str):
         """Compare two players head-to-head across all stat categories.
 
@@ -1153,7 +1153,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: autopick
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="autopick", aliases=["auto"])
+    @nbadraft.command(name="autopick")
     async def draft_autopick(self, ctx: commands.Context):
         """Toggle autopick for yourself. When active, the best available player is picked automatically on your turn."""
         draft = await self.config.guild(ctx.guild).active_draft()
@@ -1188,7 +1188,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: nominate (auction)
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="nominate", aliases=["nom"])
+    @nbadraft.command(name="nominate")
     async def draft_nominate(self, ctx: commands.Context, *, player_name: str):
         """Nominate a player for auction. Only works in Auction draft mode.
 
@@ -1253,7 +1253,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: bid
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="bid", aliases=["b"])
+    @nbadraft.command(name="bid")
     async def draft_bid(self, ctx: commands.Context, amount: int):
         """Place a bid in an Auction draft.
 
@@ -1299,7 +1299,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: modes
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="modes", aliases=["draftmodes"])
+    @nbadraft.command(name="modes")
     async def draft_modes(self, ctx: commands.Context):
         """Show all available draft modes with descriptions."""
         embed = discord.Embed(
@@ -1320,7 +1320,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: history
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="history", aliases=["past"])
+    @nbadraft.command(name="history")
     async def draft_history(self, ctx: commands.Context):
         """Show recent draft history for this server."""
         history = await self.config.guild(ctx.guild).draft_history()
@@ -1352,7 +1352,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: cancel
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="cancel", aliases=["abort"])
+    @nbadraft.command(name="cancel")
     async def draft_cancel(self, ctx: commands.Context):
         """Cancel the current draft. Host or admin only."""
         draft = await self.config.guild(ctx.guild).active_draft()
@@ -1405,7 +1405,7 @@ class NBAdex(commands.Cog):
     # SUBCOMMAND: pickui  (show pick dropdown manually)
     # ──────────────────────────────────────────────────────────────────────────
 
-    @nbadraft.command(name="pickui", aliases=["dropdown", "ui"])
+    @nbadraft.command(name="pickui")
     async def draft_pickui(self, ctx: commands.Context, position: str = "ALL"):
         """Show the interactive player picker dropdown for your current pick.
 
