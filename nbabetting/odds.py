@@ -1015,10 +1015,17 @@ class OddsFetcher:
 
         # ESPN stat name → our internal key
         stat_name_map: Dict[str, str] = {
+            # ESPN category names (actual "name" field values)
+            "scoring":      "pts",
+            "rebounding":   "reb",
+            "assists":      "ast",
+            # Standard per-game names
             "avgpoints":    "pts", "points":    "pts", "pointspergame":    "pts",
             "avgrebounds":  "reb", "rebounds":  "reb", "reboundspergame":  "reb",
-            "avgassists":   "ast", "assists":   "ast", "assistspergame":   "ast",
+            "avgassists":   "ast", "assistspergame":   "ast",
+            # Short abbreviations
             "ppg": "pts", "rpg": "reb", "apg": "ast",
+            "pts": "pts", "reb": "reb", "ast": "ast",
         }
 
         def _extract_stats(athlete: Dict) -> Dict[str, float]:
@@ -1130,10 +1137,17 @@ class OddsFetcher:
         session = await self._get_session()
 
         _stat_key_map: Dict[str, str] = {
+            # ESPN team leaders category names (what the "name" field actually returns)
+            "scoring":         "pts",   # ESPN uses "Scoring" as the category name
+            "rebounding":      "reb",   # ESPN uses "Rebounding"
+            "assists":         "ast",   # ESPN uses "Assists"
+            # Standard per-game stat names
             "pointspergame":   "pts", "avgpoints":   "pts", "points":   "pts",
             "reboundspergame": "reb", "avgrebounds": "reb", "rebounds": "reb",
-            "assistspergame":  "ast", "avgassists":  "ast", "assists":  "ast",
+            "assistspergame":  "ast", "avgassists":  "ast",
+            # Short abbreviations ESPN uses in the "abbreviation" field
             "ppg": "pts", "rpg": "reb", "apg": "ast",
+            "pts": "pts", "reb": "reb", "ast": "ast",
         }
 
         player_stats: Dict[str, Dict] = {}
@@ -1144,6 +1158,14 @@ class OddsFetcher:
             if val > player_stats[pname].get(key, 0.0):
                 player_stats[pname][key] = val
 
+        def _resolve_cat(cat: Dict) -> Optional[str]:
+            """Try category name first, then abbreviation, to handle ESPN's varying schemas."""
+            for field in ("name", "abbreviation", "displayName"):
+                raw = (cat.get(field) or "").lower().replace(" ", "").replace("_", "")
+                if raw and raw in _stat_key_map:
+                    return _stat_key_map[raw]
+            return None
+
         # ── Source 1: team leaders (top scorers/rebounders/assisters for this team) ──
         try:
             url = ESPN_TEAM_LEADERS.format(team_id=team_id)
@@ -1151,10 +1173,7 @@ class OddsFetcher:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
                     for cat in data.get("leaders", []):
-                        cat_name = (
-                            cat.get("name", "") or cat.get("abbreviation", "")
-                        ).lower().replace(" ", "").replace("_", "")
-                        stat_key = _stat_key_map.get(cat_name)
+                        stat_key = _resolve_cat(cat)
                         if not stat_key:
                             continue
                         for entry in cat.get("leaders", []):
@@ -1169,10 +1188,14 @@ class OddsFetcher:
         except Exception:
             pass
 
-        # ── Source 2: team roster (full list; may include stats in athlete object) ──
+        # ── Source 2: team roster (full list; request stats alongside the roster) ──
         try:
             url = ESPN_TEAM_ROSTER.format(team_id=team_id)
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(
+                url,
+                params={"enable": "stats", "seasontype": "2"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
                 data = await resp.json(content_type=None) if resp.status == 200 else {}
 
             raw_athletes: List[Dict] = []
@@ -1232,16 +1255,23 @@ class OddsFetcher:
 
         # ESPN uses different category names depending on endpoint version
         category_key_map = {
+            # Actual display names ESPN uses (lowercased)
+            "scoring":         "pts",
+            "rebounding":      "reb",
+            "assists":         "ast",
+            # Standard names
             "pointspergame":   "pts",
             "reboundspergame": "reb",
             "assistspergame":  "ast",
             "points":          "pts",
             "rebounds":        "reb",
-            "assists":         "ast",
-            "scoring":         "pts",
+            # Short abbreviations
             "ppg":             "pts",
             "rpg":             "reb",
             "apg":             "ast",
+            "pts":             "pts",
+            "reb":             "reb",
+            "ast":             "ast",
         }
 
         def _abbr_from_athlete(athlete: Dict) -> str:
@@ -1273,11 +1303,15 @@ class OddsFetcher:
                 data = await resp.json(content_type=None)
 
             for category in data.get("leaders", []):
-                cat_name = (
-                    category.get("name", "")
-                    or category.get("abbreviation", "")
-                ).lower().replace(" ", "").replace("_", "")
-                stat_key = category_key_map.get(cat_name)
+                # Try every label field ESPN uses — stop at first match.
+                # Using "name or abbreviation" in one expression silently drops
+                # the abbreviation when name exists but isn't in the map.
+                stat_key = None
+                for _field in ("name", "abbreviation", "displayName"):
+                    _raw = (category.get(_field) or "").lower().replace(" ", "").replace("_", "")
+                    if _raw and _raw in category_key_map:
+                        stat_key = category_key_map[_raw]
+                        break
                 if not stat_key:
                     continue
                 for entry in category.get("leaders", []):
@@ -1585,20 +1619,27 @@ class OddsFetcher:
                         continue  # unknown team — skip
                 props_pool[pname] = entry
 
-        # Fill in any roster player not yet in the pool with zero-stats placeholder
-        # (they still appear as bettable — bench contribution bets are valid)
-        for pname, status in combined_roster.items():
-            if status in ("out", "inactive"):
+        # Fill in any roster player not yet in the pool with zero-stats placeholder.
+        # IMPORTANT: iterate home_roster and away_roster SEPARATELY rather than
+        # combined_roster so that team_abbr is always correct even when one of the
+        # two roster fetches failed (empty dict).  Using a combined dict + a
+        # "pname in home_roster" check breaks when home_roster is empty because
+        # every player then falls through to away_abbr.
+        _UNAVAIL = {"out", "inactive"}
+        for pname, status in home_roster.items():
+            if status in _UNAVAIL or pname in injury_out or pname in props_pool:
                 continue
-            if pname in injury_out:
+            props_pool[pname] = {
+                "pts": 0.0, "reb": 0.0, "ast": 0.0, "pra": 0.0,
+                "tier": 3, "team_abbr": home_abbr,
+            }
+        for pname, status in away_roster.items():
+            if status in _UNAVAIL or pname in injury_out or pname in props_pool:
                 continue
-            if pname not in props_pool:
-                # Determine team_abbr from which roster they're in
-                t = home_abbr if pname in home_roster else away_abbr
-                props_pool[pname] = {
-                    "pts": 0.0, "reb": 0.0, "ast": 0.0, "pra": 0.0,
-                    "tier": 3, "team_abbr": t,
-                }
+            props_pool[pname] = {
+                "pts": 0.0, "reb": 0.0, "ast": 0.0, "pra": 0.0,
+                "tier": 3, "team_abbr": away_abbr,
+            }
 
         # ── Adjust props_pool using last-5-game averages (season avg is the floor) ─
         # Lines are based on career/season averages as the primary source.
