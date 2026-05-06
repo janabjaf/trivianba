@@ -109,11 +109,8 @@ def _ml_from_spread(spread_abs: float) -> Tuple[int, int]:
 
 
 def _spread_vig(spread_abs: float) -> Tuple[int, int]:
-    """Spread juice: (fav_price, dog_price). NBA spreads are usually close to -110/-110."""
-    if spread_abs <= 3.0:   return -110, -110
-    if spread_abs <= 6.0:   return -112, -108
-    if spread_abs <= 9.0:   return -115, -105
-    return -118, -102
+    """Spread juice: FanDuel runs -110/-110 on all NBA point spreads, regardless of size."""
+    return -110, -110
 
 
 # ── Opening line tracking (in-memory, never overwritten after first set) ──────
@@ -166,20 +163,22 @@ def _prop_juice(tier: int, is_questionable: bool = False) -> Tuple[int, int]:
     """
     Return (over_price, under_price) for a player prop.
 
-    Real bookmakers shade props based on:
-    - Stars attract massive public over action → over is more expensive
-    - Questionable players → wider spread (uncertainty premium)
-    - Bench players → near-standard juice
+    Calibrated to FanDuel-style pricing:
+    - Stars (tier 1): slight over lean (-115/-105) — public hammers star overs
+    - Rotation (tier 2): mild over lean (-115/-105)
+    - Bench (tier 3): neutral (-110/-110)
+    - Questionable: favour the under (-108/-112) — limited minutes risk
+    The under is NEVER priced at even money (+100); book always holds vig on both sides.
     """
     if is_questionable:
         if tier == 1:
-            return (-108, -112)   # star questionable: slight under-juice edge
+            return (-108, -112)   # star questionable: injury limits minutes → under edge
         return (-105, -115)       # role player questionable: under is the sharper side
     if tier == 1:
-        return (-118, +100)       # public hammers star overs — charge extra vig
+        return (-115, -105)       # star: slight over lean, both sides properly juiced
     if tier == 2:
-        return (-115, -105)       # rotation players: mild public over lean
-    return (-110, -110)           # bench: standard flat juice
+        return (-115, -105)       # rotation: same mild over lean as FanDuel standard
+    return (-110, -110)           # bench: flat standard juice
 
 
 # ── Public-action vig boost ───────────────────────────────────────────────────
@@ -599,11 +598,13 @@ def generate_player_props_for_game(
             tier = 3
 
         if tier == 3:
-            # Bench players: enforce minimum lines so bets are meaningful
-            pts_line = _bench_line(pts, 7.5)
-            reb_line = _bench_line(reb, 3.5)
+            # Bench players: minimums floored just below a realistic contribution.
+            # Using 4.5/2.5/1.5 so a 5 ppg player gets a line near their average,
+            # not an inflated 7.5 that makes the under trivially easy.
+            pts_line = _bench_line(pts, 4.5)
+            reb_line = _bench_line(reb, 2.5)
             ast_line = _bench_line(ast, 1.5)
-            pra_line = _bench_line(pra, 13.5, -1.0)
+            pra_line = _bench_line(pra, 8.5, -1.0)
         else:
             pts_line = _line(pts)
             reb_line = _line(reb)
@@ -612,28 +613,31 @@ def generate_player_props_for_game(
 
         is_questionable = pname in (questionable_players or set())
 
-        # Points: public hammers overs heavily — most biased juice
-        pts_over_p, pts_under_p   = _prop_juice(tier, is_questionable)
-        # Rebounds: more neutral market; slight sharp under lean on stars
-        if tier == 1:
-            reb_over_p, reb_under_p = (-112, -108)
-        elif tier == 2:
-            reb_over_p, reb_under_p = (-110, -110)
-        else:
-            reb_over_p, reb_under_p = (-110, -110)
+        # ── FanDuel-calibrated per-stat juice ─────────────────────────────────
+        # Points: public hammers overs — slight over premium for stars & rotation
+        pts_over_p, pts_under_p = _prop_juice(tier, is_questionable)
+
+        # Rebounds: neutral market — FanDuel standard -110/-110 for all tiers
         if is_questionable:
             reb_over_p, reb_under_p = (-105, -115)
-        # Assists: most neutral line — public has no strong lean
-        ast_over_p, ast_under_p   = (-110, -110) if not is_questionable else (-105, -115)
-        # PRA: combined uncertainty → slightly higher vig on both sides
-        if tier == 1:
-            pra_over_p, pra_under_p = (-120, +102)
+        else:
+            reb_over_p, reb_under_p = (-110, -110)
+
+        # Assists: neutral; -110/-110 across the board (lowest public interest)
+        if is_questionable:
+            ast_over_p, ast_under_p = (-105, -115)
+        else:
+            ast_over_p, ast_under_p = (-110, -110)
+
+        # PRA: combined stat — slight over lean same as points, never at even money
+        if is_questionable:
+            pra_over_p, pra_under_p = (-108, -112)
+        elif tier == 1:
+            pra_over_p, pra_under_p = (-115, -105)
         elif tier == 2:
             pra_over_p, pra_under_p = (-115, -105)
         else:
-            pra_over_p, pra_under_p = (-112, -108)
-        if is_questionable:
-            pra_over_p, pra_under_p = (-108, -112)
+            pra_over_p, pra_under_p = (-110, -110)
 
         props[pname] = {
             "pts":        pts_line,
@@ -1468,11 +1472,14 @@ class OddsFetcher:
         #   - Injured players from the injuries endpoint (status "out") are excluded.
         # ──────────────────────────────────────────────────────────────────────
 
-        # Collect injury "out" names from the injuries report
+        # Collect unavailable player names from the injuries report.
+        # "out", "inactive", and "suspension"/"suspended" are all non-playing
+        # statuses; doubtful is NOT excluded here (still listed on FanDuel).
         injury_out: set = set()
+        _UNAVAILABLE_STATUSES = {"out", "inactive", "suspension", "suspended"}
         for team_abbr_key in (home_abbr, away_abbr):
             for inj in injuries.get(team_abbr_key, []):
-                if inj.get("status", "").lower() in ("out",):
+                if inj.get("status", "").lower() in _UNAVAILABLE_STATUSES:
                     injury_out.add(inj["name"])
 
         # Merge availability from team rosters
@@ -1495,12 +1502,29 @@ class OddsFetcher:
         # to this specific team — no team-abbr guessing needed) and ESPN_TEAM_ROSTER
         # (complete player list).  Seeding from these first guarantees BOTH teams
         # always have players in the pool before we even look at the global leaders.
+        #
+        # IMPORTANT: process each team separately so team_abbr is always correct.
+        # Merging dicts ({**home, **away}) can overwrite team_abbr for same-named
+        # players, so we do two explicit passes instead.
         props_pool: Dict[str, Dict] = {}
 
-        for pname, pdata in {**home_player_pool, **away_player_pool}.items():
+        for pname, pdata in home_player_pool.items():
             if not _is_available(pname):
                 continue
-            props_pool[pname] = dict(pdata)
+            entry = dict(pdata)
+            entry["team_abbr"] = home_abbr   # always authoritative
+            props_pool[pname] = entry
+
+        for pname, pdata in away_player_pool.items():
+            if not _is_available(pname):
+                continue
+            if pname in props_pool:
+                # Player appears in both rosters (very rare — traded player edge
+                # case). Keep the entry but don't overwrite team_abbr.
+                continue
+            entry = dict(pdata)
+            entry["team_abbr"] = away_abbr   # always authoritative
+            props_pool[pname] = entry
 
         # Supplement with global stat leaders — wider coverage of season averages.
         # ESPN's leaders endpoint often omits team_abbr, so we also accept any
@@ -1515,36 +1539,51 @@ class OddsFetcher:
             if not _is_available(pname):
                 continue
 
-            entry = dict(pdata)
-            # Ensure team_abbr is always set so generate_player_props_for_game
-            # can filter correctly even when ESPN omits it.
-            if not in_game_by_abbr:
-                entry["team_abbr"] = home_abbr if pname in home_roster else away_abbr
-
             if pname in props_pool:
-                # Already seeded from team player pool — keep its team_abbr and
-                # merge in any higher stat values from the global leaders.
+                # Already seeded from team player pool — PRESERVE its team_abbr
+                # (which we set authoritatively above) and only merge higher stats.
                 ex = props_pool[pname]
                 for key in ("pts", "reb", "ast", "pra"):
-                    if entry.get(key, 0) > ex.get(key, 0):
-                        ex[key] = entry[key]
+                    if pdata.get(key, 0) > ex.get(key, 0):
+                        ex[key] = pdata[key]
                 ex["tier"] = _player_tier(ex.get("pts", 0))
             else:
+                # Player not yet in pool — add them with correct team attribution.
+                entry = dict(pdata)
+                if pname in home_roster:
+                    entry["team_abbr"] = home_abbr
+                elif pname in away_roster:
+                    entry["team_abbr"] = away_abbr
+                elif in_game_by_abbr:
+                    entry["team_abbr"] = t   # trust ESPN if it's one of our two teams
+                else:
+                    continue   # can't determine team — skip
                 props_pool[pname] = entry
 
-        # Overlay/add from game summary (most authoritative for this specific game)
+        # Overlay/add from game summary (authoritative for game-day availability)
         for pname, sdata in summary_roster.items():
             if not _is_available(pname, sdata):
                 continue
             if pname in props_pool:
                 # Keep the higher stats (summary may have more recent data)
+                # but NEVER overwrite team_abbr — we set it authoritatively above.
                 ex = props_pool[pname]
                 for key in ("pts", "reb", "ast", "pra"):
                     if sdata.get(key, 0) > ex.get(key, 0):
                         ex[key] = sdata[key]
                 ex["tier"] = _player_tier(ex["pts"])
+                # Do NOT copy sdata["team_abbr"] — it can be wrong from ESPN summary
             else:
-                props_pool[pname] = dict(sdata)
+                entry = dict(sdata)
+                # Infer correct team_abbr from roster membership if not already set
+                if entry.get("team_abbr", "") not in (home_abbr, away_abbr):
+                    if pname in home_roster:
+                        entry["team_abbr"] = home_abbr
+                    elif pname in away_roster:
+                        entry["team_abbr"] = away_abbr
+                    else:
+                        continue  # unknown team — skip
+                props_pool[pname] = entry
 
         # Fill in any roster player not yet in the pool with zero-stats placeholder
         # (they still appear as bettable — bench contribution bets are valid)
@@ -1561,10 +1600,12 @@ class OddsFetcher:
                     "tier": 3, "team_abbr": t,
                 }
 
-        # ── Blend last-5-game averages into props_pool (65% recent, 35% season) ─
-        # This makes prop lines respond to current form instead of pure season
-        # averages — a cold shooter or a player on a scoring streak will have
-        # lines that actually reflect it.
+        # ── Adjust props_pool using last-5-game averages (season avg is the floor) ─
+        # Lines are based on career/season averages as the primary source.
+        # Recent form can only RAISE a line (hot streak → harder to bet the over)
+        # but NEVER lower it below the season average.
+        # This ensures elite players like Anthony Edwards keep their proper lines
+        # even during a cold stretch.
         last5_lookup: Dict[str, Dict] = {**home_last5, **away_last5}
         for pname, pdata in props_pool.items():
             l5 = last5_lookup.get(pname)
@@ -1572,11 +1613,15 @@ class OddsFetcher:
                 continue
             updated = False
             for stat in ("pts", "reb", "ast"):
-                l5_val = l5.get(stat, 0.0)
-                if l5_val > 0:
-                    season_val = pdata.get(stat, 0.0)
-                    pdata[stat] = round(0.65 * l5_val + 0.35 * season_val, 1)
+                l5_val     = l5.get(stat, 0.0)
+                season_val = pdata.get(stat, 0.0)
+                if l5_val > 0 and l5_val > season_val:
+                    # Player is on a hot streak — slightly raise the line
+                    blended = round(0.25 * l5_val + 0.75 * season_val, 1)
+                    pdata[stat] = blended
                     updated = True
+                # If l5 is lower than season avg, keep season avg (cold streaks
+                # don't lower lines — this protects against easy-win scenarios)
             if updated:
                 pdata["pra"]  = round(
                     pdata.get("pts", 0.0) + pdata.get("reb", 0.0) + pdata.get("ast", 0.0), 1

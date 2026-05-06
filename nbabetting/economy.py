@@ -41,12 +41,17 @@ class Economy:
         return await self.config.member_from_ids(guild_id, user_id).balance()
 
     async def add(self, guild_id: int, user_id: int, amount: float) -> float:
-        """Add amount and return new balance."""
-        conf    = self.config.member_from_ids(guild_id, user_id)
-        bal     = await conf.balance()
-        new_bal = round(bal + amount, 2)
-        await conf.balance.set(new_bal)
-        return new_bal
+        """Add amount and return new balance.
+
+        Uses the same per-user lock as deduct() to prevent concurrent win
+        payouts or refunds from overwriting each other's balance write.
+        """
+        async with self._lock(guild_id, user_id):
+            conf    = self.config.member_from_ids(guild_id, user_id)
+            bal     = await conf.balance()
+            new_bal = round(bal + amount, 2)
+            await conf.balance.set(new_bal)
+            return new_bal
 
     async def deduct(self, guild_id: int, user_id: int, amount: float) -> bool:
         """Deduct amount. Returns False if insufficient funds.

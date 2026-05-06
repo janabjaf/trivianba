@@ -48,8 +48,16 @@ class BetsManager:
         if gid not in self._cache:
             return
         path = self._path(guild_id)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self._cache[gid], f, indent=2)
+        tmp  = path.with_suffix(".tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._cache[gid], f, indent=2)
+            tmp.replace(path)   # atomic rename on POSIX — no partial-write corruption
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -208,7 +216,11 @@ class BetsManager:
         return bet_id
 
     def get_bets_placed_today(self, guild_id: int, user_id: int) -> int:
-        """Count how many bets this user has placed today (UTC calendar day)."""
+        """Count how many bets this user has placed today (UTC calendar day).
+
+        Cancelled bets (injury refunds) are excluded so refunded bets do not
+        burn the user's daily bet allowance.
+        """
         today = datetime.now(timezone.utc).date().isoformat()
         data  = self._load(guild_id)
         uid   = str(user_id)
@@ -217,12 +229,18 @@ class BetsManager:
             for bet in data[pool].values():
                 if bet.get("user_id") != uid:
                     continue
+                if bet.get("status") == "cancelled":
+                    continue   # injury refunds don't consume daily bet slots
                 if (bet.get("placed_at") or "").startswith(today):
                     count += 1
         return count
 
     def get_wagered_today(self, guild_id: int, user_id: int) -> float:
-        """Return total amount wagered today (UTC) by this user."""
+        """Return total amount wagered today (UTC) by this user.
+
+        Cancelled bets (injury refunds) are excluded so refunded stakes are
+        not counted against the user's daily wagering limit.
+        """
         today = datetime.now(timezone.utc).date().isoformat()
         data  = self._load(guild_id)
         uid   = str(user_id)
@@ -231,6 +249,8 @@ class BetsManager:
             for bet in data[pool].values():
                 if bet.get("user_id") != uid:
                     continue
+                if bet.get("status") == "cancelled":
+                    continue   # refunded bets don't count against daily wager limits
                 if (bet.get("placed_at") or "").startswith(today):
                     total += float(bet.get("stake", 0.0))
         return total

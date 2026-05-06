@@ -86,6 +86,8 @@ class NBABetting(commands.Cog):
         self._news_posted: Dict[int, Set[str]] = {}
         # Track last known injury statuses per guild for change detection
         self._injury_snapshot: Dict[int, Dict[str, str]] = {}
+        # Track bet IDs already refunded due to injury (prevents double-refund)
+        self._injury_refunded: Dict[int, Set[str]] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -381,6 +383,23 @@ class NBABetting(commands.Cog):
         news_articles = await self.fetcher.get_news(limit=8)
         injuries      = await self.fetcher.get_injuries()
 
+        # ── Flatten all injuries to {player_name: status} for injury-refund logic ──
+        all_injured: Dict[str, str] = {}
+        for team_abbr_key, players in (injuries or {}).items():
+            for player_info in players:
+                pname  = player_info.get("name", "")
+                status = player_info.get("status", "")
+                if pname and status:
+                    all_injured[pname] = status
+
+        # Refund bets for any "Out" player across ALL guilds (not just those with a
+        # news channel) — every guild with pending bets deserves the refund.
+        for guild in self.bot.guilds:
+            try:
+                await self._refund_injured_player_bets(guild.id, all_injured)
+            except Exception as exc:
+                log.warning("Injury refund check failed for guild %s: %s", guild.id, exc)
+
         for guild in self.bot.guilds:
             guild_id   = guild.id
             channel_id: Optional[int] = await self.config.guild_from_id(guild_id).news_channel()
@@ -473,6 +492,143 @@ class NBABetting(commands.Cog):
 
             self._news_posted[guild_id]       = posted_ids
             self._injury_snapshot[guild_id]   = new_inj
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Injury-based auto-refund
+    # ══════════════════════════════════════════════════════════════════════════
+
+    async def _refund_injured_player_bets(
+        self,
+        guild_id: int,
+        all_injured: Dict[str, str],
+    ) -> None:
+        """
+        Scan all pending bets in a guild.  Any player-prop or parlay-leg bet
+        whose player is now listed as "Out" (or "Inactive") in the ESPN injury
+        report is cancelled and the stake is refunded to the bettor.
+
+        A DM is sent to the user explaining why their bet was voided.
+        Each bet ID is only refunded once (tracked in self._injury_refunded).
+        """
+        # Build set of players confirmed "Out" / "Inactive"
+        out_players: Set[str] = {
+            pname for pname, status in all_injured.items()
+            if status.lower() in ("out", "inactive", "suspension")
+        }
+        if not out_players:
+            return
+
+        refunded_ids = self._injury_refunded.setdefault(guild_id, set())
+        pending = self.bets.get_all_pending(guild_id)
+
+        for bet in pending:
+            bet_id = bet["id"]
+            if bet_id in refunded_ids:
+                continue
+
+            user_id = int(bet["user_id"])
+            stake   = bet["stake"]
+
+            # ── Single player-prop bet ─────────────────────────────────────
+            if bet.get("bet_type") == "player_props":
+                selection = bet.get("selection", "")
+                parts     = selection.split("|")
+                player_name = parts[0] if parts else ""
+                if not player_name or player_name not in out_players:
+                    continue
+
+                settled = self.bets.settle_bet(guild_id, bet_id, "cancelled", stake)
+                if not settled:
+                    continue
+                await self.economy.add(guild_id, user_id, stake)
+                refunded_ids.add(bet_id)
+
+                # DM the user
+                embed = discord.Embed(
+                    title="🚨 Bet Auto-Cancelled — Player Ruled Out",
+                    color=discord.Color.orange(),
+                    description=(
+                        f"**{player_name}** has been ruled out and is unavailable "
+                        f"to play.  Your bet has been automatically refunded."
+                    ),
+                )
+                embed.add_field(name="Bet ID",    value=f"`{bet_id}`",        inline=True)
+                embed.add_field(name="Refunded",  value=f"💰 **{stake:.0f}**", inline=True)
+                embed.add_field(
+                    name="Pick",
+                    value=f"{selection} (cancelled)",
+                    inline=False,
+                )
+                embed.set_footer(text="You can place a new bet on a different player.")
+                user = self.bot.get_user(user_id)
+                if user:
+                    try:
+                        await user.send(embed=embed)
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+
+                # Also post to notify channel if configured
+                channel_id: Optional[int] = await self.config.guild_from_id(guild_id).notify_channel()
+                if channel_id:
+                    channel = self.bot.get_channel(channel_id)
+                    if channel:
+                        try:
+                            await channel.send(
+                                content=f"<@{user_id}>",
+                                embed=embed,
+                            )
+                        except (discord.Forbidden, discord.HTTPException):
+                            pass
+
+            # ── Parlay bet — check each player-prop leg ────────────────────
+            elif bet.get("bet_type") == "parlay":
+                legs = bet.get("legs", [])
+                injured_legs: List[str] = []
+                for leg in legs:
+                    if leg.get("leg_type") != "player_props":
+                        continue
+                    sel   = leg.get("selection", "")
+                    parts = sel.split("|")
+                    pname = parts[0] if parts else ""
+                    if pname and pname in out_players:
+                        injured_legs.append(pname)
+
+                if not injured_legs:
+                    continue
+
+                settled = self.bets.settle_bet(guild_id, bet_id, "cancelled", stake)
+                if not settled:
+                    continue
+                await self.economy.add(guild_id, user_id, stake)
+                refunded_ids.add(bet_id)
+
+                players_str = ", ".join(f"**{p}**" for p in injured_legs)
+                embed = discord.Embed(
+                    title="🚨 Parlay Auto-Cancelled — Player(s) Ruled Out",
+                    color=discord.Color.orange(),
+                    description=(
+                        f"{players_str} {'has' if len(injured_legs) == 1 else 'have'} been "
+                        f"ruled out.  Your {len(legs)}-leg parlay has been fully refunded."
+                    ),
+                )
+                embed.add_field(name="Bet ID",   value=f"`{bet_id}`",         inline=True)
+                embed.add_field(name="Refunded", value=f"💰 **{stake:.0f}**",  inline=True)
+                embed.set_footer(text="You can build a new parlay without the affected player(s).")
+                user = self.bot.get_user(user_id)
+                if user:
+                    try:
+                        await user.send(embed=embed)
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+
+                channel_id2: Optional[int] = await self.config.guild_from_id(guild_id).notify_channel()
+                if channel_id2:
+                    channel2 = self.bot.get_channel(channel_id2)
+                    if channel2:
+                        try:
+                            await channel2.send(content=f"<@{user_id}>", embed=embed)
+                        except (discord.Forbidden, discord.HTTPException):
+                            pass
 
     # ══════════════════════════════════════════════════════════════════════════
     # /economy  commands
