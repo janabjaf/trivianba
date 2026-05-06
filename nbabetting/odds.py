@@ -592,9 +592,11 @@ def generate_player_props_for_game(
         pra  = pts + reb + ast
         tier = _player_tier(pts)
 
-        # Skip players with no stats at all (truly unknown bench players)
+        # Players with all-zero stats are roster-only entries added by the
+        # team-roster fallback (no leaders / summary data found for them).
+        # Force tier-3 so they receive meaningful minimum bench lines below.
         if pts == 0.0 and reb == 0.0 and ast == 0.0:
-            continue
+            tier = 3
 
         if tier == 3:
             # Bench players: enforce minimum lines so bets are meaningful
@@ -749,6 +751,10 @@ class OddsFetcher:
         # Per-team roster cache: {abbr: {player_name: status_str}}
         self._team_roster_cache: Dict[str, Dict] = {}
         self._team_roster_ts:    Dict[str, float] = {}
+
+        # Per-team player pool (leaders + roster stats): {abbr: {player_name: {pts,...}}}
+        self._team_player_pool_cache: Dict[str, Dict] = {}
+        self._team_player_pool_ts:    Dict[str, float] = {}
 
         # Per-game summary roster cache: {event_id: {player_name: {pts,reb,ast,pra,team_abbr,available}}}
         self._summary_roster_cache: Dict[str, Dict] = {}
@@ -1000,6 +1006,8 @@ class OddsFetcher:
         session = await self._get_session()
         result: Dict[str, Dict] = {}
         valid_abbrs = {home_abbr, away_abbr}
+        # Reverse TEAM_IDS so we can resolve numeric team IDs → abbreviation
+        _id_to_abbr: Dict[str, str] = {str(v): k for k, v in TEAM_IDS.items()}
 
         # ESPN stat name → our internal key
         stat_name_map: Dict[str, str] = {
@@ -1037,10 +1045,15 @@ class OddsFetcher:
                 data = await resp.json(content_type=None)
 
             for team_block in data.get("rosters", []):
+                t_obj     = team_block.get("team", {})
                 team_abbr = (
-                    team_block.get("team", {}).get("abbreviation", "")
-                    or team_block.get("team", {}).get("abbrev", "")
+                    t_obj.get("abbreviation", "")
+                    or t_obj.get("abbrev", "")
                 ).upper()
+                # If ESPN omits or mismatches the abbreviation, resolve via team ID
+                if team_abbr not in valid_abbrs:
+                    team_id_str = str(t_obj.get("id", ""))
+                    team_abbr   = _id_to_abbr.get(team_id_str, team_abbr)
                 if team_abbr not in valid_abbrs:
                     continue
 
@@ -1083,6 +1096,120 @@ class OddsFetcher:
         if result:
             self._summary_roster_cache[event_id] = result
             self._summary_roster_ts[event_id]    = now
+        return result
+
+    # ── Per-team player pool (leaders + roster) ───────────────────────────────
+
+    async def get_team_player_pool(self, abbr: str) -> Dict[str, Dict]:
+        """
+        Return {player_name: {pts, reb, ast, pra, tier, team_abbr}} for every
+        player on the team, by combining two ESPN sources:
+
+        1. ESPN_TEAM_LEADERS — top stat leaders already scoped to this team,
+           so team attribution is guaranteed (no abbr-guessing needed).
+        2. ESPN_TEAM_ROSTER  — full player list; stats extracted from the
+           nested `statistics` object when ESPN includes them.
+
+        Cached per team for 6 hours (same TTL as team stats).
+        """
+        now = time.monotonic()
+        if (
+            abbr in self._team_player_pool_cache
+            and now - self._team_player_pool_ts.get(abbr, 0) < TEAM_STATS_TTL
+        ):
+            return self._team_player_pool_cache[abbr]
+
+        team_id = TEAM_IDS.get(abbr)
+        if not team_id:
+            return {}
+
+        session = await self._get_session()
+
+        _stat_key_map: Dict[str, str] = {
+            "pointspergame":   "pts", "avgpoints":   "pts", "points":   "pts",
+            "reboundspergame": "reb", "avgrebounds": "reb", "rebounds": "reb",
+            "assistspergame":  "ast", "avgassists":  "ast", "assists":  "ast",
+            "ppg": "pts", "rpg": "reb", "apg": "ast",
+        }
+
+        player_stats: Dict[str, Dict] = {}
+
+        def _update(pname: str, key: str, val: float) -> None:
+            if pname not in player_stats:
+                player_stats[pname] = {"pts": 0.0, "reb": 0.0, "ast": 0.0, "team_abbr": abbr}
+            if val > player_stats[pname].get(key, 0.0):
+                player_stats[pname][key] = val
+
+        # ── Source 1: team leaders (top scorers/rebounders/assisters for this team) ──
+        try:
+            url = ESPN_TEAM_LEADERS.format(team_id=team_id)
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    for cat in data.get("leaders", []):
+                        cat_name = (
+                            cat.get("name", "") or cat.get("abbreviation", "")
+                        ).lower().replace(" ", "").replace("_", "")
+                        stat_key = _stat_key_map.get(cat_name)
+                        if not stat_key:
+                            continue
+                        for entry in cat.get("leaders", []):
+                            athlete = entry.get("athlete") or {}
+                            pname   = athlete.get("displayName") or athlete.get("fullName", "")
+                            if not pname:
+                                continue
+                            try:
+                                _update(pname, stat_key, float(entry.get("value", 0)))
+                            except (TypeError, ValueError):
+                                pass
+        except Exception:
+            pass
+
+        # ── Source 2: team roster (full list; may include stats in athlete object) ──
+        try:
+            url = ESPN_TEAM_ROSTER.format(team_id=team_id)
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                data = await resp.json(content_type=None) if resp.status == 200 else {}
+
+            raw_athletes: List[Dict] = []
+            for item in data.get("athletes", []):
+                if "items" in item:
+                    raw_athletes.extend(item["items"])
+                elif "displayName" in item or "fullName" in item:
+                    raw_athletes.append(item)
+
+            for athlete in raw_athletes:
+                pname = athlete.get("displayName") or athlete.get("fullName", "")
+                if not pname:
+                    continue
+                # Ensure the player appears even with zero stats
+                if pname not in player_stats:
+                    player_stats[pname] = {"pts": 0.0, "reb": 0.0, "ast": 0.0, "team_abbr": abbr}
+                # Extract stats from the statistics sub-object ESPN sometimes includes
+                stats_obj = athlete.get("statistics") or {}
+                splits    = stats_obj.get("splits") or {}
+                for cat in splits.get("categories") or []:
+                    for s in cat.get("stats") or []:
+                        sname = (s.get("name") or "").lower().replace(" ", "").replace("_", "")
+                        sk    = _stat_key_map.get(sname)
+                        if sk and s.get("value") is not None:
+                            try:
+                                _update(pname, sk, float(s["value"]))
+                            except (TypeError, ValueError):
+                                pass
+        except Exception:
+            pass
+
+        # Compute pra + tier for everything collected
+        result: Dict[str, Dict] = {}
+        for pname, d in player_stats.items():
+            d["pra"]  = d["pts"] + d["reb"] + d["ast"]
+            d["tier"] = _player_tier(d["pts"])
+            result[pname] = d
+
+        if result:
+            self._team_player_pool_cache[abbr] = result
+            self._team_player_pool_ts[abbr]    = now
         return result
 
     # ── Season stat leaders ───────────────────────────────────────────────────
@@ -1311,6 +1438,7 @@ class OddsFetcher:
             home_roster, away_roster,
             summary_roster,
             home_last5, away_last5,
+            home_player_pool, away_player_pool,
         ) = await asyncio.gather(
             self.get_injuries(),
             self.get_stat_leaders(),
@@ -1321,14 +1449,18 @@ class OddsFetcher:
             self._parse_summary_roster(event_id, home_abbr, away_abbr),
             self.get_player_last5(home_abbr),
             self.get_player_last5(away_abbr),
+            self.get_team_player_pool(home_abbr),
+            self.get_team_player_pool(away_abbr),
         )
 
         # ── Build props player pool ────────────────────────────────────────────
         #
         # Priority (highest → lowest):
-        #   1. ESPN game summary rosters  — game-specific players + season avgs
-        #   2. Global stat leaders        — wide coverage, season avgs
-        #   3. Team roster names          — guarantees every player appears
+        #   0. Per-team player pools (ESPN_TEAM_LEADERS + ESPN_TEAM_ROSTER per team)
+        #      — guaranteed correct team attribution for BOTH teams
+        #   1. Global stat leaders   — supplements with wider season-avg coverage
+        #   2. ESPN game summary rosters — game-specific availability + avgs
+        #   3. Team roster names     — guarantees every remaining player appears
         #
         # Availability filter:
         #   - Players marked "out" or "inactive" in team roster are excluded.
@@ -1358,14 +1490,21 @@ class OddsFetcher:
             roster_status = combined_roster.get(pname, "active")
             return roster_status not in ("out", "inactive")
 
-        # Start with global leaders that belong to either team in this game.
-        # ESPN's leaders endpoint often omits team_abbr from athlete objects,
-        # so we ALSO accept any player whose name appears in the game's
-        # combined_roster (built from the reliable team-roster endpoint).
-        # In that case we infer the correct team_abbr from which sub-roster
-        # the player was found in.
+        # ── Seed props_pool from per-team player pools (highest-confidence source) ──
+        # get_team_player_pool() fetches ESPN_TEAM_LEADERS (players already scoped
+        # to this specific team — no team-abbr guessing needed) and ESPN_TEAM_ROSTER
+        # (complete player list).  Seeding from these first guarantees BOTH teams
+        # always have players in the pool before we even look at the global leaders.
         props_pool: Dict[str, Dict] = {}
 
+        for pname, pdata in {**home_player_pool, **away_player_pool}.items():
+            if not _is_available(pname):
+                continue
+            props_pool[pname] = dict(pdata)
+
+        # Supplement with global stat leaders — wider coverage of season averages.
+        # ESPN's leaders endpoint often omits team_abbr, so we also accept any
+        # player found in combined_roster and infer their team from it.
         for pname, pdata in stat_leaders.items():
             t = pdata.get("team_abbr", "")
             in_game_by_abbr   = t in (home_abbr, away_abbr)
@@ -1381,7 +1520,17 @@ class OddsFetcher:
             # can filter correctly even when ESPN omits it.
             if not in_game_by_abbr:
                 entry["team_abbr"] = home_abbr if pname in home_roster else away_abbr
-            props_pool[pname] = entry
+
+            if pname in props_pool:
+                # Already seeded from team player pool — keep its team_abbr and
+                # merge in any higher stat values from the global leaders.
+                ex = props_pool[pname]
+                for key in ("pts", "reb", "ast", "pra"):
+                    if entry.get(key, 0) > ex.get(key, 0):
+                        ex[key] = entry[key]
+                ex["tier"] = _player_tier(ex.get("pts", 0))
+            else:
+                props_pool[pname] = entry
 
         # Overlay/add from game summary (most authoritative for this specific game)
         for pname, sdata in summary_roster.items():
