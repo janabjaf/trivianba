@@ -65,6 +65,7 @@ class NBABetting(commands.Cog):
             bets_won=0,
             bets_lost=0,
             bets_push=0,
+            current_streak=0,       # consecutive wins (resets on loss)
         )
         self.config.register_guild(
             admin_role=None,
@@ -72,6 +73,9 @@ class NBABetting(commands.Cog):
             news_channel=None,
             max_bet_pct=DEFAULT_MAX_BET_PCT,
             max_daily_bets=DEFAULT_MAX_DAILY_BETS,
+            parlay_insurance_pct=0.0,   # 0 = disabled; e.g. 0.25 = 25% stake back on 1-leg miss
+            streak_bonus_at=0,          # 0 = disabled; e.g. 3 = bonus every 3 consecutive wins
+            streak_bonus_coins=0,       # coins awarded at each streak milestone
         )
 
         # ── Helpers ───────────────────────────────────────────────────────────
@@ -146,6 +150,12 @@ class NBABetting(commands.Cog):
             if not pending:
                 continue
 
+            # Fetch guild config once per guild — used for insurance & streak bonus
+            guild_cfg          = await self.config.guild_from_id(guild_id).all()
+            insurance_pct      = float(guild_cfg.get("parlay_insurance_pct", 0.0))
+            streak_bonus_at    = int(guild_cfg.get("streak_bonus_at",    0))
+            streak_bonus_coins = int(guild_cfg.get("streak_bonus_coins", 0))
+
             # Pre-fetch box scores for all events with player-prop or parlay bets
             prop_event_ids: set = set()
             for b in pending:
@@ -211,6 +221,10 @@ class NBABetting(commands.Cog):
                     if not can_settle:
                         continue
 
+                    # "no_action" (DNP player leg) is treated like "push":
+                    # the leg is removed and the parlay continues with remaining legs.
+                    _inactive = {"push", "no_action"}
+
                     if "lost" in leg_results:
                         result = "lost"
                         payout = 0.0
@@ -218,9 +232,10 @@ class NBABetting(commands.Cog):
                         result = "won"
                         payout = stake + bet["potential_payout"]
                     else:
-                        # Some legs pushed — reduce parlay to surviving legs
+                        # Remove push/no_action legs — parlay recalculates on survivors
                         surviving = [
-                            legs[i] for i, r in enumerate(leg_results) if r != "push"
+                            legs[i] for i, r in enumerate(leg_results)
+                            if r not in _inactive
                         ]
                         if len(surviving) < 2:
                             result = "push"
@@ -231,21 +246,48 @@ class NBABetting(commands.Cog):
                             result     = "won"
                             payout     = stake + new_profit
 
-                    if result != "won" and result != "push":
+                    if result not in ("won", "push"):
                         payout = 0.0
+
                     # Settle first — moves bet out of active before crediting money.
                     settled = self.bets.settle_bet(guild_id, bet["id"], result, payout)
                     if not settled:
                         continue  # already settled (safety guard)
+
+                    insurance_refund = 0.0
                     if result == "won":
                         await self.economy.add(guild_id, user_id, payout)
                         await self.economy.record_win(guild_id, user_id, payout)
+                        # Streak tracking
+                        streak = await self.economy.get_streak(guild_id, user_id) + 1
+                        await self.economy.set_streak(guild_id, user_id, streak)
                     elif result == "push":
                         await self.economy.add(guild_id, user_id, payout)
                         await self.economy.record_push(guild_id, user_id, stake)
+                        # Push doesn't break streak but doesn't extend it either
                     else:
                         await self.economy.record_loss(guild_id, user_id)
-                    await self._notify_result(guild_id, user_id, bet, result, payout)
+                        await self.economy.set_streak(guild_id, user_id, 0)
+                        # ── Parlay insurance: 1-leg miss on 3+ leg parlay ──────
+                        n_settled = sum(1 for r in leg_results if r not in _inactive)
+                        n_lost    = leg_results.count("lost")
+                        if insurance_pct > 0 and n_lost == 1 and n_settled >= 3:
+                            insurance_refund = max(1.0, round(stake * insurance_pct))
+                            await self.economy.add(guild_id, user_id, insurance_refund)
+
+                    # ── Streak milestone bonus ─────────────────────────────────
+                    streak_bonus = 0
+                    if result == "won" and streak_bonus_at > 0 and streak_bonus_coins > 0:
+                        streak = await self.economy.get_streak(guild_id, user_id)
+                        if streak > 0 and streak % streak_bonus_at == 0:
+                            streak_bonus = streak_bonus_coins
+                            await self.economy.add(guild_id, user_id, streak_bonus)
+
+                    await self._notify_result(
+                        guild_id, user_id, bet, result, payout,
+                        insurance_refund=insurance_refund,
+                        streak_bonus=streak_bonus,
+                    )
                     continue
 
                 # ── Single bet settlement ──────────────────────────────────────
@@ -274,25 +316,39 @@ class NBABetting(commands.Cog):
 
                 profit = bet["potential_payout"]
 
-                if result == "won":
-                    payout = stake + profit
-                elif result == "push":
-                    payout = stake
+                # "no_action" = player DNP late scratch → refund stake, same as push
+                if result in ("won", "push", "no_action"):
+                    payout = stake + profit if result == "won" else stake
                 else:
                     payout = 0.0
+
                 # Settle first — prevents double payout if the bot restarts mid-loop.
                 settled = self.bets.settle_bet(guild_id, bet["id"], result, payout)
                 if not settled:
                     continue  # already settled (safety guard)
+
+                streak_bonus = 0
                 if result == "won":
                     await self.economy.add(guild_id, user_id, payout)
                     await self.economy.record_win(guild_id, user_id, payout)
-                elif result == "push":
+                    streak = await self.economy.get_streak(guild_id, user_id) + 1
+                    await self.economy.set_streak(guild_id, user_id, streak)
+                    # Streak milestone bonus
+                    if streak_bonus_at > 0 and streak_bonus_coins > 0 and streak % streak_bonus_at == 0:
+                        streak_bonus = streak_bonus_coins
+                        await self.economy.add(guild_id, user_id, streak_bonus)
+                elif result in ("push", "no_action"):
                     await self.economy.add(guild_id, user_id, payout)
                     await self.economy.record_push(guild_id, user_id, stake)
+                    # Push / no_action doesn't break streak
                 else:
                     await self.economy.record_loss(guild_id, user_id)
-                await self._notify_result(guild_id, user_id, bet, result, payout)
+                    await self.economy.set_streak(guild_id, user_id, 0)
+
+                await self._notify_result(
+                    guild_id, user_id, bet, result, payout,
+                    streak_bonus=streak_bonus,
+                )
 
     async def _notify_result(
         self,
@@ -301,14 +357,32 @@ class NBABetting(commands.Cog):
         bet: dict,
         result: str,
         payout: float,
+        *,
+        insurance_refund: float = 0.0,
+        streak_bonus: int = 0,
     ) -> None:
         """DM the user their bet result AND post to the guild's notify_channel if set."""
-        emoji = {"won": "✅", "lost": "❌", "push": "🔄"}.get(result, "❓")
-        color = {
-            "won":  discord.Color.green(),
-            "lost": discord.Color.red(),
-            "push": discord.Color.gold(),
-        }.get(result, discord.Color.greyple())
+        _EMOJI = {
+            "won":       "✅",
+            "lost":      "❌",
+            "push":      "🔄",
+            "no_action": "🚫",
+        }
+        _COLOR = {
+            "won":       discord.Color.green(),
+            "lost":      discord.Color.red(),
+            "push":      discord.Color.gold(),
+            "no_action": discord.Color.orange(),
+        }
+        _TITLE = {
+            "won":       "✅ Bet Settled — WON",
+            "lost":      "❌ Bet Settled — LOST",
+            "push":      "🔄 Bet Settled — PUSH",
+            "no_action": "🚫 No Action — Player Did Not Play",
+        }
+        emoji = _EMOJI.get(result, "❓")
+        color = _COLOR.get(result, discord.Color.greyple())
+        title = _TITLE.get(result, f"{emoji} Bet Settled — {result.upper()}")
 
         bet_type = bet.get("bet_type", "")
 
@@ -328,18 +402,32 @@ class NBABetting(commands.Cog):
             sel_display = bet.get("selection", "")
             game_str = f"{bet.get('away_team', '')} @ {bet.get('home_team', '')}"
 
-        embed = discord.Embed(
-            title=f"{emoji} Bet Settled — {result.upper()}",
-            color=color,
-        )
+        embed = discord.Embed(title=title, color=color)
         embed.add_field(name="Bet ID",    value=f"`{bet['id']}`",        inline=True)
         embed.add_field(name="Game",      value=game_str,                 inline=False)
         embed.add_field(name="Your Pick", value=f"{sel_display}  ({fmt_odds(bet.get('odds', -110))})", inline=True)
         embed.add_field(name="Stake",     value=f"{CURRENCY}{bet['stake']:.0f}", inline=True)
+
         if result == "won":
             embed.add_field(name="You Won!", value=f"{CURRENCY}**{payout:.0f}**", inline=True)
         elif result == "push":
             embed.add_field(name="Push", value="Stake returned.", inline=True)
+        elif result == "no_action":
+            embed.add_field(name="No Action", value="Stake refunded — player did not play.", inline=False)
+            embed.set_footer(text="You can place a new bet on a different player or game.")
+
+        if insurance_refund > 0:
+            embed.add_field(
+                name="🛡️ Parlay Insurance",
+                value=f"{CURRENCY}**{insurance_refund:.0f}** refunded — missed by 1 leg!",
+                inline=False,
+            )
+        if streak_bonus > 0:
+            embed.add_field(
+                name="🔥 Win Streak Bonus",
+                value=f"{CURRENCY}**{streak_bonus}** bonus coins for your win streak!",
+                inline=False,
+            )
 
         # ── DM the user ───────────────────────────────────────────────────────
         user = self.bot.get_user(user_id)
@@ -504,18 +592,28 @@ class NBABetting(commands.Cog):
     ) -> None:
         """
         Scan all pending bets in a guild.  Any player-prop or parlay-leg bet
-        whose player is now listed as "Out" (or "Inactive") in the ESPN injury
-        report is cancelled and the stake is refunded to the bettor.
+        whose player is now listed as "Out", "Inactive", or "Doubtful" is
+        cancelled and the full stake is refunded to the bettor via DM.
 
-        A DM is sent to the user explaining why their bet was voided.
+        Why Doubtful is included: when a player goes doubtful their expected
+        output drops ~22% and the line moves significantly lower.  A bet
+        locked in at the old (higher) line is now at a serious disadvantage —
+        voiding it lets the user re-bet at the fair current line.
+
+        Questionable / Day-to-Day players are NOT auto-voided because they
+        almost always play; the line adjusts slightly but the bet remains fair.
+
         Each bet ID is only refunded once (tracked in self._injury_refunded).
         """
-        # Build set of players confirmed "Out" / "Inactive"
-        out_players: Set[str] = {
-            pname for pname, status in all_injured.items()
-            if status.lower() in ("out", "inactive", "suspension")
+        # Players who definitely won't play or are severely compromised
+        _VOID_STATUSES = {"out", "inactive", "suspension", "doubtful"}
+
+        void_players: Dict[str, str] = {
+            pname: status.lower()
+            for pname, status in all_injured.items()
+            if status.lower() in _VOID_STATUSES
         }
-        if not out_players:
+        if not void_players:
             return
 
         refunded_ids = self._injury_refunded.setdefault(guild_id, set())
@@ -531,35 +629,46 @@ class NBABetting(commands.Cog):
 
             # ── Single player-prop bet ─────────────────────────────────────
             if bet.get("bet_type") == "player_props":
-                selection = bet.get("selection", "")
-                parts     = selection.split("|")
+                selection   = bet.get("selection", "")
+                parts       = selection.split("|")
                 player_name = parts[0] if parts else ""
-                if not player_name or player_name not in out_players:
+                if not player_name or player_name not in void_players:
                     continue
 
+                inj_status = void_players[player_name]
                 settled = self.bets.settle_bet(guild_id, bet_id, "cancelled", stake)
                 if not settled:
                     continue
                 await self.economy.add(guild_id, user_id, stake)
                 refunded_ids.add(bet_id)
 
-                # DM the user
-                embed = discord.Embed(
-                    title="🚨 Bet Auto-Cancelled — Player Ruled Out",
-                    color=discord.Color.orange(),
-                    description=(
+                if inj_status == "doubtful":
+                    title = "⚠️ Bet Voided — Player Listed as Doubtful"
+                    desc  = (
+                        f"**{player_name}** has been listed as **Doubtful**. "
+                        f"Their prop line has dropped significantly and your original bet "
+                        f"is no longer at a fair line. Your stake has been automatically refunded "
+                        f"so you can re-bet at the updated line if you choose."
+                    )
+                    footer = "You can place a new bet at the current adjusted line."
+                else:
+                    title = "🚨 Bet Auto-Cancelled — Player Ruled Out"
+                    desc  = (
                         f"**{player_name}** has been ruled out and is unavailable "
-                        f"to play.  Your bet has been automatically refunded."
-                    ),
+                        f"to play. Your bet has been automatically refunded."
+                    )
+                    footer = "You can place a new bet on a different player."
+
+                embed = discord.Embed(
+                    title=title,
+                    color=discord.Color.orange(),
+                    description=desc,
                 )
-                embed.add_field(name="Bet ID",    value=f"`{bet_id}`",        inline=True)
-                embed.add_field(name="Refunded",  value=f"💰 **{stake:.0f}**", inline=True)
-                embed.add_field(
-                    name="Pick",
-                    value=f"{selection} (cancelled)",
-                    inline=False,
-                )
-                embed.set_footer(text="You can place a new bet on a different player.")
+                embed.add_field(name="Bet ID",   value=f"`{bet_id}`",         inline=True)
+                embed.add_field(name="Refunded", value=f"💰 **{stake:.0f}**",  inline=True)
+                embed.add_field(name="Pick",     value=f"{selection} (voided)", inline=False)
+                embed.set_footer(text=footer)
+
                 user = self.bot.get_user(user_id)
                 if user:
                     try:
@@ -567,33 +676,29 @@ class NBABetting(commands.Cog):
                     except (discord.Forbidden, discord.HTTPException):
                         pass
 
-                # Also post to notify channel if configured
                 channel_id: Optional[int] = await self.config.guild_from_id(guild_id).notify_channel()
                 if channel_id:
                     channel = self.bot.get_channel(channel_id)
                     if channel:
                         try:
-                            await channel.send(
-                                content=f"<@{user_id}>",
-                                embed=embed,
-                            )
+                            await channel.send(content=f"<@{user_id}>", embed=embed)
                         except (discord.Forbidden, discord.HTTPException):
                             pass
 
             # ── Parlay bet — check each player-prop leg ────────────────────
             elif bet.get("bet_type") == "parlay":
                 legs = bet.get("legs", [])
-                injured_legs: List[str] = []
+                void_legs: List[tuple] = []
                 for leg in legs:
                     if leg.get("leg_type") != "player_props":
                         continue
                     sel   = leg.get("selection", "")
                     parts = sel.split("|")
                     pname = parts[0] if parts else ""
-                    if pname and pname in out_players:
-                        injured_legs.append(pname)
+                    if pname and pname in void_players:
+                        void_legs.append((pname, void_players[pname]))
 
-                if not injured_legs:
+                if not void_legs:
                     continue
 
                 settled = self.bets.settle_bet(guild_id, bet_id, "cancelled", stake)
@@ -602,18 +707,42 @@ class NBABetting(commands.Cog):
                 await self.economy.add(guild_id, user_id, stake)
                 refunded_ids.add(bet_id)
 
-                players_str = ", ".join(f"**{p}**" for p in injured_legs)
-                embed = discord.Embed(
-                    title="🚨 Parlay Auto-Cancelled — Player(s) Ruled Out",
-                    color=discord.Color.orange(),
-                    description=(
-                        f"{players_str} {'has' if len(injured_legs) == 1 else 'have'} been "
-                        f"ruled out.  Your {len(legs)}-leg parlay has been fully refunded."
-                    ),
+                has_doubtful = any(s == "doubtful" for _, s in void_legs)
+                has_out      = any(s != "doubtful" for _, s in void_legs)
+
+                if has_out:
+                    title = "🚨 Parlay Auto-Cancelled — Player(s) Ruled Out"
+                else:
+                    title = "⚠️ Parlay Voided — Player(s) Listed as Doubtful"
+
+                players_str = ", ".join(
+                    f"**{p}** ({'Doubtful' if s == 'doubtful' else 'Out'})"
+                    for p, s in void_legs
                 )
-                embed.add_field(name="Bet ID",   value=f"`{bet_id}`",         inline=True)
-                embed.add_field(name="Refunded", value=f"💰 **{stake:.0f}**",  inline=True)
-                embed.set_footer(text="You can build a new parlay without the affected player(s).")
+
+                if has_doubtful and not has_out:
+                    desc = (
+                        f"{players_str} {'has' if len(void_legs) == 1 else 'have'} been listed as Doubtful. "
+                        f"Their prop lines have dropped significantly, making your original parlay leg(s) "
+                        f"unfair. Your {len(legs)}-leg parlay has been fully refunded."
+                    )
+                    footer = "You can build a new parlay at the updated lines."
+                else:
+                    desc = (
+                        f"{players_str} {'has' if len(void_legs) == 1 else 'have'} been ruled out. "
+                        f"Your {len(legs)}-leg parlay has been fully refunded."
+                    )
+                    footer = "You can build a new parlay without the affected player(s)."
+
+                embed = discord.Embed(
+                    title=title,
+                    color=discord.Color.orange(),
+                    description=desc,
+                )
+                embed.add_field(name="Bet ID",   value=f"`{bet_id}`",        inline=True)
+                embed.add_field(name="Refunded", value=f"💰 **{stake:.0f}**", inline=True)
+                embed.set_footer(text=footer)
+
                 user = self.bot.get_user(user_id)
                 if user:
                     try:
@@ -887,6 +1016,80 @@ class NBABetting(commands.Cog):
         msg  = await ctx.send(embed=view._build_embed(), view=view)
         view.message = msg
 
+    @bet_group.command(name="cashout")
+    @app_commands.describe(bet_id="Your bet ID to cash out early (shown in /bet mybets)")
+    async def bet_cashout(self, ctx: commands.Context, bet_id: str) -> None:
+        """Cash out a pending bet early for 80% of your stake (70% for parlays).
+
+        Your bet must still be pending (not yet started or settled).
+        The house keeps 20–30% as an early settlement fee — identical to how
+        FanDuel prices early cashout before the game goes live.
+        """
+        bet_id = bet_id.upper().strip()
+        bet    = self.bets.get_bet(ctx.guild.id, bet_id)
+
+        if not bet:
+            return await ctx.send(f"❌ Bet `{bet_id}` not found.", ephemeral=True)
+        if bet["user_id"] != str(ctx.author.id):
+            return await ctx.send("❌ That's not your bet.", ephemeral=True)
+        if bet["status"] != "pending":
+            return await ctx.send(
+                f"❌ Bet `{bet_id}` is already **{bet['status']}** — only pending bets can be cashed out.",
+                ephemeral=True,
+            )
+
+        stake      = bet["stake"]
+        is_parlay  = bet.get("bet_type") == "parlay"
+        cashout_pct = 0.70 if is_parlay else 0.80
+        cashout_val = max(1.0, round(stake * cashout_pct))
+
+        bet_type = bet.get("bet_type", "")
+        if bet_type == "player_props":
+            sel_display = fmt_prop_selection(bet.get("selection", ""))
+        elif bet_type == "parlay":
+            legs = bet.get("legs", [])
+            sel_display = f"{len(legs)}-leg parlay"
+        else:
+            sel_display = bet.get("selection", "")
+
+        potential_return = stake + bet.get("potential_payout", 0.0)
+
+        view = ConfirmView(ctx.author.id, timeout=30)
+        msg  = await ctx.send(
+            f"💸 **Early Cash Out Offer**\n"
+            f"Bet `{bet_id}` — **{sel_display}**\n\n"
+            f"• Original stake: {CURRENCY}**{stake:.0f}**\n"
+            f"• Full potential return: {CURRENCY}**{potential_return:.0f}**\n"
+            f"• **Cash out now for: {CURRENCY}{cashout_val:.0f}** "
+            f"({cashout_pct * 100:.0f}% of stake)\n\n"
+            f"*You permanently forfeit the remaining "
+            f"{CURRENCY}{stake - cashout_val:.0f} and your full win potential.*",
+            view=view,
+        )
+        await view.wait()
+        if not view.confirmed:
+            return await msg.edit(content="Cash out cancelled.", view=None)
+
+        # settle_bet moves the bet to the settled pool — guards against double cashout
+        ok = self.bets.settle_bet(ctx.guild.id, bet_id, "cashout", cashout_val)
+        if not ok:
+            return await msg.edit(
+                content="❌ Could not cash out — bet may have already been settled.", view=None
+            )
+
+        await self.economy.add(ctx.guild.id, ctx.author.id, cashout_val)
+        await self.economy.record_cashout(ctx.guild.id, ctx.author.id, cashout_val)
+
+        embed = discord.Embed(title="💸 Bet Cashed Out", color=discord.Color.gold())
+        embed.add_field(name="Bet ID",      value=f"`{bet_id}`",                      inline=True)
+        embed.add_field(name="Pick",        value=sel_display,                         inline=True)
+        embed.add_field(name="Returned",    value=f"{CURRENCY}**{cashout_val:.0f}**", inline=True)
+        embed.set_footer(
+            text=f"House kept {CURRENCY}{stake - cashout_val:.0f} "
+                 f"| Full win potential was {CURRENCY}{potential_return:.0f}"
+        )
+        await msg.edit(content=None, embed=embed, view=None)
+
     @bet_group.command(name="mybets")
     async def bet_mybets(self, ctx: commands.Context) -> None:
         """View your active (pending) bets."""
@@ -1003,15 +1206,29 @@ class NBABetting(commands.Cog):
         msg  = await ctx.send(
             "⚠️ This will **permanently delete all bet history** "
             "(active and settled) for this server.\n"
-            "Member balances are **not** affected. Continue?",
+            "Stakes for **pending bets** will be refunded to each user's balance.\n"
+            "Continue?",
             view=view,
         )
         await view.wait()
         if not view.confirmed:
             return await msg.edit(content="Reset cancelled.", view=None)
-        active_cleared, _ = self.bets.clear_all_bets(ctx.guild.id)
+
+        # Refund stakes for all pending bets before wiping — otherwise users
+        # permanently lose the coins they staked on bets that never settled.
+        active_cleared, active_bets = self.bets.clear_all_bets(ctx.guild.id)
+        refunded = 0
+        for bet in active_bets:
+            if bet.get("status") == "pending" and bet.get("stake", 0) > 0:
+                try:
+                    await self.economy.add(ctx.guild.id, int(bet["user_id"]), bet["stake"])
+                    refunded += 1
+                except Exception:
+                    pass
+
+        detail = f" ({refunded} stake(s) refunded)" if refunded else ""
         await msg.edit(
-            content=f"✅ Cleared all bet history ({active_cleared} active bet(s) removed).",
+            content=f"✅ Cleared all bet history ({active_cleared} active bet(s) removed{detail}).",
             view=None,
         )
 
@@ -1210,6 +1427,63 @@ class NBABetting(commands.Cog):
             )
         await ctx.send("✅ Limits updated:\n" + "\n".join(f"• {c}" for c in changed))
 
+    @admin_group.command(name="setinsurance")
+    @app_commands.describe(
+        pct="Parlay insurance payout as a percentage of stake (0–100). 0 = disabled. "
+            "e.g. 25 = refund 25% of stake when a 3+ leg parlay misses by exactly 1 leg.",
+    )
+    async def admin_setinsurance(
+        self, ctx: commands.Context, pct: float
+    ) -> None:
+        """Enable/disable FanDuel-style parlay insurance for this server.
+
+        When enabled, users who lose a 3+ leg parlay by exactly one losing leg
+        automatically receive a partial stake refund.  Set to 0 to disable.
+        """
+        if not (0 <= pct <= 100):
+            return await ctx.send("❌ Percentage must be between 0 and 100.", ephemeral=True)
+        frac = round(pct / 100.0, 4)
+        await self.config.guild(ctx.guild).parlay_insurance_pct.set(frac)
+        if pct == 0:
+            await ctx.send("✅ Parlay insurance **disabled**.")
+        else:
+            await ctx.send(
+                f"✅ Parlay insurance set to **{pct:.0f}%** of stake.\n"
+                f"Users who miss a 3+ leg parlay by 1 leg will receive "
+                f"**{pct:.0f}%** of their stake back automatically."
+            )
+
+    @admin_group.command(name="setstreakbonus")
+    @app_commands.describe(
+        every_n_wins="Award bonus every N consecutive wins. 0 = disabled.",
+        bonus_coins="Coins awarded at each streak milestone.",
+    )
+    async def admin_setstreakbonus(
+        self,
+        ctx: commands.Context,
+        every_n_wins: int,
+        bonus_coins: int = 0,
+    ) -> None:
+        """Enable/disable FanDuel-style win streak bonuses for this server.
+
+        When enabled, users who reach a streak milestone (every N wins in a row)
+        automatically receive bonus coins.  Streaks reset on any loss.
+        Pushes and no-action refunds do not break or extend the streak.
+        """
+        if every_n_wins < 0:
+            return await ctx.send("❌ every_n_wins must be 0 or greater.", ephemeral=True)
+        if bonus_coins < 0:
+            return await ctx.send("❌ bonus_coins must be 0 or greater.", ephemeral=True)
+        await self.config.guild(ctx.guild).streak_bonus_at.set(every_n_wins)
+        await self.config.guild(ctx.guild).streak_bonus_coins.set(bonus_coins)
+        if every_n_wins == 0 or bonus_coins == 0:
+            await ctx.send("✅ Win streak bonuses **disabled**.")
+        else:
+            await ctx.send(
+                f"✅ Win streak bonus set: every **{every_n_wins}** consecutive wins "
+                f"awards {CURRENCY}**{bonus_coins}** bonus coins."
+            )
+
     @admin_group.command(name="notifychannel")
     @app_commands.describe(channel="Channel for settlement announcements (leave blank to disable)")
     async def admin_notifychannel(
@@ -1262,17 +1536,38 @@ class NBABetting(commands.Cog):
         news_ch     = ctx.guild.get_channel(cfg["news_channel"]) if cfg.get("news_channel") else None
         pending_cnt = len(self.bets.get_all_pending(ctx.guild.id))
 
-        embed = discord.Embed(title="⚙️ NBABetting Status", color=discord.Color.blurple())
-        embed.add_field(name="Odds Source",     value="🟢 ESPN (injury-adjusted)", inline=True)
-        embed.add_field(name="Admin Role",      value=role.mention if role else "Admins only", inline=True)
-        embed.add_field(name="Notify Channel",  value=notify_ch.mention if notify_ch else "DMs only", inline=True)
-        embed.add_field(name="News Channel",    value=news_ch.mention if news_ch else "Disabled", inline=True)
-        embed.add_field(name="Pending Bets",    value=str(pending_cnt), inline=True)
+        ins_pct        = float(cfg.get("parlay_insurance_pct", 0.0)) * 100
+        streak_at      = int(cfg.get("streak_bonus_at", 0))
+        streak_coins   = int(cfg.get("streak_bonus_coins", 0))
+        max_bets_label = str(cfg.get("max_daily_bets", DEFAULT_MAX_DAILY_BETS)) or "unlimited"
+        max_pct_label  = f"{cfg.get('max_bet_pct', DEFAULT_MAX_BET_PCT) * 100:.0f}% of balance"
 
-        settle_task  = self._settlement_task
-        settle_ok    = settle_task is not None and not settle_task.done()
-        news_task    = self._news_task
-        news_ok      = news_task is not None and not news_task.done()
+        embed = discord.Embed(title="⚙️ NBABetting Status", color=discord.Color.blurple())
+        embed.add_field(name="Odds Source",      value="🟢 ESPN (injury-adjusted)",          inline=True)
+        embed.add_field(name="Admin Role",       value=role.mention if role else "Admins only", inline=True)
+        embed.add_field(name="Notify Channel",   value=notify_ch.mention if notify_ch else "DMs only", inline=True)
+        embed.add_field(name="News Channel",     value=news_ch.mention if news_ch else "Disabled", inline=True)
+        embed.add_field(name="Pending Bets",     value=str(pending_cnt),                     inline=True)
+        embed.add_field(name="Max Daily Bets",   value=max_bets_label,                        inline=True)
+        embed.add_field(name="Max Bet Size",     value=max_pct_label,                         inline=True)
+        embed.add_field(
+            name="🛡️ Parlay Insurance",
+            value=f"{ins_pct:.0f}% of stake" if ins_pct > 0 else "Disabled",
+            inline=True,
+        )
+        embed.add_field(
+            name="🔥 Streak Bonus",
+            value=(
+                f"{CURRENCY}{streak_coins} every {streak_at} wins"
+                if streak_at > 0 and streak_coins > 0 else "Disabled"
+            ),
+            inline=True,
+        )
+
+        settle_task = self._settlement_task
+        settle_ok   = settle_task is not None and not settle_task.done()
+        news_task   = self._news_task
+        news_ok     = news_task is not None and not news_task.done()
         embed.add_field(
             name="Settlement Loop",
             value=f"{'🟢 Running' if settle_ok else '🔴 Stopped'} (every 10 min)",
@@ -1283,5 +1578,8 @@ class NBABetting(commands.Cog):
             value=f"{'🟢 Running' if news_ok else '🔴 Stopped'} (every 15 min)",
             inline=True,
         )
-        embed.set_footer(text="Use /admin settle to trigger settlement  ·  /admin newsnow for news check")
+        embed.set_footer(
+            text="Use /admin settle to trigger settlement  ·  "
+                 "/admin setinsurance  ·  /admin setstreakbonus"
+        )
         await ctx.send(embed=embed)

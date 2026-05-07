@@ -580,32 +580,49 @@ def generate_player_props_for_game(
     game: Dict,
     props_pool: Dict[str, Dict],
     questionable_players: Optional[Set[str]] = None,
+    injury_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     Build player prop over/under lines for every available player.
 
     props_pool keys: {player_name: {pts, reb, ast, pra, tier, team_abbr}}
+    injury_map keys: {player_name_lower: status_lower}
 
-    Line logic:
-    - Star players (tier 1, pts >= 20):  line = avg - 0.5, rounded to nearest 0.5
-    - Rotation players (tier 2, pts >= 12): same formula
-    - Bench players (tier 3 / pts < 12): minimum lines set (pts 7.5, reb 3.5, ast 1.5)
-      so betting is still meaningful rather than on trivially small numbers.
-
-    Players with completely zero stats AND not in the game summary are skipped —
-    they are likely two-way / G-League call-ups with no ESPN data.
+    Line logic (FanDuel-accurate):
+    - Lines are set AT the player's actual season/recent average, rounded to the
+      nearest 0.5. No artificial discounts or floors — this mirrors how FanDuel
+      prices every player from stars to deep bench.
+    - Health/quality adjustments are applied BEFORE rounding: a doubtful player's
+      line is reduced proportionally to their reduced expected output. This is how
+      real books handle it — the LINE moves, not just the juice.
+    - Players with ALL zero stats are skipped — they have no ESPN data and
+      creating fake lines would make one side near-guaranteed.
+    - OUT players are skipped entirely — no point offering props for DNPs.
+    - A stat is only offered if its line is >= 0.5 (i.e., the player actually
+      averages enough of that stat to make betting meaningful).
+    - Juice is calibrated to FanDuel norms per tier and injury status.
     """
     props: Dict[str, Any] = {}
     home_abbr = game.get("home_abbr", "")
     away_abbr = game.get("away_abbr", "")
+    _imap     = {k.lower(): v for k, v in (injury_map or {}).items()}
 
-    def _line(val: float, offset: float = -0.5) -> float:
-        """Round to nearest 0.5 with the given offset."""
-        return round((val + offset) * 2) / 2
+    # Health factors: how much of their normal output to expect on game night.
+    # doubtful      → ~78% output (limited minutes, managed load)
+    # questionable/
+    #   day-to-day  → ~88% output (likely plays but not 100%)
+    # healthy       → 100%
+    # out           → skip (DNP; line would be meaningless)
+    _HEALTH_FACTOR = {
+        "doubtful":    0.78,
+        "questionable":0.88,
+        "day-to-day":  0.88,
+        "dtd":         0.88,
+    }
 
-    def _bench_line(val: float, minimum: float, offset: float = -0.5) -> float:
-        raw = _line(val, offset)
-        return max(raw, minimum)
+    def _line(val: float) -> float:
+        """Round to nearest 0.5 — FanDuel sets lines at the player's actual average."""
+        return round(val * 2) / 2
 
     for pname, pdata in props_pool.items():
         if pdata.get("team_abbr", "") not in (home_abbr, away_abbr):
@@ -614,30 +631,39 @@ def generate_player_props_for_game(
         pts  = float(pdata.get("pts", 0.0))
         reb  = float(pdata.get("reb", 0.0))
         ast  = float(pdata.get("ast", 0.0))
-        pra  = pts + reb + ast
         tier = _player_tier(pts)
 
-        # Players with all-zero stats are roster-only entries added by the
-        # team-roster fallback (no leaders / summary data found for them).
-        # Force tier-3 so they receive meaningful minimum bench lines below.
+        # Skip players with no statistical data at all — they are two-way /
+        # G-League call-ups or players ESPN has no averages for.  Generating
+        # fake lines for them creates near-guaranteed winners and is the main
+        # source of the "100% win" bug.
         if pts == 0.0 and reb == 0.0 and ast == 0.0:
-            tier = 3
+            continue
 
-        if tier == 3:
-            # Bench players: minimums floored just below a realistic contribution.
-            # Using 4.5/2.5/1.5 so a 5 ppg player gets a line near their average,
-            # not an inflated 7.5 that makes the under trivially easy.
-            pts_line = _bench_line(pts, 4.5)
-            reb_line = _bench_line(reb, 2.5)
-            ast_line = _bench_line(ast, 1.5)
-            pra_line = _bench_line(pra, 8.5, -1.0)
-        else:
-            pts_line = _line(pts)
-            reb_line = _line(reb)
-            ast_line = _line(ast)
-            pra_line = _line(pra, -1.0)
+        # ── Health / injury status ────────────────────────────────────────────
+        inj_status = _imap.get(pname.lower(), "active")
+
+        # OUT players will definitely not play — skip them entirely.
+        if inj_status == "out":
+            continue
+
+        # Apply line reduction factor based on health.  This moves the actual
+        # LINE down (not just the juice) when a player is compromised.
+        line_factor = _HEALTH_FACTOR.get(inj_status, 1.0)
+        if line_factor < 1.0:
+            pts = round(pts * line_factor, 1)
+            reb = round(reb * line_factor, 1)
+            ast = round(ast * line_factor, 1)
+
+        pra  = pts + reb + ast
 
         is_questionable = pname in (questionable_players or set())
+
+        # ── Compute lines at actual average (FanDuel style) ───────────────────
+        pts_line = _line(pts)
+        reb_line = _line(reb)
+        ast_line = _line(ast)
+        pra_line = _line(pra)
 
         # ── FanDuel-calibrated per-stat juice ─────────────────────────────────
         # Points: public hammers overs — slight over premium for stars & rotation
@@ -655,33 +681,47 @@ def generate_player_props_for_game(
         else:
             ast_over_p, ast_under_p = (-110, -110)
 
-        # PRA: combined stat — slight over lean same as points, never at even money
+        # PRA: combined stat — slight over lean for stars/rotation
         if is_questionable:
             pra_over_p, pra_under_p = (-108, -112)
-        elif tier == 1:
-            pra_over_p, pra_under_p = (-115, -105)
-        elif tier == 2:
+        elif tier in (1, 2):
             pra_over_p, pra_under_p = (-115, -105)
         else:
             pra_over_p, pra_under_p = (-110, -110)
 
-        props[pname] = {
-            "pts":        pts_line,
-            "pts_over":   pts_over_p,
-            "pts_under":  pts_under_p,
-            "reb":        reb_line,
-            "reb_over":   reb_over_p,
-            "reb_under":  reb_under_p,
-            "ast":        ast_line,
-            "ast_over":   ast_over_p,
-            "ast_under":  ast_under_p,
-            "pra":        pra_line,
-            "pra_over":   pra_over_p,
-            "pra_under":  pra_under_p,
-            "team_abbr":  pdata.get("team_abbr", ""),
-            "tier":       tier,
-            "status":     "questionable" if is_questionable else "active",
+        # ── Build the prop entry — only include stats with a playable line ─────
+        # A line of 0.0 or 0.5 on a minor stat means the player essentially never
+        # records it; skip those to avoid near-guaranteed wins in one direction.
+        entry: Dict[str, Any] = {
+            "team_abbr": pdata.get("team_abbr", ""),
+            "tier":      tier,
+            "status":    inj_status if inj_status != "active" else "active",
         }
+
+        if pts_line >= 0.5:
+            entry["pts"]       = pts_line
+            entry["pts_over"]  = pts_over_p
+            entry["pts_under"] = pts_under_p
+
+        if reb_line >= 0.5:
+            entry["reb"]       = reb_line
+            entry["reb_over"]  = reb_over_p
+            entry["reb_under"] = reb_under_p
+
+        if ast_line >= 0.5:
+            entry["ast"]       = ast_line
+            entry["ast_over"]  = ast_over_p
+            entry["ast_under"] = ast_under_p
+
+        # PRA only offered when all three components are meaningful
+        if pra_line >= 2.5 and pts_line >= 0.5 and reb_line >= 0.5:
+            entry["pra"]       = pra_line
+            entry["pra_over"]  = pra_over_p
+            entry["pra_under"] = pra_under_p
+
+        # Only add the player if at least one stat line is available
+        if any(k in entry for k in ("pts", "reb", "ast", "pra")):
+            props[pname] = entry
 
     return props
 
@@ -1828,11 +1868,12 @@ class OddsFetcher:
             }
 
         # ── Populate props_pool stats from last-5-game averages ──────────────────
-        # The ESPN leaders/stats APIs are currently unavailable, so season_val
-        # starts at 0 for every player.  When last-5 averages are available we
-        # use them directly as the stat baseline.  If season data ever comes back
-        # (season_val > 0) hot streaks raise the line slightly; cold streaks keep
-        # the season-average floor so lines are never exploitably low.
+        # Blend season average with recent form bidirectionally so that both hot
+        # streaks and cold slumps move the line — this is how FanDuel prices props.
+        #
+        # Weights: 65% season average + 35% last-5 average.
+        # When we have no season data at all, use last-5 directly (it's all we have).
+        # When we have no last-5 data, the season average stands unchanged.
         last5_lookup: Dict[str, Dict] = {**home_last5, **away_last5}
         for pname, pdata in props_pool.items():
             l5 = last5_lookup.get(pname)
@@ -1840,18 +1881,19 @@ class OddsFetcher:
                 continue
             updated = False
             for stat in ("pts", "reb", "ast"):
-                l5_val     = l5.get(stat, 0.0)
-                season_val = pdata.get(stat, 0.0)
-                if l5_val > 0:
-                    if season_val == 0.0:
-                        # No season data — use last-5 average directly
-                        pdata[stat] = l5_val
-                        updated = True
-                    elif l5_val > season_val:
-                        # Hot streak: blend slightly above season average
-                        pdata[stat] = round(0.25 * l5_val + 0.75 * season_val, 1)
-                        updated = True
-                    # Cold streak (l5 < season_val): keep season avg as floor
+                l5_val     = float(l5.get(stat, 0.0) or 0.0)
+                season_val = float(pdata.get(stat, 0.0) or 0.0)
+                if l5_val <= 0:
+                    continue
+                if season_val == 0.0:
+                    # No season data at all — use last-5 directly
+                    pdata[stat] = l5_val
+                else:
+                    # Bidirectional blend: 65% season + 35% recent form.
+                    # This allows cold slumps to lower lines and hot streaks
+                    # to raise them — matches real sportsbook line-setting.
+                    pdata[stat] = round(0.65 * season_val + 0.35 * l5_val, 1)
+                updated = True
             if updated:
                 pdata["pra"]  = round(
                     pdata.get("pts", 0.0) + pdata.get("reb", 0.0) + pdata.get("ast", 0.0), 1
@@ -1866,15 +1908,23 @@ class OddsFetcher:
             except Exception:
                 pass
 
-        # Build questionable/doubtful players set for prop juice shading
+        # Build injury map: {player_name: status} for all injured players on both teams.
+        # Used to both shade juice (questionable_players set) and shift the actual
+        # prop LINE down proportionally for compromised players.
         questionable_players: Set[str] = set()
+        injury_map: Dict[str, str] = {}
         for team_abbr_key in (home_abbr, away_abbr):
             for inj in injuries.get(team_abbr_key, []):
-                if inj.get("status", "").lower() in ("questionable", "doubtful", "day-to-day"):
-                    questionable_players.add(inj["name"])
+                raw_status = inj.get("status", "").lower()
+                pname_inj  = inj.get("name", "")
+                if not pname_inj:
+                    continue
+                injury_map[pname_inj] = raw_status
+                if raw_status in ("questionable", "doubtful", "day-to-day", "dtd"):
+                    questionable_players.add(pname_inj)
 
         odds  = generate_odds_for_game(game, injuries, stat_leaders, home_ts, away_ts, bet_dist)
-        props = generate_player_props_for_game(game, props_pool, questionable_players)
+        props = generate_player_props_for_game(game, props_pool, questionable_players, injury_map)
 
         # Build public betting action percentages for UI display
         h2h_money = bet_dist.get(game["home_team"], 0.0) + bet_dist.get(game["away_team"], 0.0)
@@ -2051,9 +2101,16 @@ class OddsFetcher:
     # ── Box score ─────────────────────────────────────────────────────────────
 
     async def get_game_box_score(self, event_id: str) -> Optional[Dict[str, Dict]]:
-        """Parse a completed game's box score into {player_name: {pts, reb, ast}}.
+        """Parse a completed game's box score into {player_name: {pts, reb, ast, played}}.
+
+        `played` is True if the player logged any minutes.  A player who DNP'd
+        due to a late scratch will either be absent from the stat_map entirely
+        (ESPN omits them) or present with MIN == 0 / "--".  Either way the
+        `played` flag lets evaluate_bet return "no_action" so the stake is
+        refunded — matching how FanDuel / DraftKings grade late scratches.
+
         Completed game stats never change — cached indefinitely per session.
-        Uses ESPN's 'labels' column headers (not 'keys') to locate PTS/REB/AST.
+        Uses ESPN's 'labels' column headers (not 'keys') to locate columns.
         """
         if event_id in self._boxscore_cache:
             return self._boxscore_cache[event_id]
@@ -2081,6 +2138,7 @@ class OddsFetcher:
                     pts_idx = next((i for i, l in enumerate(labels) if l == "PTS"), -1)
                     reb_idx = next((i for i, l in enumerate(labels) if l == "REB"), -1)
                     ast_idx = next((i for i, l in enumerate(labels) if l == "AST"), -1)
+                    min_idx = next((i for i, l in enumerate(labels) if l == "MIN"), -1)
 
                     for athlete_entry in stat_group.get("athletes") or []:
                         pname     = (athlete_entry.get("athlete") or {}).get("displayName", "")
@@ -2096,10 +2154,27 @@ class OddsFetcher:
                             except (TypeError, ValueError):
                                 return 0.0
 
+                        def _parse_min(idx: int) -> float:
+                            """Return minutes played as a float (0 = DNP)."""
+                            if idx < 0 or idx >= len(raw_stats):
+                                return 0.0
+                            s = str(raw_stats[idx]).strip()
+                            if not s or s in ("--", "0", "0:00", "DNP"):
+                                return 0.0
+                            try:
+                                if ":" in s:
+                                    m, sec = s.split(":", 1)
+                                    return float(m) + float(sec) / 60
+                                return float(s)
+                            except (TypeError, ValueError):
+                                return 0.0
+
+                        minutes = _parse_min(min_idx)
                         stat_map[pname] = {
-                            "pts": _gs(pts_idx),
-                            "reb": _gs(reb_idx),
-                            "ast": _gs(ast_idx),
+                            "pts":    _gs(pts_idx),
+                            "reb":    _gs(reb_idx),
+                            "ast":    _gs(ast_idx),
+                            "played": minutes > 0,
                         }
 
             if stat_map:
@@ -2151,7 +2226,7 @@ def evaluate_bet(
     away_score: int,
     player_stats: Optional[Dict[str, Dict]] = None,
 ) -> str:
-    """Return 'won', 'lost', or 'push'."""
+    """Return 'won', 'lost', 'push', or 'no_action' (player DNP late scratch)."""
 
     if bet_type == "h2h":
         if home_score == away_score:
@@ -2191,7 +2266,19 @@ def evaluate_bet(
         if len(parts) != 3:
             return "push"
         pname, stat, direction = parts[0], parts[1], parts[2]
-        pstat = player_stats.get(pname) or {}
+        pstat = player_stats.get(pname)
+
+        # ── Late-scratch / DNP detection ──────────────────────────────────────
+        # If the player is completely absent from the box score they were a
+        # late scratch that ESPN didn't even list.  If they ARE present but
+        # played 0 minutes (MIN == 0 / "--") they were a game-time DNP.
+        # Either way the bet grades "no_action" — stake is refunded, matching
+        # FanDuel / DraftKings industry standard for player prop no-action rules.
+        if pstat is None:
+            return "no_action"
+        if not pstat.get("played", True):
+            return "no_action"
+
         if stat == "pts":
             actual = _first(pstat, ["points", "pts"])
         elif stat == "reb":

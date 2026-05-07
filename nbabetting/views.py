@@ -31,6 +31,8 @@ STATUS_EMOJI = {
     "won":       "✅",
     "lost":      "❌",
     "push":      "🔄",
+    "no_action": "🚫",
+    "cashout":   "💸",
     "cancelled": "🚫",
 }
 PROP_STAT_LABELS = {
@@ -316,14 +318,18 @@ class BetFlowView(discord.ui.View):
         )
 
         options: List[discord.SelectOption] = []
+        def _stat_str(pdata: dict, key: str) -> str:
+            v = pdata.get(key)
+            return str(v) if v is not None else "—"
+
         for pname, pdata in team_players[:25]:
             tier  = pdata.get("tier", 3)
             is_q  = pdata.get("status", "active") == "questionable"
             emoji = "⭐" if tier == 1 else ("🔵" if tier == 2 else "⚪")
             label = (f"⚠️ {pname} (Q)" if is_q else pname)[:100]
             desc  = (
-                f"Pts {pdata.get('pts',0)} | Reb {pdata.get('reb',0)} | "
-                f"Ast {pdata.get('ast',0)} | PRA {pdata.get('pra',0)}"
+                f"Pts {_stat_str(pdata,'pts')} | Reb {_stat_str(pdata,'reb')} | "
+                f"Ast {_stat_str(pdata,'ast')} | PRA {_stat_str(pdata,'pra')}"
                 + (" | QUESTIONABLE" if is_q else "")
             )[:100]
             options.append(discord.SelectOption(
@@ -1035,6 +1041,12 @@ class MyBetsView(discord.ui.View):
             payout_str = f"\n**Won:** {CURRENCY}**{bet['actual_payout']:.0f}**"
         elif bet["status"] == "push":
             payout_str = "\n**Push** – stake returned"
+        elif bet["status"] == "no_action":
+            payout_str = "\n🚫 **No Action** – player did not play, stake refunded"
+        elif bet["status"] == "cashout":
+            actual = bet.get("actual_payout")
+            if actual is not None:
+                payout_str = f"\n💸 **Cashed Out:** {CURRENCY}{actual:.0f} returned early"
 
         if bet.get("bet_type") == "parlay":
             legs         = bet.get("legs", [])
@@ -1255,21 +1267,25 @@ class OddsView(discord.ui.View):
         # ── Top props preview ─────────────────────────────────────────────────
         props = g.get("player_props") or {}
         if props:
-            top_players = sorted(props.items(), key=lambda kv: kv[1].get("tier", 3))[:5]
+            # Only show players that have a pts line (stars/rotation players)
+            pts_players = [(n, d) for n, d in props.items() if d.get("pts") is not None]
+            top_players = sorted(pts_players, key=lambda kv: kv[1].get("tier", 3))[:5]
             prop_lines = []
             for pname, pd in top_players:
-                is_q = pd.get("status", "active") == "questionable"
+                is_q  = pd.get("status", "active") == "questionable"
                 q_tag = " ⚠️Q" if is_q else ""
+                pts_line = pd.get("pts")
                 pts_o = fmt_odds(pd.get("pts_over", -110))
                 pts_u = fmt_odds(pd.get("pts_under", -110))
                 prop_lines.append(
-                    f"**{pname}**{q_tag}  pts {pd['pts']}  ({pts_o} / {pts_u})"
+                    f"**{pname}**{q_tag}  pts {pts_line}  ({pts_o} / {pts_u})"
                 )
-            embed.add_field(
-                name="🎯 Top Props (Pts)",
-                value="\n".join(prop_lines),
-                inline=False,
-            )
+            if prop_lines:
+                embed.add_field(
+                    name="🎯 Top Props (Pts)",
+                    value="\n".join(prop_lines),
+                    inline=False,
+                )
 
         embed.set_footer(text="Use /bet place or /bet parlay to wager  ·  Odds update with server action")
         return embed
@@ -1517,16 +1533,19 @@ class ParlayBuilderView(discord.ui.View):
         )
 
         options: List[discord.SelectOption] = []
+        def _ps(pdata: dict, key: str) -> str:
+            v = pdata.get(key)
+            return str(v) if v is not None else "—"
+
         for pname, pdata in team_players[:25]:
             tier   = pdata.get("tier", 3)
             is_q   = pdata.get("status") == "questionable"
             emoji  = "⭐" if tier == 1 else ("🔵" if tier == 2 else "⚪")
             label  = (f"⚠️ {pname} (Q)" if is_q else pname)[:100]
-            pts    = pdata.get("pts", 0.0)
-            reb    = pdata.get("reb", 0.0)
-            ast    = pdata.get("ast", 0.0)
-            pra    = pdata.get("pra", 0.0)
-            desc   = f"O/U Pts {pts} | Reb {reb} | Ast {ast} | PRA {pra}"[:100]
+            desc   = (
+                f"O/U Pts {_ps(pdata,'pts')} | Reb {_ps(pdata,'reb')} | "
+                f"Ast {_ps(pdata,'ast')} | PRA {_ps(pdata,'pra')}"
+            )[:100]
             options.append(discord.SelectOption(
                 label=label, description=desc, value=pname, emoji=emoji,
             ))
