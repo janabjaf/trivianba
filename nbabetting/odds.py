@@ -16,8 +16,9 @@ ESPN_SUMMARY     = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba
 ESPN_LEADERS     = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/leaders"
 ESPN_TEAM_STATS    = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/statistics"
 ESPN_TEAM_LEADERS  = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/leaders"
-ESPN_TEAM_ROSTER   = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/roster"
-ESPN_NEWS          = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/news"
+ESPN_TEAM_ROSTER    = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/roster"
+ESPN_TEAM_SCHEDULE  = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/schedule"
+ESPN_NEWS           = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/news"
 
 # ── Cache TTLs (seconds) ──────────────────────────────────────────────────────
 GAMES_TTL             = 120     # 2 min
@@ -30,12 +31,37 @@ LAST5_TTL             = 7200    # 2 hrs  — per-team last-5 player averages
 
 # ── ESPN numeric team IDs (permanent, never change) ──────────────────────────
 TEAM_IDS: Dict[str, int] = {
-    "ATL": 1,  "BOS": 2,  "NOP": 3,  "CHI": 4,  "CLE": 5,
-    "DAL": 6,  "DEN": 7,  "DET": 8,  "GSW": 9,  "HOU": 10,
+    "ATL": 1,  "BOS": 2,  "NOP": 3,  "NO": 3,   "CHI": 4,  "CLE": 5,
+    "DAL": 6,  "DEN": 7,  "DET": 8,  "GSW": 9,  "GS": 9,   "HOU": 10,
     "IND": 11, "LAC": 12, "LAL": 13, "MIA": 14, "MIL": 15,
-    "MIN": 16, "BKN": 17, "NYK": 18, "ORL": 19, "PHI": 20,
-    "PHX": 21, "POR": 22, "SAC": 23, "SAS": 24, "OKC": 25,
-    "UTA": 26, "WAS": 27, "TOR": 28, "MEM": 29, "CHA": 30,
+    "MIN": 16, "BKN": 17, "BK": 17,  "NYK": 18, "NY": 18,  "ORL": 19, "PHI": 20,
+    "PHX": 21, "PHO": 21, "POR": 22, "SAC": 23, "SAS": 24, "SA": 24,  "OKC": 25,
+    "UTA": 26, "UT": 26,  "WAS": 27, "WSH": 27, "TOR": 28, "MEM": 29, "CHA": 30,
+}
+
+# Canonical 3-letter abbreviations (normalises 2-letter ESPN variants)
+_ABBR_CANON: Dict[str, str] = {
+    "NO": "NOP", "GS": "GSW", "BK": "BKN", "NY": "NYK",
+    "SA": "SAS", "PHO": "PHX", "UT": "UTA", "WSH": "WAS",
+}
+
+
+def _canon_abbr(abbr: str) -> str:
+    """Return the canonical 3-letter abbreviation for a team."""
+    a = abbr.upper()
+    return _ABBR_CANON.get(a, a)
+
+
+# Reverse map: ESPN numeric team ID (string) → canonical abbreviation.
+# Kept separate from TEAM_IDS so the canonical form is unambiguous even
+# though TEAM_IDS contains duplicate values for 2-letter aliases.
+_TEAM_ID_TO_ABBR: Dict[str, str] = {
+    "1": "ATL", "2": "BOS",  "3": "NOP",  "4": "CHI",  "5": "CLE",
+    "6": "DAL", "7": "DEN",  "8": "DET",  "9": "GSW",  "10": "HOU",
+    "11": "IND","12": "LAC", "13": "LAL", "14": "MIA", "15": "MIL",
+    "16": "MIN","17": "BKN", "18": "NYK", "19": "ORL", "20": "PHI",
+    "21": "PHX","22": "POR", "23": "SAC", "24": "SAS", "25": "OKC",
+    "26": "UTA","27": "WAS", "28": "TOR", "29": "MEM", "30": "CHA",
 }
 
 # ── Moneyline lookup table derived from spread (NBA-calibrated) ───────────────
@@ -714,8 +740,8 @@ def _parse_espn_event(event: Dict) -> Optional[Dict]:
             "commence_time":       event.get("date", ""),
             "home_team":           home["team"]["displayName"],
             "away_team":           away["team"]["displayName"],
-            "home_abbr":           home["team"].get("abbreviation", "").upper(),
-            "away_abbr":           away["team"].get("abbreviation", "").upper(),
+            "home_abbr":           _canon_abbr(home["team"].get("abbreviation", "").upper()),
+            "away_abbr":           _canon_abbr(away["team"].get("abbreviation", "").upper()),
             "home_record":         home_record,
             "away_record":         away_record,
             "home_home_record":    home_home_record,
@@ -1010,8 +1036,9 @@ class OddsFetcher:
         session = await self._get_session()
         result: Dict[str, Dict] = {}
         valid_abbrs = {home_abbr, away_abbr}
-        # Reverse TEAM_IDS so we can resolve numeric team IDs → abbreviation
-        _id_to_abbr: Dict[str, str] = {str(v): k for k, v in TEAM_IDS.items()}
+        # Use dedicated canonical ID→abbr map (not reversed from TEAM_IDS which has
+        # duplicate values from 2-letter aliases).
+        _id_to_abbr: Dict[str, str] = _TEAM_ID_TO_ABBR
 
         # ESPN stat name → our internal key
         stat_name_map: Dict[str, str] = {
@@ -1029,21 +1056,66 @@ class OddsFetcher:
         }
 
         def _extract_stats(athlete: Dict) -> Dict[str, float]:
-            """Walk the nested statistics tree ESPN uses."""
+            """Walk every statistics tree shape ESPN uses."""
             out: Dict[str, float] = {"pts": 0.0, "reb": 0.0, "ast": 0.0}
+
+            def _apply(name: str, value) -> None:
+                sname = name.lower().replace(" ", "").replace("_", "")
+                skey  = stat_name_map.get(sname)
+                if skey and value is not None:
+                    try:
+                        v = float(value)
+                        if v > out.get(skey, 0.0):
+                            out[skey] = v
+                    except (TypeError, ValueError):
+                        pass
+
             stats_obj = athlete.get("statistics") or {}
-            splits    = stats_obj.get("splits") or {}
+
+            # Shape A: statistics.splits.categories[].stats[]
+            splits     = stats_obj.get("splits") or {}
             categories = splits.get("categories") or []
             for cat in categories:
                 for s in cat.get("stats") or []:
-                    sname = (s.get("name") or "").lower().replace(" ", "").replace("_", "")
-                    skey  = stat_name_map.get(sname)
-                    if skey and s.get("value") is not None:
-                        try:
-                            out[skey] = float(s["value"])
-                        except (TypeError, ValueError):
-                            pass
+                    _apply(s.get("name") or "", s.get("value"))
+
+            # Shape B: statistics.categories[].stats[] (no "splits" wrapper)
+            for cat in stats_obj.get("categories") or []:
+                for s in cat.get("stats") or []:
+                    _apply(s.get("name") or "", s.get("value"))
+
+            # Shape C: flat statistics.stats[] list
+            for s in stats_obj.get("stats") or []:
+                _apply(s.get("name") or "", s.get("value"))
+
+            # Shape D: athlete has top-level avgPoints / avgRebounds / avgAssists
+            for raw_name in ("avgPoints", "avgRebounds", "avgAssists", "avgPointsPerGame",
+                             "points", "rebounds", "assists", "ppg", "rpg", "apg"):
+                val = athlete.get(raw_name)
+                if val is not None:
+                    _apply(raw_name, val)
+
             return out
+
+        def _idx_for(labels: List[str], candidates: List[str]) -> int:
+            """Return first matching column index from a labels list, or -1."""
+            for c in candidates:
+                try:
+                    return labels.index(c)
+                except ValueError:
+                    pass
+            return -1
+
+        def _stat_from_row(row: List[str], idx: int) -> float:
+            """Extract a float from a stats row at index idx.
+            Handles fractions like '7-18' (takes the first part) and plain ints/floats."""
+            if idx < 0 or idx >= len(row):
+                return 0.0
+            raw = str(row[idx]).split("-")[0].split("/")[0].strip()
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return 0.0
 
         try:
             async with session.get(
@@ -1055,13 +1127,68 @@ class OddsFetcher:
                     return {}
                 data = await resp.json(content_type=None)
 
-            for team_block in data.get("rosters", []):
-                t_obj     = team_block.get("team", {})
-                team_abbr = (
-                    t_obj.get("abbreviation", "")
-                    or t_obj.get("abbrev", "")
-                ).upper()
-                # If ESPN omits or mismatches the abbreviation, resolve via team ID
+            # ── Primary: ESPN boxscore.players (live/completed games) ──────────
+            # Structure: boxscore.players[i].team.abbreviation
+            #            boxscore.players[i].statistics[0].labels  → column names
+            #            boxscore.players[i].statistics[0].athletes[j].athlete.displayName
+            #            boxscore.players[i].statistics[0].athletes[j].stats  → list of strings
+            boxscore   = data.get("boxscore") or {}
+            bp_entries = boxscore.get("players") or []
+            for team_block in bp_entries:
+                t_obj     = team_block.get("team") or {}
+                team_abbr = _canon_abbr(
+                    (t_obj.get("abbreviation") or t_obj.get("abbrev") or "").upper()
+                )
+                if team_abbr not in valid_abbrs:
+                    team_id_str = str(t_obj.get("id", ""))
+                    team_abbr   = _id_to_abbr.get(team_id_str, team_abbr)
+                if team_abbr not in valid_abbrs:
+                    continue
+
+                for stats_group in team_block.get("statistics") or []:
+                    raw_labels = stats_group.get("labels") or stats_group.get("names") or []
+                    labels     = [str(l).upper() for l in raw_labels]
+
+                    pts_idx = _idx_for(labels, ["PTS", "POINTS"])
+                    reb_idx = _idx_for(labels, ["REB", "REBOUNDS", "DREB"])
+                    ast_idx = _idx_for(labels, ["AST", "ASSISTS"])
+
+                    for athlete_entry in stats_group.get("athletes") or []:
+                        athlete      = athlete_entry.get("athlete") or {}
+                        pname        = athlete.get("displayName") or athlete.get("fullName", "")
+                        if not pname:
+                            continue
+                        did_not_play = athlete_entry.get("didNotPlay", False)
+                        active       = athlete_entry.get("active", True)
+                        available    = active and not did_not_play
+
+                        raw_stats = athlete_entry.get("stats") or []
+                        pts = _stat_from_row(raw_stats, pts_idx)
+                        reb = _stat_from_row(raw_stats, reb_idx)
+                        ast = _stat_from_row(raw_stats, ast_idx)
+                        pra = pts + reb + ast
+                        tier = _player_tier(pts)
+
+                        if pname not in result or (pts + reb + ast) > (
+                            result[pname]["pts"] + result[pname]["reb"] + result[pname]["ast"]
+                        ):
+                            result[pname] = {
+                                "pts":       pts,
+                                "reb":       reb,
+                                "ast":       ast,
+                                "pra":       pra,
+                                "tier":      tier,
+                                "team_abbr": team_abbr,
+                                "available": available,
+                            }
+
+            # ── Fallback: legacy ESPN "rosters" structure (pre-game summaries) ──
+            # Some game previews expose per-player season averages here.
+            for team_block in data.get("rosters") or []:
+                t_obj     = team_block.get("team") or {}
+                team_abbr = _canon_abbr(
+                    (t_obj.get("abbreviation") or t_obj.get("abbrev") or "").upper()
+                )
                 if team_abbr not in valid_abbrs:
                     team_id_str = str(t_obj.get("id", ""))
                     team_abbr   = _id_to_abbr.get(team_id_str, team_abbr)
@@ -1071,15 +1198,12 @@ class OddsFetcher:
                 for entry in team_block.get("roster") or []:
                     athlete = entry.get("athlete") or {}
                     pname   = athlete.get("displayName") or athlete.get("fullName", "")
-                    if not pname:
+                    if not pname or pname in result:
                         continue
 
-                    # Availability
                     did_not_play = entry.get("didNotPlay", False)
                     status_name  = (
-                        (entry.get("status") or {})
-                        .get("type", {})
-                        .get("name", "")
+                        (entry.get("status") or {}).get("type", {}).get("name", "")
                     ).lower()
                     available = (
                         not did_not_play
@@ -1088,8 +1212,8 @@ class OddsFetcher:
 
                     stats = _extract_stats(athlete)
                     pts, reb, ast = stats["pts"], stats["reb"], stats["ast"]
-                    pra   = pts + reb + ast
-                    tier  = _player_tier(pts)
+                    pra  = pts + reb + ast
+                    tier = _player_tier(pts)
 
                     result[pname] = {
                         "pts":       pts,
@@ -1169,20 +1293,39 @@ class OddsFetcher:
         # ── Source 1: team leaders (top scorers/rebounders/assisters for this team) ──
         try:
             url = ESPN_TEAM_LEADERS.format(team_id=team_id)
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(
+                url,
+                params={"limit": 50},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
-                    for cat in data.get("leaders", []):
+                    # ESPN wraps leaders under "leaders" or "categories"
+                    leaders_data = data.get("leaders") or data.get("categories") or []
+                    for cat in leaders_data:
                         stat_key = _resolve_cat(cat)
                         if not stat_key:
                             continue
-                        for entry in cat.get("leaders", []):
-                            athlete = entry.get("athlete") or {}
-                            pname   = athlete.get("displayName") or athlete.get("fullName", "")
+                        # Entries can be under "leaders" or "athletes"
+                        entries = cat.get("leaders") or cat.get("athletes") or []
+                        for entry in entries:
+                            # Athlete nested under "athlete" key OR entry is the athlete
+                            athlete = entry.get("athlete") or entry
+                            pname   = (
+                                athlete.get("displayName")
+                                or athlete.get("fullName")
+                                or entry.get("displayName")
+                                or entry.get("fullName", "")
+                            )
                             if not pname:
                                 continue
+                            val_raw = (
+                                entry.get("value")
+                                or entry.get("average")
+                                or entry.get("perGameValue")
+                            )
                             try:
-                                _update(pname, stat_key, float(entry.get("value", 0)))
+                                _update(pname, stat_key, float(val_raw or 0))
                             except (TypeError, ValueError):
                                 pass
         except Exception:
@@ -1212,18 +1355,34 @@ class OddsFetcher:
                 # Ensure the player appears even with zero stats
                 if pname not in player_stats:
                     player_stats[pname] = {"pts": 0.0, "reb": 0.0, "ast": 0.0, "team_abbr": abbr}
-                # Extract stats from the statistics sub-object ESPN sometimes includes
+
+                def _try_stat(raw_name: str, raw_val) -> None:
+                    sname = raw_name.lower().replace(" ", "").replace("_", "")
+                    sk    = _stat_key_map.get(sname)
+                    if sk and raw_val is not None:
+                        try:
+                            _update(pname, sk, float(raw_val))
+                        except (TypeError, ValueError):
+                            pass
+
                 stats_obj = athlete.get("statistics") or {}
-                splits    = stats_obj.get("splits") or {}
+                # Shape A: statistics.splits.categories[].stats[]
+                splits = stats_obj.get("splits") or {}
                 for cat in splits.get("categories") or []:
                     for s in cat.get("stats") or []:
-                        sname = (s.get("name") or "").lower().replace(" ", "").replace("_", "")
-                        sk    = _stat_key_map.get(sname)
-                        if sk and s.get("value") is not None:
-                            try:
-                                _update(pname, sk, float(s["value"]))
-                            except (TypeError, ValueError):
-                                pass
+                        _try_stat(s.get("name") or "", s.get("value"))
+                # Shape B: statistics.categories[].stats[]
+                for cat in stats_obj.get("categories") or []:
+                    for s in cat.get("stats") or []:
+                        _try_stat(s.get("name") or "", s.get("value"))
+                # Shape C: flat statistics.stats[]
+                for s in stats_obj.get("stats") or []:
+                    _try_stat(s.get("name") or "", s.get("value"))
+                # Shape D: top-level athlete keys
+                for raw_name in ("avgPoints", "avgRebounds", "avgAssists",
+                                 "points", "rebounds", "assists", "ppg", "rpg", "apg"):
+                    if athlete.get(raw_name) is not None:
+                        _try_stat(raw_name, athlete[raw_name])
         except Exception:
             pass
 
@@ -1282,12 +1441,13 @@ class OddsFetcher:
                 lambda a: a.get("team", {}).get("abbrev", ""),
                 lambda a: (a.get("team") or {}).get("shortDisplayName", ""),
                 lambda a: a.get("teamShortName", ""),
+                lambda a: _TEAM_ID_TO_ABBR.get(str((a.get("team") or {}).get("id", "")), ""),
             ]
             for fn in checks:
                 try:
                     v = fn(athlete)
                     if v and len(v) <= 4:
-                        return v.upper()
+                        return _canon_abbr(v.upper())
                 except Exception:
                     pass
             return ""
@@ -1302,7 +1462,9 @@ class OddsFetcher:
                     return self._leaders_cache
                 data = await resp.json(content_type=None)
 
-            for category in data.get("leaders", []):
+            # ESPN wraps the list under "leaders" or "categories"
+            categories_list = data.get("leaders") or data.get("categories") or []
+            for category in categories_list:
                 # Try every label field ESPN uses — stop at first match.
                 # Using "name or abbreviation" in one expression silently drops
                 # the abbreviation when name exists but isn't in the map.
@@ -1314,14 +1476,22 @@ class OddsFetcher:
                         break
                 if not stat_key:
                     continue
-                for entry in category.get("leaders", []):
+                # ESPN uses "leaders" or "athletes" for the entry list
+                entry_list = category.get("leaders") or category.get("athletes") or []
+                for entry in entry_list:
                     try:
-                        athlete    = entry["athlete"]
-                        pname      = athlete.get("displayName", "") or athlete.get("fullName", "")
+                        # Athlete can be nested under "athlete" key or entry is the athlete
+                        athlete = entry.get("athlete") or entry
+                        pname   = (
+                            athlete.get("displayName", "")
+                            or athlete.get("fullName", "")
+                            or entry.get("displayName", "")
+                            or entry.get("fullName", "")
+                        )
                         if not pname:
                             continue
-                        team_abbr  = _abbr_from_athlete(athlete)
-                        value      = float(entry.get("value", 0))
+                        team_abbr = _abbr_from_athlete(athlete)
+                        value     = float(entry.get("value", 0))
                     except (KeyError, TypeError, ValueError):
                         continue
                     if pname not in merged:
@@ -1367,11 +1537,15 @@ class OddsFetcher:
                 data = await resp.json(content_type=None)
 
             for team_entry in data.get("injuries", []):
-                abbr    = team_entry.get("team", {}).get("abbreviation", "").upper()
-                players = []
+                raw_abbr = team_entry.get("team", {}).get("abbreviation", "").upper()
+                abbr     = _canon_abbr(raw_abbr)
+                players  = []
                 for inj in team_entry.get("injuries", []):
                     athlete  = inj.get("athlete", {})
-                    full_name = athlete.get("fullName", "")
+                    full_name = (
+                        athlete.get("fullName", "")
+                        or athlete.get("displayName", "")
+                    )
                     status    = inj.get("status", "")
                     desc      = inj.get("longComment", inj.get("shortComment", ""))
                     if full_name and status:
@@ -1523,6 +1697,18 @@ class OddsFetcher:
         for pname, status in away_roster.items():
             combined_roster[pname] = status
 
+        # Supplement combined_roster with player pool names as a fallback.
+        # When the team-roster API call fails (returns {}), global stat leaders
+        # can't be matched to the game via `in_game_by_roster` — this ensures
+        # that players already confirmed by the team player pool are still
+        # eligible to receive stat overlays from the global leaders endpoint.
+        for pname in home_player_pool:
+            if pname not in combined_roster:
+                combined_roster[pname] = "active"
+        for pname in away_player_pool:
+            if pname not in combined_roster:
+                combined_roster[pname] = "active"
+
         def _is_available(pname: str, summary_entry: Optional[Dict] = None) -> bool:
             if pname in injury_out:
                 return False
@@ -1641,12 +1827,12 @@ class OddsFetcher:
                 "tier": 3, "team_abbr": away_abbr,
             }
 
-        # ── Adjust props_pool using last-5-game averages (season avg is the floor) ─
-        # Lines are based on career/season averages as the primary source.
-        # Recent form can only RAISE a line (hot streak → harder to bet the over)
-        # but NEVER lower it below the season average.
-        # This ensures elite players like Anthony Edwards keep their proper lines
-        # even during a cold stretch.
+        # ── Populate props_pool stats from last-5-game averages ──────────────────
+        # The ESPN leaders/stats APIs are currently unavailable, so season_val
+        # starts at 0 for every player.  When last-5 averages are available we
+        # use them directly as the stat baseline.  If season data ever comes back
+        # (season_val > 0) hot streaks raise the line slightly; cold streaks keep
+        # the season-average floor so lines are never exploitably low.
         last5_lookup: Dict[str, Dict] = {**home_last5, **away_last5}
         for pname, pdata in props_pool.items():
             l5 = last5_lookup.get(pname)
@@ -1656,13 +1842,16 @@ class OddsFetcher:
             for stat in ("pts", "reb", "ast"):
                 l5_val     = l5.get(stat, 0.0)
                 season_val = pdata.get(stat, 0.0)
-                if l5_val > 0 and l5_val > season_val:
-                    # Player is on a hot streak — slightly raise the line
-                    blended = round(0.25 * l5_val + 0.75 * season_val, 1)
-                    pdata[stat] = blended
-                    updated = True
-                # If l5 is lower than season avg, keep season avg (cold streaks
-                # don't lower lines — this protects against easy-win scenarios)
+                if l5_val > 0:
+                    if season_val == 0.0:
+                        # No season data — use last-5 average directly
+                        pdata[stat] = l5_val
+                        updated = True
+                    elif l5_val > season_val:
+                        # Hot streak: blend slightly above season average
+                        pdata[stat] = round(0.25 * l5_val + 0.75 * season_val, 1)
+                        updated = True
+                    # Cold streak (l5 < season_val): keep season avg as floor
             if updated:
                 pdata["pra"]  = round(
                     pdata.get("pts", 0.0) + pdata.get("reb", 0.0) + pdata.get("ast", 0.0), 1
@@ -1717,24 +1906,52 @@ class OddsFetcher:
 
     async def get_player_last5(self, abbr: str) -> Dict[str, Dict]:
         """
-        Return {player_name: {pts, reb, ast}} averaged over the player's last
-        5 completed games for team `abbr`.  Cached per team for 2 hours.
+        Return {player_name: {pts, reb, ast}} averaged over the team's last
+        5 completed games.  Uses the ESPN team schedule endpoint directly
+        (playoffs first, then regular season) so it works even when the global
+        recent-completed-games window is empty.  Cached per team for 2 hours.
         """
         now = time.monotonic()
         if abbr in self._last5_cache and now - self._last5_ts.get(abbr, 0) < LAST5_TTL:
             return self._last5_cache[abbr]
 
-        recent = await self.get_recent_completed(days_back=7)
-        team_games = [
-            g for g in recent
-            if g.get("home_abbr") == abbr or g.get("away_abbr") == abbr
-        ][:5]
+        team_id = TEAM_IDS.get(abbr)
+        if not team_id:
+            return {}
 
-        if not team_games:
+        session    = await self._get_session()
+        event_ids: List[str] = []
+
+        # Collect up to 5 most-recent completed game IDs.
+        # Check playoff schedule first (seasontype=3), then regular season (2).
+        for season_type in ("3", "2"):
+            if len(event_ids) >= 5:
+                break
+            try:
+                url = ESPN_TEAM_SCHEDULE.format(team_id=team_id)
+                async with session.get(
+                    url,
+                    params={"season": "2026", "seasontype": season_type},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json(content_type=None)
+
+                for ev in reversed(data.get("events", [])):
+                    if len(event_ids) >= 5:
+                        break
+                    comp = (ev.get("competitions") or [{}])[0]
+                    if comp.get("status", {}).get("type", {}).get("completed", False):
+                        event_ids.append(ev["id"])
+            except Exception:
+                pass
+
+        if not event_ids:
             return {}
 
         box_scores = await asyncio.gather(
-            *[self.get_game_box_score(g["event_id"]) for g in team_games],
+            *[self.get_game_box_score(eid) for eid in event_ids],
             return_exceptions=True,
         )
 
@@ -1744,9 +1961,9 @@ class OddsFetcher:
             if not isinstance(bs, dict) or not bs:
                 continue
             for pname, pstats in bs.items():
-                pts = float(pstats.get("pts", pstats.get("points", 0)) or 0)
-                reb = float(pstats.get("reb", pstats.get("rebounds", pstats.get("totalrebounds", 0))) or 0)
-                ast = float(pstats.get("ast", pstats.get("assists", 0)) or 0)
+                pts = float(pstats.get("pts", 0) or 0)
+                reb = float(pstats.get("reb", 0) or 0)
+                ast = float(pstats.get("ast", 0) or 0)
                 if pts + reb + ast == 0:
                     continue
                 if pname not in totals:
@@ -1764,7 +1981,7 @@ class OddsFetcher:
                 "ast": round(totals[pname]["ast"] / counts[pname], 1),
             }
             for pname in totals
-            if counts[pname] >= 2   # need at least 2 games for a meaningful average
+            if counts[pname] >= 1
         }
 
         if result:
@@ -1834,7 +2051,10 @@ class OddsFetcher:
     # ── Box score ─────────────────────────────────────────────────────────────
 
     async def get_game_box_score(self, event_id: str) -> Optional[Dict[str, Dict]]:
-        # Completed game stats never change — cache indefinitely per session
+        """Parse a completed game's box score into {player_name: {pts, reb, ast}}.
+        Completed game stats never change — cached indefinitely per session.
+        Uses ESPN's 'labels' column headers (not 'keys') to locate PTS/REB/AST.
+        """
         if event_id in self._boxscore_cache:
             return self._boxscore_cache[event_id]
 
@@ -1850,21 +2070,37 @@ class OddsFetcher:
                 data = await resp.json(content_type=None)
 
             stat_map: Dict[str, Dict] = {}
-            for team_block in data.get("boxscore", {}).get("players", []):
-                for stat_group in team_block.get("statistics", []):
-                    keys = stat_group.get("keys", [])
-                    for athlete_entry in stat_group.get("athletes", []):
-                        display_name = athlete_entry.get("athlete", {}).get("displayName", "")
-                        raw_stats    = athlete_entry.get("stats", [])
-                        if not display_name or not raw_stats:
+            for team_block in (data.get("boxscore") or {}).get("players") or []:
+                for stat_group in team_block.get("statistics") or []:
+                    # ESPN sends both "labels" (display: "PTS") and "keys" (machine:
+                    # "points", "fieldGoalsMade-fieldGoalsAttempted").  Always use
+                    # labels for index lookup — keys contain compound strings like
+                    # "fieldGoalsMade-fieldGoalsAttempted" that can't be floated.
+                    raw_labels = stat_group.get("labels") or stat_group.get("names") or []
+                    labels     = [str(l).upper() for l in raw_labels]
+                    pts_idx = next((i for i, l in enumerate(labels) if l == "PTS"), -1)
+                    reb_idx = next((i for i, l in enumerate(labels) if l == "REB"), -1)
+                    ast_idx = next((i for i, l in enumerate(labels) if l == "AST"), -1)
+
+                    for athlete_entry in stat_group.get("athletes") or []:
+                        pname     = (athlete_entry.get("athlete") or {}).get("displayName", "")
+                        raw_stats = athlete_entry.get("stats") or []
+                        if not pname or not raw_stats:
                             continue
-                        parsed: Dict[str, float] = {}
-                        for key, val in zip(keys, raw_stats):
+
+                        def _gs(idx: int) -> float:
+                            if idx < 0 or idx >= len(raw_stats):
+                                return 0.0
                             try:
-                                parsed[key.lower()] = float(val)
-                            except (ValueError, TypeError):
-                                parsed[key.lower()] = 0.0
-                        stat_map[display_name] = parsed
+                                return float(str(raw_stats[idx]).split("-")[0].split("/")[0])
+                            except (TypeError, ValueError):
+                                return 0.0
+
+                        stat_map[pname] = {
+                            "pts": _gs(pts_idx),
+                            "reb": _gs(reb_idx),
+                            "ast": _gs(ast_idx),
+                        }
 
             if stat_map:
                 self._boxscore_cache[event_id] = stat_map
