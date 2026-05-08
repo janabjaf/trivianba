@@ -93,6 +93,12 @@ _ML_TABLE: List[Tuple[float, int, int]] = [
 
 HOME_COURT_ADV = 2.0   # pts — modern NBA, down from historical 3
 
+# ── Per-game stat sanity caps ─────────────────────────────────────────────────
+# No NBA player has EVER averaged more than these values in a single season.
+# Any parsed value above these thresholds is a season TOTAL, not a per-game
+# average, and must be rejected to prevent "850 assists" style line inflation.
+_PER_GAME_MAX: Dict[str, float] = {"pts": 55.0, "reb": 28.0, "ast": 17.0}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Small helpers
@@ -631,6 +637,16 @@ def generate_player_props_for_game(
         pts  = float(pdata.get("pts", 0.0))
         reb  = float(pdata.get("reb", 0.0))
         ast  = float(pdata.get("ast", 0.0))
+
+        # ── Final sanity gate (last line of defence against data bugs) ────────
+        # If any stat still exceeds a realistic per-game maximum after all the
+        # upstream fixes, clamp it hard rather than generating a nonsense line.
+        # These caps (55 PPG / 28 RPG / 17 APG) are above every NBA record, so
+        # a real superstar's line is NEVER touched; only corrupted data is caught.
+        pts = min(pts, _PER_GAME_MAX["pts"])
+        reb = min(reb, _PER_GAME_MAX["reb"])
+        ast = min(ast, _PER_GAME_MAX["ast"])
+
         tier = _player_tier(pts)
 
         # Skip players with no statistical data at all — they are two-way /
@@ -1105,6 +1121,12 @@ class OddsFetcher:
                 if skey and value is not None:
                     try:
                         v = float(value)
+                        # Reject season totals masquerading as per-game averages.
+                        # No player averages 55+ PPG, 28+ RPG, or 17+ APG per game.
+                        if v > _PER_GAME_MAX.get(skey, 9999.0):
+                            return
+                        # Only keep the highest VALID per-game value seen across
+                        # multiple ESPN stat shapes for the same player.
                         if v > out.get(skey, 0.0):
                             out[skey] = v
                     except (TypeError, ValueError):
@@ -1203,9 +1225,9 @@ class OddsFetcher:
                         available    = active and not did_not_play
 
                         raw_stats = athlete_entry.get("stats") or []
-                        pts = _stat_from_row(raw_stats, pts_idx)
-                        reb = _stat_from_row(raw_stats, reb_idx)
-                        ast = _stat_from_row(raw_stats, ast_idx)
+                        pts = min(_stat_from_row(raw_stats, pts_idx), _PER_GAME_MAX["pts"])
+                        reb = min(_stat_from_row(raw_stats, reb_idx), _PER_GAME_MAX["reb"])
+                        ast = min(_stat_from_row(raw_stats, ast_idx), _PER_GAME_MAX["ast"])
                         pra = pts + reb + ast
                         tier = _player_tier(pts)
 
@@ -1319,6 +1341,9 @@ class OddsFetcher:
         def _update(pname: str, key: str, val: float) -> None:
             if pname not in player_stats:
                 player_stats[pname] = {"pts": 0.0, "reb": 0.0, "ast": 0.0, "team_abbr": abbr}
+            # Hard-reject season totals: no player averages 55+ PPG / 28+ RPG / 17+ APG.
+            if val > _PER_GAME_MAX.get(key, 9999.0):
+                return
             if val > player_stats[pname].get(key, 0.0):
                 player_stats[pname][key] = val
 
@@ -1800,12 +1825,17 @@ class OddsFetcher:
                 continue
 
             if pname in props_pool:
-                # Already seeded from team player pool — PRESERVE its team_abbr
-                # (which we set authoritatively above) and only merge higher stats.
+                # Already seeded from team player pool (the most accurate source).
+                # Only fill in stats that are still zero — never overwrite non-zero
+                # values, because the team-specific leaders endpoint is authoritative
+                # and the global leaders endpoint can contain stale/wrong splits.
                 ex = props_pool[pname]
-                for key in ("pts", "reb", "ast", "pra"):
-                    if pdata.get(key, 0) > ex.get(key, 0):
-                        ex[key] = pdata[key]
+                for key in ("pts", "reb", "ast"):
+                    ex_val  = float(ex.get(key, 0.0) or 0.0)
+                    new_val = float(pdata.get(key, 0.0) or 0.0)
+                    if ex_val == 0.0 and new_val > 0.0 and new_val <= _PER_GAME_MAX.get(key, 9999.0):
+                        ex[key] = new_val
+                ex["pra"]  = ex.get("pts", 0.0) + ex.get("reb", 0.0) + ex.get("ast", 0.0)
                 ex["tier"] = _player_tier(ex.get("pts", 0))
             else:
                 # Player not yet in pool — add them with correct team attribution.
@@ -1825,14 +1855,18 @@ class OddsFetcher:
             if not _is_available(pname, sdata):
                 continue
             if pname in props_pool:
-                # Keep the higher stats (summary may have more recent data)
-                # but NEVER overwrite team_abbr — we set it authoritatively above.
+                # Summary roster is used for AVAILABILITY only.
+                # Only fill zero-stat gaps — never overwrite the team-player-pool
+                # season averages, which are more authoritative than game-summary data.
+                # NEVER overwrite team_abbr — we set it authoritatively above.
                 ex = props_pool[pname]
-                for key in ("pts", "reb", "ast", "pra"):
-                    if sdata.get(key, 0) > ex.get(key, 0):
-                        ex[key] = sdata[key]
+                for key in ("pts", "reb", "ast"):
+                    ex_val  = float(ex.get(key, 0.0) or 0.0)
+                    new_val = float(sdata.get(key, 0.0) or 0.0)
+                    if ex_val == 0.0 and new_val > 0.0 and new_val <= _PER_GAME_MAX.get(key, 9999.0):
+                        ex[key] = new_val
+                ex["pra"]  = ex.get("pts", 0.0) + ex.get("reb", 0.0) + ex.get("ast", 0.0)
                 ex["tier"] = _player_tier(ex["pts"])
-                # Do NOT copy sdata["team_abbr"] — it can be wrong from ESPN summary
             else:
                 entry = dict(sdata)
                 # Infer correct team_abbr from roster membership if not already set
@@ -1868,10 +1902,14 @@ class OddsFetcher:
             }
 
         # ── Populate props_pool stats from last-5-game averages ──────────────────
-        # Blend season average with recent form bidirectionally so that both hot
-        # streaks and cold slumps move the line — this is how FanDuel prices props.
+        # Blend season average with recent form.
         #
-        # Weights: 65% season average + 35% last-5 average.
+        # Weights: 90% season average + 10% last-5 average.
+        # Season average is the dominant signal — it's what FanDuel and all major
+        # books use as their baseline.  Recent form gets only a 10% nudge so that
+        # a 3-game hot streak or cold slump doesn't meaningfully inflate/deflate
+        # the line away from a player's true season average.
+        #
         # When we have no season data at all, use last-5 directly (it's all we have).
         # When we have no last-5 data, the season average stands unchanged.
         last5_lookup: Dict[str, Dict] = {**home_last5, **away_last5}
@@ -1883,16 +1921,16 @@ class OddsFetcher:
             for stat in ("pts", "reb", "ast"):
                 l5_val     = float(l5.get(stat, 0.0) or 0.0)
                 season_val = float(pdata.get(stat, 0.0) or 0.0)
-                if l5_val <= 0:
+                # Sanity-check last-5 values too — a 60-point game in box score
+                # is real but season-total data must not sneak through here.
+                if l5_val <= 0 or l5_val > _PER_GAME_MAX.get(stat, 9999.0):
                     continue
                 if season_val == 0.0:
                     # No season data at all — use last-5 directly
                     pdata[stat] = l5_val
                 else:
-                    # Bidirectional blend: 65% season + 35% recent form.
-                    # This allows cold slumps to lower lines and hot streaks
-                    # to raise them — matches real sportsbook line-setting.
-                    pdata[stat] = round(0.65 * season_val + 0.35 * l5_val, 1)
+                    # 90% season + 10% recent form: season average dominates.
+                    pdata[stat] = round(0.90 * season_val + 0.10 * l5_val, 1)
                 updated = True
             if updated:
                 pdata["pra"]  = round(
