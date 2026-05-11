@@ -32,7 +32,6 @@ STATUS_EMOJI = {
     "lost":      "❌",
     "push":      "🔄",
     "no_action": "🚫",
-    "cashout":   "💸",
     "cancelled": "🚫",
 }
 PROP_STAT_LABELS = {
@@ -1043,10 +1042,6 @@ class MyBetsView(discord.ui.View):
             payout_str = "\n**Push** – stake returned"
         elif bet["status"] == "no_action":
             payout_str = "\n🚫 **No Action** – player did not play, stake refunded"
-        elif bet["status"] == "cashout":
-            actual = bet.get("actual_payout")
-            if actual is not None:
-                payout_str = f"\n💸 **Cashed Out:** {CURRENCY}{actual:.0f} returned early"
 
         if bet.get("bet_type") == "parlay":
             legs         = bet.get("legs", [])
