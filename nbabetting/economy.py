@@ -101,14 +101,6 @@ class Economy:
         bpush = await conf.bets_push()
         await conf.bets_push.set(bpush + 1)
 
-    async def record_cashout(self, guild_id: int, user_id: int, cashout_value: float) -> None:
-        """Record an early cashout.  cashout_value goes into total_returned so
-        P/L reflects the partial return (negative P/L = cost of cashing out early).
-        Does NOT increment wins/losses/pushes — cashout is its own event."""
-        conf = self.config.member_from_ids(guild_id, user_id)
-        tr   = await conf.total_returned()
-        await conf.total_returned.set(round(tr + cashout_value, 2))
-
     async def get_streak(self, guild_id: int, user_id: int) -> int:
         return await self.config.member_from_ids(guild_id, user_id).current_streak()
 
