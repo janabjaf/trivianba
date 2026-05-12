@@ -2207,12 +2207,18 @@ class OddsFetcher:
                             except (TypeError, ValueError):
                                 return 0.0
 
+                        pts     = _gs(pts_idx)
+                        reb     = _gs(reb_idx)
+                        ast     = _gs(ast_idx)
                         minutes = _parse_min(min_idx)
+                        # If ESPN omits the MIN column (min_idx == -1), fall back
+                        # to stats: any player who recorded a stat obviously played.
+                        played  = minutes > 0 or (min_idx < 0 and (pts + reb + ast) > 0)
                         stat_map[pname] = {
-                            "pts":    _gs(pts_idx),
-                            "reb":    _gs(reb_idx),
-                            "ast":    _gs(ast_idx),
-                            "played": minutes > 0,
+                            "pts":    pts,
+                            "reb":    reb,
+                            "ast":    ast,
+                            "played": played,
                         }
 
             if stat_map:
@@ -2274,7 +2280,7 @@ def evaluate_bet(
 
     elif bet_type == "spreads":
         if point is None:
-            return "lost"
+            return "push"  # missing point data → refund rather than unfair loss
         margin = (
             home_score - away_score if selection == home_team
             else away_score - home_score
@@ -2304,7 +2310,15 @@ def evaluate_bet(
         if len(parts) != 3:
             return "push"
         pname, stat, direction = parts[0], parts[1], parts[2]
+        # Exact match first; fall back to case-insensitive to handle minor
+        # name formatting differences between bet placement and box score.
         pstat = player_stats.get(pname)
+        if pstat is None:
+            pname_lower = pname.lower()
+            pstat = next(
+                (v for k, v in player_stats.items() if k.lower() == pname_lower),
+                None,
+            )
 
         # ── Late-scratch / DNP detection ──────────────────────────────────────
         # If the player is completely absent from the box score they were a
@@ -2314,7 +2328,15 @@ def evaluate_bet(
         # FanDuel / DraftKings industry standard for player prop no-action rules.
         if pstat is None:
             return "no_action"
-        if not pstat.get("played", True):
+        # Secondary guard: if stats show any activity the player DID play,
+        # regardless of what the played flag says (guards against MIN parse failures).
+        actually_played = (
+            pstat.get("played", True)
+            or pstat.get("pts", 0.0) > 0
+            or pstat.get("reb", 0.0) > 0
+            or pstat.get("ast", 0.0) > 0
+        )
+        if not actually_played:
             return "no_action"
 
         if stat == "pts":

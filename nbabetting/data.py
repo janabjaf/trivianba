@@ -168,20 +168,22 @@ class BetsManager:
         Return total money wagered per selection for an event.
         Used by the odds engine for line movement.
         e.g. {"Lakers": 1500.0, "Warriors": 800.0, "Over": 600.0, "Under": 200.0}
+
+        Only PENDING (active) bets are counted — settled bets from prior games
+        must not permanently skew the line for future sessions.
         """
         data = self._load(guild_id)
         dist: Dict[str, float] = {}
-        for pool in ("active", "settled"):
-            for bet in data[pool].values():
-                if bet.get("event_id") != event_id:
-                    continue
-                if bet.get("status") == "cancelled":
-                    continue
-                if bet.get("bet_type") == "player_props":
-                    continue   # props don't affect spread/total lines
-                sel = bet.get("selection", "")
-                if sel:
-                    dist[sel] = dist.get(sel, 0.0) + bet.get("stake", 0.0)
+        for bet in data["active"].values():
+            if bet.get("status") != "pending":
+                continue
+            if bet.get("event_id") != event_id:
+                continue
+            if bet.get("bet_type") == "player_props":
+                continue   # props don't affect spread/total lines
+            sel = bet.get("selection", "")
+            if sel:
+                dist[sel] = dist.get(sel, 0.0) + bet.get("stake", 0.0)
         return dist
 
     def place_parlay(

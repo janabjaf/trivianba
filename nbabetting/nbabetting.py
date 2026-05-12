@@ -132,7 +132,7 @@ class NBABetting(commands.Cog):
                 raise
             except Exception as exc:
                 log.exception("Settlement error: %s", exc)
-            await asyncio.sleep(600)   # every 10 minutes
+            await asyncio.sleep(120)   # every 2 minutes
 
     async def _run_settlement(self) -> None:
         guild_ids = self.bets.get_all_guilds()
@@ -454,7 +454,7 @@ class NBABetting(commands.Cog):
     # ══════════════════════════════════════════════════════════════════════════
 
     async def _news_loop(self) -> None:
-        """Background task: poll ESPN for NBA news and injury updates every 15 minutes."""
+        """Background task: poll ESPN for NBA news and injury updates every 5 minutes."""
         await self.bot.wait_until_ready()
         await asyncio.sleep(90)  # Initial delay to let everything else stabilize
         while True:
@@ -464,7 +464,7 @@ class NBABetting(commands.Cog):
                 raise
             except Exception as exc:
                 log.exception("News check error: %s", exc)
-            await asyncio.sleep(900)  # every 15 minutes
+            await asyncio.sleep(300)  # every 5 minutes
 
     async def _run_news_check(self) -> None:
         """Fetch ESPN NBA news and injury reports, post new items to configured channels."""
@@ -571,7 +571,7 @@ class NBABetting(commands.Cog):
                             description="\n".join(changes[:10]),
                             color=discord.Color.red(),
                         )
-                        embed.set_footer(text="Source: ESPN  ·  Updates every 15 minutes")
+                        embed.set_footer(text="Source: ESPN  ·  Updates every 5 minutes")
                         await channel.send(embed=embed)
                     except (discord.Forbidden, discord.HTTPException):
                         pass
@@ -942,7 +942,7 @@ class NBABetting(commands.Cog):
         cfg        = await self.config.guild(ctx.guild).all()
         max_daily  = cfg.get("max_daily_bets", DEFAULT_MAX_DAILY_BETS)
         bets_today = self.bets.get_bets_placed_today(ctx.guild.id, ctx.author.id)
-        if bets_today >= max_daily:
+        if max_daily > 0 and bets_today >= max_daily:
             return await ctx.send(
                 f"🔒 You've reached the daily limit of **{max_daily}** bets. "
                 f"Limits reset at midnight UTC."
@@ -1003,7 +1003,7 @@ class NBABetting(commands.Cog):
         cfg        = await self.config.guild(ctx.guild).all()
         max_daily  = cfg.get("max_daily_bets", DEFAULT_MAX_DAILY_BETS)
         bets_today = self.bets.get_bets_placed_today(ctx.guild.id, ctx.author.id)
-        if bets_today >= max_daily:
+        if max_daily > 0 and bets_today >= max_daily:
             return await ctx.send(
                 f"🔒 You've reached the daily limit of **{max_daily}** bets. "
                 f"Limits reset at midnight UTC."
@@ -1219,7 +1219,7 @@ class NBABetting(commands.Cog):
 
     @admin_group.command(name="settle")
     async def admin_settle(self, ctx: commands.Context) -> None:
-        """Force-run bet settlement right now (don't wait for the 10-minute loop)."""
+        """Force-run bet settlement right now (don't wait for the 2-minute loop)."""
         async with ctx.typing():
             await self._run_settlement()
         await ctx.send("✅ Settlement cycle completed.")
@@ -1248,7 +1248,9 @@ class NBABetting(commands.Cog):
 
         count = 0
         for bet in game_bets:
-            self.bets.settle_bet(ctx.guild.id, bet["id"], "push", bet["stake"])
+            settled = self.bets.settle_bet(ctx.guild.id, bet["id"], "push", bet["stake"])
+            if not settled:
+                continue  # already settled by loop — skip to avoid double-refund
             await self.economy.add(ctx.guild.id, int(bet["user_id"]), bet["stake"])
             await self.economy.record_push(ctx.guild.id, int(bet["user_id"]), bet["stake"])
             count += 1
@@ -1427,7 +1429,7 @@ class NBABetting(commands.Cog):
     async def admin_setnewschannel(
         self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None
     ) -> None:
-        """Set a channel to receive ESPN NBA news headlines and injury updates every 15 minutes."""
+        """Set a channel to receive ESPN NBA news headlines and injury updates every 5 minutes."""
         await self.config.guild(ctx.guild).news_channel.set(channel.id if channel else None)
         if channel:
             # Reset cached state so it posts fresh articles to the new channel
@@ -1435,7 +1437,7 @@ class NBABetting(commands.Cog):
             self._injury_snapshot.pop(ctx.guild.id, None)
             await ctx.send(
                 f"✅ ESPN NBA news & injury updates will post in {channel.mention}.\n"
-                f"New articles and injury status changes will appear every ~15 minutes."
+                f"New articles and injury status changes will appear every ~5 minutes."
             )
         else:
             await ctx.send("✅ News channel cleared. ESPN updates disabled for this server.")
