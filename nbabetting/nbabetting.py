@@ -1471,7 +1471,7 @@ class NBABetting(commands.Cog):
         max_pct_label  = f"{cfg.get('max_bet_pct', DEFAULT_MAX_BET_PCT) * 100:.0f}% of balance"
 
         embed = discord.Embed(title="⚙️ NBABetting Status", color=discord.Color.blurple())
-        embed.add_field(name="Odds Source",      value="🟢 ESPN (injury-adjusted)",          inline=True)
+        embed.add_field(name="Odds Source",      value="🟢 DraftKings (via ESPN)",           inline=True)
         embed.add_field(name="Admin Role",       value=role.mention if role else "Admins only", inline=True)
         embed.add_field(name="Notify Channel",   value=notify_ch.mention if notify_ch else "DMs only", inline=True)
         embed.add_field(name="News Channel",     value=news_ch.mention if news_ch else "Disabled", inline=True)

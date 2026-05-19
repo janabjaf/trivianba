@@ -3,6 +3,7 @@ ML-from-spread derivation, back-to-back detection, form weighting, line movement
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -19,6 +20,21 @@ ESPN_TEAM_LEADERS  = "https://site.api.espn.com/apis/site/v2/sports/basketball/n
 ESPN_TEAM_ROSTER    = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/roster"
 ESPN_TEAM_SCHEDULE  = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{team_id}/schedule"
 ESPN_NEWS           = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/news"
+ESPN_PROPS_BASE     = (
+    "https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba"
+    "/events/{eid}/competitions/{eid}/odds/100/propBets"
+)
+
+# ── Prop-type name → internal stat key ───────────────────────────────────────
+_PROP_TYPE_MAP: Dict[str, str] = {
+    "Total Points":                        "pts",
+    "Total Rebounds":                      "reb",
+    "Total Assists":                       "ast",
+    "Total Points, Rebounds, and Assists": "pra",
+}
+
+# ── Pre-compiled regex for ESPN athlete IDs in $ref URLs ─────────────────────
+_AID_RE = re.compile(r"/athletes/(\d+)")
 
 # ── Cache TTLs (seconds) ──────────────────────────────────────────────────────
 GAMES_TTL             = 120     # 2 min
@@ -392,6 +408,76 @@ def _line_movement(
 # Core odds generation
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _parse_pickcenter(pc: Dict) -> Optional[Dict]:
+    """Parse an ESPN/DraftKings pickcenter object into our internal real_odds dict.
+
+    ESPN spread sign convention: negative value = home team is favoured
+      e.g. spread=-4.5 means home gives 4.5 pts (home favoured).
+    Our spread sign convention: positive = home favoured.
+    Therefore: our_spread = -(espn_spread).
+    """
+    try:
+        espn_spread = pc.get("spread")
+        total       = pc.get("overUnder")
+        if espn_spread is None or total is None:
+            return None
+
+        home_obj = pc.get("homeTeamOdds") or {}
+        away_obj = pc.get("awayTeamOdds") or {}
+
+        our_spread = -float(espn_spread)   # flip sign: positive = home favoured
+
+        home_ml = home_obj.get("moneyLine")
+        away_ml = away_obj.get("moneyLine")
+
+        h_spread_odds = home_obj.get("spreadOdds", -110)
+        a_spread_odds = away_obj.get("spreadOdds", -110)
+
+        over_odds  = pc.get("overOdds",  -110)
+        under_odds = pc.get("underOdds", -110)
+
+        # Opening lines from the structured pointSpread/moneyline sub-objects
+        ps     = pc.get("pointSpread") or {}
+        ml_obj = pc.get("moneyline") or {}
+
+        open_h_spread_str = (ps.get("home") or {}).get("open", {}).get("line")   # e.g. "-3.5"
+        open_h_ml_str     = (ml_obj.get("home") or {}).get("open", {}).get("odds")  # e.g. "-162"
+        open_a_ml_str     = (ml_obj.get("away") or {}).get("open", {}).get("odds")  # e.g. "+136"
+
+        opening_spread: Optional[float] = None
+        if open_h_spread_str is not None:
+            try:
+                opening_spread = -float(str(open_h_spread_str))  # flip sign
+            except (ValueError, TypeError):
+                pass
+
+        open_h_ml: Optional[int] = None
+        open_a_ml: Optional[int] = None
+        try:
+            if open_h_ml_str is not None:
+                open_h_ml = int(open_h_ml_str)
+            if open_a_ml_str is not None:
+                open_a_ml = int(open_a_ml_str)
+        except (ValueError, TypeError):
+            pass
+
+        return {
+            "spread":           our_spread,
+            "total":            float(total),
+            "home_ml":          int(home_ml)        if home_ml        is not None else None,
+            "away_ml":          int(away_ml)        if away_ml        is not None else None,
+            "home_spread_odds": int(h_spread_odds)  if h_spread_odds  is not None else -110,
+            "away_spread_odds": int(a_spread_odds)  if a_spread_odds  is not None else -110,
+            "over_odds":        int(over_odds)       if over_odds      is not None else -110,
+            "under_odds":       int(under_odds)      if under_odds     is not None else -110,
+            "opening_spread":   opening_spread,
+            "open_home_ml":     open_h_ml,
+            "open_away_ml":     open_a_ml,
+        }
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def generate_odds_for_game(
     game: Dict,
     injuries:       Optional[Dict[str, List[Dict]]] = None,
@@ -399,16 +485,20 @@ def generate_odds_for_game(
     home_ts:        Optional[Dict]                  = None,
     away_ts:        Optional[Dict]                  = None,
     bet_dist:       Optional[Dict[str, float]]      = None,
+    real_odds:      Optional[Dict]                  = None,
 ) -> Dict[str, Any]:
     """
-    Produce h2h / spreads / totals with:
-     - Real team ppg/papg from ESPN stats (if available)
-     - Power rating (season + last-10 + venue record)
-     - Back-to-back penalty
-     - Injury adjustment
-     - Line movement from server bet volume
-     - Spread-derived moneyline (not flat win%)
-     - Spread-appropriate vig
+    Produce h2h / spreads / totals.
+
+    When ``real_odds`` is provided (parsed from ESPN's DraftKings pickcenter):
+     - Real DK spread, total, moneylines, and vig are used directly as the base.
+     - Only server-bet line movement is layered on top (our unique feature).
+     - Injury notes are still shown for informational display.
+     - Synthetic power-rating calculation is skipped entirely.
+
+    When ``real_odds`` is None (synthetic fallback):
+     - Full calculation: team ppg/papg, power ratings, B2B, injury adjustments.
+     - Used when ESPN hasn't posted DK odds yet (pre-season, very early lines, etc.).
     """
     injuries     = injuries     or {}
     stat_leaders = stat_leaders or {}
@@ -416,16 +506,135 @@ def generate_odds_for_game(
     away_ts      = away_ts      or {}
     bet_dist     = bet_dist     or {}
 
-    home_team  = game["home_team"]
-    away_team  = game["away_team"]
-    home_abbr  = game.get("home_abbr", "")
-    away_abbr  = game.get("away_abbr", "")
+    home_team = game["home_team"]
+    away_team = game["away_team"]
+    home_abbr = game.get("home_abbr", "")
+    away_abbr = game.get("away_abbr", "")
+
+    # ── Injury analysis (always run — needed for display notes) ───────────────
+    h_inj_shift, h_notes = _injury_shift(home_abbr, injuries, stat_leaders)
+    a_inj_shift, a_notes = _injury_shift(away_abbr, injuries, stat_leaders)
+    injury_notes = h_notes + a_notes
+
+    # B2B flags — for display in both paths
+    h_back_to_back = home_ts.get("is_back_to_back", False)
+    a_back_to_back = away_ts.get("is_back_to_back", False)
+
+    spread_mv = total_mv = 0.0
+
+    if real_odds:
+        # ── REAL ODDS PATH (DraftKings lines via ESPN) ────────────────────────
+        # DK already prices in injuries, B2B, power ratings, public action, etc.
+        # We only layer our server-bet line movement feature on top.
+        raw_spread = real_odds["spread"]   # positive = home favoured (our convention)
+        base_total = real_odds["total"]
+
+        spread_mv, total_mv = _line_movement(home_team, away_team, bet_dist)
+        raw_spread += spread_mv
+        base_total += total_mv
+
+        spread = round(raw_spread * 2) / 2
+        spread = max(-24.0, min(24.0, spread))
+        total  = round(base_total * 2) / 2
+
+        # Use real DK moneylines; derive from spread only if ESPN omits them
+        h_ml = real_odds.get("home_ml")
+        a_ml = real_odds.get("away_ml")
+        if h_ml is None or a_ml is None:
+            spread_abs     = abs(spread)
+            fav_ml, dog_ml = _ml_from_spread(spread_abs)
+            h_ml, a_ml     = (fav_ml, dog_ml) if spread >= 0 else (dog_ml, fav_ml)
+            if spread_abs < 0.5:
+                h_ml = a_ml = -110
+
+        # Real DK spread vig (e.g. -102/-118 instead of flat -110/-110)
+        h_spread_price = real_odds.get("home_spread_odds", -110) or -110
+        a_spread_price = real_odds.get("away_spread_odds", -110) or -110
+
+        # Real DK totals vig
+        over_price  = real_odds.get("over_odds",  -110) or -110
+        under_price = real_odds.get("under_odds", -110) or -110
+
+        h_power = a_power = 0.5   # not computed in real-odds path
+
+        # Opening line: seed from DK's real opening spread when available so
+        # line-movement display is relative to the actual book open, not our
+        # first computed value.
+        real_open = real_odds.get("opening_spread")
+        if real_open is not None and game["event_id"] not in _opening_lines:
+            _opening_lines[game["event_id"]] = {
+                "spread": real_open,
+                "total":  real_odds["total"],
+            }
+
+        record_opening_line(game["event_id"], spread, total)
+        opening        = get_opening_line(game["event_id"]) or {}
+        opening_spread = opening.get("spread", spread)
+        opening_total  = opening.get("total",  total)
+
+        # Public-action vig boost on top of real ML
+        h2h_money = bet_dist.get(home_team, 0.0) + bet_dist.get(away_team, 0.0)
+        if h2h_money >= 50:
+            home_pct = bet_dist.get(home_team, 0.0) / h2h_money
+            away_pct = 1.0 - home_pct
+            if home_pct >= 0.65:
+                h_ml -= _public_vig_boost(home_pct)
+            elif away_pct >= 0.65:
+                a_ml -= _public_vig_boost(away_pct)
+
+        # Totals public-action vig boost
+        ou_money = bet_dist.get("Over", 0.0) + bet_dist.get("Under", 0.0)
+        if ou_money >= 50:
+            over_pct  = bet_dist.get("Over",  0.0) / ou_money
+            under_pct = 1.0 - over_pct
+            if over_pct >= 0.65:
+                boost       = _public_vig_boost(over_pct)
+                over_price  -= boost
+                under_price  = min(under_price + boost - 2, -102)
+            elif under_pct >= 0.65:
+                boost       = _public_vig_boost(under_pct)
+                under_price -= boost
+                over_price   = min(over_price + boost - 2, -102)
+
+        if abs(spread_mv) >= 0.5 or abs(total_mv) >= 0.5:
+            injury_notes.append("📊 Line has moved due to betting action on this server.")
+
+        return {
+            "h2h": {home_team: h_ml, away_team: a_ml},
+            "spreads": {
+                home_team: {"price": h_spread_price, "point": -spread},
+                away_team: {"price": a_spread_price, "point":  spread},
+            },
+            "totals": {
+                "Over":  {"price": over_price,  "point": total},
+                "Under": {"price": under_price, "point": total},
+            },
+            "injury_notes": injury_notes,
+            "_meta": {
+                "spread":           spread,
+                "total":            total,
+                "opening_spread":   opening_spread,
+                "opening_total":    opening_total,
+                "spread_move":      round(spread - opening_spread, 1),
+                "total_move":       round(total  - opening_total,  1),
+                "h_power":          0.5,
+                "a_power":          0.5,
+                "h_back_to_back":   h_back_to_back,
+                "a_back_to_back":   a_back_to_back,
+                "spread_moved":     spread_mv,
+                "total_moved":      total_mv,
+                "real_odds":        True,
+            },
+        }
+
+    # ── SYNTHETIC FALLBACK PATH ───────────────────────────────────────────────
+    # Used when ESPN hasn't posted DraftKings odds yet.
 
     # ── Parse records from game ───────────────────────────────────────────────
-    hw,  hl  = _parse_record(game.get("home_record",       "0-0"))
-    aw,  al  = _parse_record(game.get("away_record",       "0-0"))
-    hh_w, hh_l = _parse_record(game.get("home_home_record","0-0"))
-    ar_w, ar_l = _parse_record(game.get("away_road_record","0-0"))
+    hw,  hl    = _parse_record(game.get("home_record",        "0-0"))
+    aw,  al    = _parse_record(game.get("away_record",        "0-0"))
+    hh_w, hh_l = _parse_record(game.get("home_home_record",  "0-0"))
+    ar_w, ar_l = _parse_record(game.get("away_road_record",  "0-0"))
     h_l10w = game.get("home_last10_wins", 5)
     a_l10w = game.get("away_last10_wins", 5)
 
@@ -440,30 +649,25 @@ def generate_odds_for_game(
     a_papg = away_ts.get("papg")
 
     if h_ppg and h_papg and a_ppg and a_papg:
-        # Vegas-style power rating: avg of team's offence vs opponent's defence
         h_expected = (h_ppg + a_papg) / 2
         a_expected = (a_ppg + h_papg) / 2
         raw_spread = h_expected - a_expected + HOME_COURT_ADV
     else:
-        # Fallback: pure win-percentage spread (~4% win-pct gap per point)
         raw_spread = (h_power - a_power) * 25 + HOME_COURT_ADV
 
     # ── Back-to-back penalty (-2.5 pts for team on B2B) ──────────────────────
-    if home_ts.get("is_back_to_back"):
+    if h_back_to_back:
         raw_spread -= 2.5
-    if away_ts.get("is_back_to_back"):
+    if a_back_to_back:
         raw_spread += 2.5
 
-    # ── Injury adjustment ─────────────────────────────────────────────────────
-    h_inj_shift, h_notes = _injury_shift(home_abbr, injuries, stat_leaders)
-    a_inj_shift, a_notes = _injury_shift(away_abbr, injuries, stat_leaders)
-    injury_notes = h_notes + a_notes
-    raw_spread  -= h_inj_shift
-    raw_spread  += a_inj_shift
+    # ── Injury line adjustment (synthetic only — real books do this already) ──
+    raw_spread -= h_inj_shift
+    raw_spread += a_inj_shift
 
     # ── Line movement ─────────────────────────────────────────────────────────
     spread_mv, total_mv = _line_movement(home_team, away_team, bet_dist)
-    raw_spread += spread_mv   # positive = home favoured more → home side more expensive
+    raw_spread += spread_mv
 
     # ── Round to nearest 0.5, clamp ──────────────────────────────────────────
     spread = round(raw_spread * 2) / 2
@@ -473,16 +677,15 @@ def generate_odds_for_game(
     spread_abs = abs(spread)
     fav_ml, dog_ml = _ml_from_spread(spread_abs)
 
-    if spread >= 0:   # home is favourite (or PK)
+    if spread >= 0:
         h_ml, a_ml = fav_ml, dog_ml
-    else:             # away is favourite
+    else:
         h_ml, a_ml = dog_ml, fav_ml
 
-    if spread_abs < 0.5:  # pick'em
+    if spread_abs < 0.5:
         h_ml = a_ml = -110
 
     # ── Public action vig boost ───────────────────────────────────────────────
-    # When the server's bettors heavily lean one side, charge that side extra vig
     h2h_money = bet_dist.get(home_team, 0.0) + bet_dist.get(away_team, 0.0)
     if h2h_money >= 50:
         home_pct = bet_dist.get(home_team, 0.0) / h2h_money
@@ -500,16 +703,12 @@ def generate_odds_for_game(
     else:
         base_total = 225.0 + (h_power + a_power - 1.0) * 10
 
-    # Back-to-back teams score fewer points
-    if home_ts.get("is_back_to_back"):
+    if h_back_to_back:
         base_total -= 2.0
-    if away_ts.get("is_back_to_back"):
+    if a_back_to_back:
         base_total -= 2.0
 
-    # Injury total impact
     base_total -= (h_inj_shift + a_inj_shift) * 2.5
-
-    # Line movement
     base_total += total_mv
 
     total = round(base_total * 2) / 2
@@ -543,7 +742,6 @@ def generate_odds_for_game(
     opening_spread = opening.get("spread", spread)
     opening_total  = opening.get("total",  total)
 
-    # ── Line movement note ────────────────────────────────────────────────────
     if abs(spread_mv) >= 0.5 or abs(total_mv) >= 0.5:
         injury_notes.append("📊 Line has moved due to betting action on this server.")
 
@@ -570,10 +768,11 @@ def generate_odds_for_game(
             "total_move":       round(total  - opening_total,  1),
             "h_power":          round(h_power, 3),
             "a_power":          round(a_power, 3),
-            "h_back_to_back":   home_ts.get("is_back_to_back", False),
-            "a_back_to_back":   away_ts.get("is_back_to_back", False),
+            "h_back_to_back":   h_back_to_back,
+            "a_back_to_back":   a_back_to_back,
             "spread_moved":     spread_mv,
             "total_moved":      total_mv,
+            "real_odds":        False,
         },
     }
 
@@ -861,7 +1060,195 @@ class OddsFetcher:
         # Completed game box scores (never expire — completed game stats don't change)
         self._boxscore_cache: Dict[str, Dict] = {}
 
+        # Per-game DraftKings pickcenter (real game odds from ESPN): {event_id: parsed_dict}
+        self._pickcenter_cache: Dict[str, Dict] = {}
+        self._pickcenter_ts:    Dict[str, float] = {}
+
+        # Per-game DraftKings player props (real prop lines from ESPN propBets endpoint)
+        self._props_dk_cache: Dict[str, Dict] = {}
+        self._props_dk_ts:    Dict[str, float] = {}
+
+        # Season-long ESPN athlete ID → display name (never expires within a session)
+        self._athlete_cache: Dict[str, str] = {}
+
     # ── Session ───────────────────────────────────────────────────────────────
+
+    async def _get_pickcenter(self, event_id: str) -> Optional[Dict]:
+        """Fetch real DraftKings odds from ESPN game summary's pickcenter section.
+
+        Uses a 2-minute TTL so lines stay fresh during active betting windows.
+        Returns a parsed real_odds dict (same shape as _parse_pickcenter output)
+        or None if the game hasn't had lines posted yet.
+        """
+        now = time.monotonic()
+        cached_ts = self._pickcenter_ts.get(event_id, 0.0)
+        if event_id in self._pickcenter_cache and now - cached_ts < GAMES_TTL:
+            return self._pickcenter_cache[event_id]
+
+        session = await self._get_session()
+        try:
+            async with session.get(
+                ESPN_SUMMARY,
+                params={"event": event_id},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+
+            pc_list = data.get("pickcenter") or []
+            if not pc_list:
+                return None
+
+            # Prefer DraftKings provider; fall back to first available
+            pc: Optional[Dict] = None
+            for p in pc_list:
+                pname = (p.get("provider", {}).get("name") or "").lower()
+                if "draft" in pname or pc is None:
+                    pc = p
+                    if "draft" in pname:
+                        break
+
+            if not pc:
+                return None
+
+            result = _parse_pickcenter(pc)
+            if result:
+                self._pickcenter_cache[event_id] = result
+                self._pickcenter_ts[event_id]    = now
+            return result
+        except Exception:
+            return None
+
+    async def _get_player_props_dk(self, event_id: str) -> Optional[Dict[str, Dict]]:
+        """Fetch real DraftKings player prop lines from ESPN's propBets endpoint.
+
+        Returns {player_name: {pts, pts_over, pts_under, reb, reb_over, reb_under,
+                               ast, ast_over, ast_under, pra, pra_over, pra_under}}
+        or None when the endpoint is unavailable.
+
+        team_abbr, tier, and status are injected by get_game_with_odds using the
+        roster and injury data already fetched in that call.
+        """
+        now = time.monotonic()
+        if (
+            event_id in self._props_dk_cache
+            and now - self._props_dk_ts.get(event_id, 0.0) < GAMES_TTL
+        ):
+            return self._props_dk_cache[event_id]
+
+        session = await self._get_session()
+        try:
+            url = ESPN_PROPS_BASE.format(eid=event_id)
+            async with session.get(
+                url,
+                params={"lang": "en", "region": "us", "limit": 600},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+
+            items: List[Dict] = data.get("items") or []
+            if not items:
+                return None
+
+            # ── Collect unique athlete $ref URLs ──────────────────────────────
+            athlete_refs: Dict[str, str] = {}   # aid → base URL (no query string)
+            for item in items:
+                ref = (item.get("athlete") or {}).get("$ref", "")
+                m = _AID_RE.search(ref)
+                if m:
+                    aid = m.group(1)
+                    if aid not in athlete_refs:
+                        athlete_refs[aid] = ref.split("?")[0]
+
+            # ── Resolve uncached athlete IDs → display names in parallel ──────
+            uncached = [aid for aid in athlete_refs if aid not in self._athlete_cache]
+            if uncached:
+                async def _fetch_name(aid: str, ref_url: str) -> None:
+                    try:
+                        async with session.get(
+                            ref_url,
+                            params={"lang": "en", "region": "us"},
+                            timeout=aiohttp.ClientTimeout(total=8),
+                        ) as r:
+                            if r.status == 200:
+                                ad = await r.json(content_type=None)
+                                name = (
+                                    ad.get("displayName")
+                                    or ad.get("fullName")
+                                    or ad.get("shortName")
+                                    or ""
+                                )
+                                if name:
+                                    self._athlete_cache[aid] = name
+                    except Exception:
+                        pass
+
+                await asyncio.gather(
+                    *[_fetch_name(a, athlete_refs[a]) for a in uncached]
+                )
+
+            # ── Group items by (player_name, stat_key) ────────────────────────
+            # ESPN returns items in order: for each (athlete, type) pair there are
+            # exactly 2 entries — first is the OVER, second is the UNDER.
+            grouped: Dict[str, Dict[str, List[Dict]]] = {}
+            for item in items:
+                ref = (item.get("athlete") or {}).get("$ref", "")
+                m = _AID_RE.search(ref)
+                if not m:
+                    continue
+                name = self._athlete_cache.get(m.group(1))
+                if not name:
+                    continue
+                type_name = (item.get("type") or {}).get("name", "")
+                stat_key  = _PROP_TYPE_MAP.get(type_name)
+                if not stat_key:
+                    continue
+                grouped.setdefault(name, {}).setdefault(stat_key, []).append(item)
+
+            # ── Build prop entries ─────────────────────────────────────────────
+            def _parse_dk_odds(item: Dict) -> int:
+                raw = (item.get("odds") or {}).get("american", {}).get("value", "-110")
+                try:
+                    return int(str(raw).replace("+", ""))
+                except (ValueError, TypeError):
+                    return -110
+
+            props: Dict[str, Dict] = {}
+            for player_name, stat_map in grouped.items():  # noqa: E501
+                entry: Dict[str, Any] = {}
+                for stat_key, sitems in stat_map.items():
+                    if not sitems:
+                        continue
+                    over_item  = sitems[0]
+                    under_item = sitems[1] if len(sitems) > 1 else sitems[0]
+
+                    # Line from the current target; fall back to odds.total field
+                    line_raw = (
+                        (over_item.get("current") or {}).get("target", {}).get("value")
+                        or (over_item.get("odds")   or {}).get("total",  {}).get("value")
+                    )
+                    if line_raw is None:
+                        continue
+                    line = float(line_raw)
+                    if line < 0.5:
+                        continue
+
+                    entry[stat_key]            = line
+                    entry[f"{stat_key}_over"]  = _parse_dk_odds(over_item)
+                    entry[f"{stat_key}_under"] = _parse_dk_odds(under_item)
+
+                if any(k in entry for k in _PROP_TYPE_MAP.values()):
+                    props[player_name] = entry
+
+            if props:
+                self._props_dk_cache[event_id] = props
+                self._props_dk_ts[event_id]    = now
+            return props or None
+        except Exception:
+            return None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -1716,6 +2103,8 @@ class OddsFetcher:
             summary_roster,
             home_last5, away_last5,
             home_player_pool, away_player_pool,
+            real_odds,
+            dk_props_raw,
         ) = await asyncio.gather(
             self.get_injuries(),
             self.get_stat_leaders(),
@@ -1728,6 +2117,8 @@ class OddsFetcher:
             self.get_player_last5(away_abbr),
             self.get_team_player_pool(home_abbr),
             self.get_team_player_pool(away_abbr),
+            self._get_pickcenter(event_id),
+            self._get_player_props_dk(event_id),
         )
 
         # ── Build props player pool ────────────────────────────────────────────
@@ -1961,8 +2352,49 @@ class OddsFetcher:
                 if raw_status in ("questionable", "doubtful", "day-to-day", "dtd"):
                     questionable_players.add(pname_inj)
 
-        odds  = generate_odds_for_game(game, injuries, stat_leaders, home_ts, away_ts, bet_dist)
-        props = generate_player_props_for_game(game, props_pool, questionable_players, injury_map)
+        odds  = generate_odds_for_game(game, injuries, stat_leaders, home_ts, away_ts, bet_dist, real_odds=real_odds)
+
+        # ── Real DraftKings props (from ESPN propBets endpoint) ────────────────
+        if dk_props_raw:
+            # Build a lowercase name → canonical name index from props_pool so we
+            # can match ESPN display names (e.g. "LeBron James") to our pool keys.
+            pool_lower: Dict[str, str] = {k.lower(): k for k in props_pool}
+            # Injury map keyed by lowercase name for case-insensitive lookups
+            inj_lower: Dict[str, str] = {k.lower(): v for k, v in injury_map.items()}
+
+            real_props: Dict[str, Any] = {}
+            for pname, pentry in dk_props_raw.items():
+                pname_lc   = pname.lower()
+                inj_status = inj_lower.get(pname_lc, "active")
+                if inj_status == "out":
+                    continue  # DNP — omit entirely
+
+                # Team attribution: prefer props_pool (has team_abbr from roster data).
+                team_abbr_val = ""
+                pool_key = pool_lower.get(pname_lc)
+                if pool_key:
+                    team_abbr_val = props_pool[pool_key].get("team_abbr", "")
+                if not team_abbr_val:
+                    # Fall back to summary_roster (built from ESPN boxscore participants)
+                    sr = (summary_roster or {})
+                    sr_entry = sr.get(pname) or sr.get(pool_key or "")
+                    if sr_entry:
+                        team_abbr_val = sr_entry.get("team_abbr", "")
+
+                # Tier from real DK pts line (more accurate than season average)
+                dk_pts = pentry.get("pts")
+                tier   = _player_tier(dk_pts) if dk_pts is not None else 3
+
+                real_props[pname] = {
+                    **pentry,
+                    "team_abbr": team_abbr_val,
+                    "tier":      tier,
+                    "status":    inj_status,
+                }
+            props: Dict[str, Any] = real_props
+        else:
+            # Fallback: synthetic props from season-average pool
+            props = generate_player_props_for_game(game, props_pool, questionable_players, injury_map)
 
         # Build public betting action percentages for UI display
         h2h_money = bet_dist.get(game["home_team"], 0.0) + bet_dist.get(game["away_team"], 0.0)
@@ -2292,7 +2724,7 @@ def evaluate_bet(
 
     elif bet_type == "totals":
         if point is None:
-            return "lost"
+            return "push"  # missing line data → refund rather than unfair loss (matches spreads)
         total = home_score + away_score
         if selection == "Over":
             if total > point:  return "won"
