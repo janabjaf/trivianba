@@ -27,10 +27,19 @@ ESPN_PROPS_BASE     = (
 
 # ── Prop-type name → internal stat key ───────────────────────────────────────
 _PROP_TYPE_MAP: Dict[str, str] = {
+    # Core stats
     "Total Points":                        "pts",
     "Total Rebounds":                      "reb",
     "Total Assists":                       "ast",
+    # Combo stats
     "Total Points, Rebounds, and Assists": "pra",
+    "Total Points and Rebounds":           "pr",
+    "Total Points and Assists":            "pa",
+    "Total Assists and Rebounds":          "ar",
+    # Counting stats
+    "Total 3-Point Field Goals":           "threes",
+    "Total Steals":                        "stl",
+    "Total Blocks":                        "blk",
 }
 
 # ── Pre-compiled regex for ESPN athlete IDs in $ref URLs ─────────────────────
@@ -988,6 +997,17 @@ def _parse_espn_event(event: Dict) -> Optional[Dict]:
         h_l10_wins, _ = _parse_record(h_last10)
         a_l10_wins, _ = _parse_record(a_last10)
 
+        home_abbr_raw = _canon_abbr(home["team"].get("abbreviation", "").upper())
+        away_abbr_raw = _canon_abbr(away["team"].get("abbreviation", "").upper())
+
+        # Team logos — use ESPN's own CDN URL from the response when available,
+        # falling back to the standard abbreviated path which is always valid.
+        def _team_logo(team_block: Dict, abbr: str) -> str:
+            url = team_block["team"].get("logo") or ""
+            if url and url.startswith("http"):
+                return url
+            return f"https://a.espncdn.com/i/teamlogos/nba/500/{abbr.lower()}.png"
+
         return {
             "event_id":            event["id"],
             "name":                event.get("name", ""),
@@ -995,8 +1015,10 @@ def _parse_espn_event(event: Dict) -> Optional[Dict]:
             "commence_time":       event.get("date", ""),
             "home_team":           home["team"]["displayName"],
             "away_team":           away["team"]["displayName"],
-            "home_abbr":           _canon_abbr(home["team"].get("abbreviation", "").upper()),
-            "away_abbr":           _canon_abbr(away["team"].get("abbreviation", "").upper()),
+            "home_abbr":           home_abbr_raw,
+            "away_abbr":           away_abbr_raw,
+            "home_logo":           _team_logo(home, home_abbr_raw),
+            "away_logo":           _team_logo(away, away_abbr_raw),
             "home_record":         home_record,
             "away_record":         away_record,
             "home_home_record":    home_home_record,
@@ -1190,6 +1212,14 @@ class OddsFetcher:
                     *[_fetch_name(a, athlete_refs[a]) for a in uncached]
                 )
 
+            # ── Build name → ESPN athlete ID map (for headshot URLs) ─────────
+            # Only include athletes that actually appear in this event's prop items.
+            name_to_aid: Dict[str, str] = {
+                self._athlete_cache[aid]: aid
+                for aid in athlete_refs
+                if aid in self._athlete_cache
+            }
+
             # ── Group items by (player_name, stat_key) ────────────────────────
             # ESPN returns items in order: for each (athlete, type) pair there are
             # exactly 2 entries — first is the OVER, second is the UNDER.
@@ -1241,6 +1271,9 @@ class OddsFetcher:
                     entry[f"{stat_key}_under"] = _parse_dk_odds(under_item)
 
                 if any(k in entry for k in _PROP_TYPE_MAP.values()):
+                    # Store ESPN athlete ID so callers can build headshot URLs:
+                    # https://a.espncdn.com/i/headshots/nba/players/full/{athlete_id}.png
+                    entry["athlete_id"] = name_to_aid.get(player_name, "")
                     props[player_name] = entry
 
             if props:
@@ -2356,11 +2389,20 @@ class OddsFetcher:
 
         # ── Real DraftKings props (from ESPN propBets endpoint) ────────────────
         if dk_props_raw:
-            # Build a lowercase name → canonical name index from props_pool so we
-            # can match ESPN display names (e.g. "LeBron James") to our pool keys.
+            # ── Team attribution: use already-fetched rosters (keyed by ESPN displayName,
+            # the exact same name source as the propBets athlete endpoint).
+            # This is far more reliable than props_pool cross-reference which can fail on
+            # minor name differences like "P.J. Washington" vs "PJ Washington".
+            roster_team_map: Dict[str, str] = {}
+            for pname_r in (home_roster or {}):
+                roster_team_map[pname_r.lower()] = home_abbr
+            for pname_r in (away_roster or {}):
+                roster_team_map[pname_r.lower()] = away_abbr
+
+            # Fallback indexes for players missing from the ESPN team roster endpoint
             pool_lower: Dict[str, str] = {k.lower(): k for k in props_pool}
-            # Injury map keyed by lowercase name for case-insensitive lookups
-            inj_lower: Dict[str, str] = {k.lower(): v for k, v in injury_map.items()}
+            sr_lower: Dict[str, str]   = {k.lower(): k for k in (summary_roster or {})}
+            inj_lower: Dict[str, str]  = {k.lower(): v for k, v in injury_map.items()}
 
             real_props: Dict[str, Any] = {}
             for pname, pentry in dk_props_raw.items():
@@ -2369,17 +2411,18 @@ class OddsFetcher:
                 if inj_status == "out":
                     continue  # DNP — omit entirely
 
-                # Team attribution: prefer props_pool (has team_abbr from roster data).
-                team_abbr_val = ""
-                pool_key = pool_lower.get(pname_lc)
-                if pool_key:
-                    team_abbr_val = props_pool[pool_key].get("team_abbr", "")
+                # Priority 1: direct roster match (most reliable)
+                team_abbr_val = roster_team_map.get(pname_lc, "")
+                # Priority 2: props_pool (season stats data, different name normalisation)
                 if not team_abbr_val:
-                    # Fall back to summary_roster (built from ESPN boxscore participants)
-                    sr = (summary_roster or {})
-                    sr_entry = sr.get(pname) or sr.get(pool_key or "")
-                    if sr_entry:
-                        team_abbr_val = sr_entry.get("team_abbr", "")
+                    pool_key = pool_lower.get(pname_lc)
+                    if pool_key:
+                        team_abbr_val = props_pool[pool_key].get("team_abbr", "")
+                # Priority 3: summary_roster (ESPN boxscore participants)
+                if not team_abbr_val:
+                    sr_key = sr_lower.get(pname_lc)
+                    if sr_key:
+                        team_abbr_val = (summary_roster or {})[sr_key].get("team_abbr", "")
 
                 # Tier from real DK pts line (more accurate than season average)
                 dk_pts = pentry.get("pts")
@@ -2605,10 +2648,13 @@ class OddsFetcher:
                     # "fieldGoalsMade-fieldGoalsAttempted" that can't be floated.
                     raw_labels = stat_group.get("labels") or stat_group.get("names") or []
                     labels     = [str(l).upper() for l in raw_labels]
-                    pts_idx = next((i for i, l in enumerate(labels) if l == "PTS"), -1)
-                    reb_idx = next((i for i, l in enumerate(labels) if l == "REB"), -1)
-                    ast_idx = next((i for i, l in enumerate(labels) if l == "AST"), -1)
-                    min_idx = next((i for i, l in enumerate(labels) if l == "MIN"), -1)
+                    pts_idx    = next((i for i, l in enumerate(labels) if l == "PTS"),  -1)
+                    reb_idx    = next((i for i, l in enumerate(labels) if l == "REB"),  -1)
+                    ast_idx    = next((i for i, l in enumerate(labels) if l == "AST"),  -1)
+                    min_idx    = next((i for i, l in enumerate(labels) if l == "MIN"),  -1)
+                    threes_idx = next((i for i, l in enumerate(labels) if l == "3PM"),  -1)
+                    stl_idx    = next((i for i, l in enumerate(labels) if l == "STL"),  -1)
+                    blk_idx    = next((i for i, l in enumerate(labels) if l == "BLK"),  -1)
 
                     for athlete_entry in stat_group.get("athletes") or []:
                         pname     = (athlete_entry.get("athlete") or {}).get("displayName", "")
@@ -2642,14 +2688,20 @@ class OddsFetcher:
                         pts     = _gs(pts_idx)
                         reb     = _gs(reb_idx)
                         ast     = _gs(ast_idx)
+                        threes  = _gs(threes_idx)
+                        stl     = _gs(stl_idx)
+                        blk     = _gs(blk_idx)
                         minutes = _parse_min(min_idx)
-                        # If ESPN omits the MIN column (min_idx == -1), fall back
-                        # to stats: any player who recorded a stat obviously played.
-                        played  = minutes > 0 or (min_idx < 0 and (pts + reb + ast) > 0)
+                        played  = minutes > 0 or (
+                            min_idx < 0 and (pts + reb + ast + threes + stl + blk) > 0
+                        )
                         stat_map[pname] = {
                             "pts":    pts,
                             "reb":    reb,
                             "ast":    ast,
+                            "threes": threes,
+                            "stl":    stl,
+                            "blk":    blk,
                             "played": played,
                         }
 
@@ -2685,8 +2737,16 @@ def fmt_prop_selection(selection: str) -> str:
     if len(parts) == 3:
         pname, stat, direction = parts
         stat_labels = {
-            "pts": "Points", "reb": "Rebounds",
-            "ast": "Assists", "pra": "Pts+Reb+Ast",
+            "pts":    "Points",
+            "reb":    "Rebounds",
+            "ast":    "Assists",
+            "pra":    "Pts+Reb+Ast",
+            "pr":     "Pts+Reb",
+            "pa":     "Pts+Ast",
+            "ar":     "Ast+Reb",
+            "threes": "3-Pointers Made",
+            "stl":    "Steals",
+            "blk":    "Blocks",
         }
         return f"{pname} — {stat_labels.get(stat, stat)} {direction}"
     return selection
@@ -2764,9 +2824,12 @@ def evaluate_bet(
         # regardless of what the played flag says (guards against MIN parse failures).
         actually_played = (
             pstat.get("played", True)
-            or pstat.get("pts", 0.0) > 0
-            or pstat.get("reb", 0.0) > 0
-            or pstat.get("ast", 0.0) > 0
+            or pstat.get("pts",    0.0) > 0
+            or pstat.get("reb",    0.0) > 0
+            or pstat.get("ast",    0.0) > 0
+            or pstat.get("threes", 0.0) > 0
+            or pstat.get("stl",    0.0) > 0
+            or pstat.get("blk",    0.0) > 0
         )
         if not actually_played:
             return "no_action"
@@ -2778,10 +2841,28 @@ def evaluate_bet(
         elif stat == "ast":
             actual = _first(pstat, ["assists", "ast"])
         elif stat == "pra":
-            pts = _first(pstat, ["points",   "pts"])  or 0.0
-            reb = _first(pstat, ["rebounds", "reb"])  or 0.0
-            ast = _first(pstat, ["assists",  "ast"])  or 0.0
+            pts = _first(pstat, ["points",   "pts"]) or 0.0
+            reb = _first(pstat, ["rebounds", "reb"]) or 0.0
+            ast = _first(pstat, ["assists",  "ast"]) or 0.0
             actual = pts + reb + ast
+        elif stat == "pr":
+            pts = _first(pstat, ["points",   "pts"]) or 0.0
+            reb = _first(pstat, ["rebounds", "reb"]) or 0.0
+            actual = pts + reb
+        elif stat == "pa":
+            pts = _first(pstat, ["points",  "pts"]) or 0.0
+            ast = _first(pstat, ["assists", "ast"]) or 0.0
+            actual = pts + ast
+        elif stat == "ar":
+            reb = _first(pstat, ["rebounds", "reb"]) or 0.0
+            ast = _first(pstat, ["assists",  "ast"]) or 0.0
+            actual = reb + ast
+        elif stat == "threes":
+            actual = _first(pstat, ["threes", "3pm", "threepointersmade"])
+        elif stat == "stl":
+            actual = _first(pstat, ["stl", "steals"])
+        elif stat == "blk":
+            actual = _first(pstat, ["blk", "blocks"])
         else:
             return "push"
         if actual is None:

@@ -35,10 +35,19 @@ STATUS_EMOJI = {
     "cancelled": "🚫",
 }
 PROP_STAT_LABELS = {
-    "pts": "Points",
-    "reb": "Rebounds",
-    "ast": "Assists",
-    "pra": "Pts+Reb+Ast",
+    # Core
+    "pts":    "Points",
+    "reb":    "Rebounds",
+    "ast":    "Assists",
+    # Combos
+    "pra":    "Pts+Reb+Ast",
+    "pr":     "Pts+Reb",
+    "pa":     "Pts+Ast",
+    "ar":     "Ast+Reb",
+    # Counting
+    "threes": "3-Pointers Made",
+    "stl":    "Steals",
+    "blk":    "Blocks",
 }
 
 
@@ -321,16 +330,14 @@ class BetFlowView(discord.ui.View):
             v = pdata.get(key)
             return str(v) if v is not None else "—"
 
+        _SEL_STATS = [("pts","Pts"),("reb","Reb"),("ast","Ast"),("threes","3PM"),("pra","PRA"),("stl","Stl"),("blk","Blk")]
         for pname, pdata in team_players[:25]:
             tier  = pdata.get("tier", 3)
             is_q  = pdata.get("status", "active") == "questionable"
             emoji = "⭐" if tier == 1 else ("🔵" if tier == 2 else "⚪")
             label = (f"⚠️ {pname} (Q)" if is_q else pname)[:100]
-            desc  = (
-                f"Pts {_stat_str(pdata,'pts')} | Reb {_stat_str(pdata,'reb')} | "
-                f"Ast {_stat_str(pdata,'ast')} | PRA {_stat_str(pdata,'pra')}"
-                + (" | QUESTIONABLE" if is_q else "")
-            )[:100]
+            parts = [f"{sl} {_stat_str(pdata, sk)}" for sk, sl in _SEL_STATS if pdata.get(sk) is not None]
+            desc  = ("  ".join(parts[:5]) + (" ⚠️Q" if is_q else ""))[:100]
             options.append(discord.SelectOption(
                 label=label, description=desc,
                 value=f"__player__{pname}", emoji=emoji,
@@ -715,6 +722,29 @@ class BetFlowView(discord.ui.View):
 
         if self.selected_game:
             g   = self.selected_game
+
+            # ── Team logos / player headshot thumbnail ─────────────────────────
+            if self.selected_type == "player_props" and self.selected_outcome:
+                # Show player headshot after a player prop pick is made
+                raw_sel = self.selected_outcome.get("selection", "")
+                pname_sel = raw_sel.split("|")[0] if raw_sel else ""
+                if pname_sel:
+                    pdata_sel = g.get("player_props", {}).get(pname_sel, {})
+                    aid = pdata_sel.get("athlete_id", "")
+                    if aid:
+                        embed.set_thumbnail(
+                            url=f"https://a.espncdn.com/i/headshots/nba/players/full/{aid}.png"
+                        )
+            if not embed.thumbnail:
+                home_logo = g.get("home_logo", "")
+                away_logo = g.get("away_logo", "")
+                if home_logo:
+                    embed.set_thumbnail(url=home_logo)
+                if away_logo:
+                    embed.set_author(
+                        name=f"{g.get('away_team', '')} (Away)", icon_url=away_logo
+                    )
+
             val = f"**{g['away_team']}** @ **{g['home_team']}**\n{_discord_ts(g['commence_time'])}"
             # Show injury notes if any
             inj_notes = g.get("odds", {}).get("injury_notes", [])
@@ -1179,11 +1209,18 @@ class OddsView(discord.ui.View):
         meta = odds.get("_meta", {})
         pub  = g.get("public_action") or {}
 
+        home_logo = g.get("home_logo", "")
+        away_logo = g.get("away_logo", "")
+
         embed = discord.Embed(
             title=f"📋 Odds Board — {g.get('away_team')} @ {g.get('home_team')}",
             color=discord.Color.dark_gold(),
             description=_discord_ts(g.get("commence_time", "")),
         )
+        if home_logo:
+            embed.set_thumbnail(url=home_logo)
+        if away_logo:
+            embed.set_author(name=f"{g.get('away_team', '')} (Away)", icon_url=away_logo)
 
         # ── Moneyline ─────────────────────────────────────────────────────────
         h2h = odds.get("h2h") or {}
@@ -1262,22 +1299,37 @@ class OddsView(discord.ui.View):
         # ── Top props preview ─────────────────────────────────────────────────
         props = g.get("player_props") or {}
         if props:
-            # Only show players that have a pts line (stars/rotation players)
-            pts_players = [(n, d) for n, d in props.items() if d.get("pts") is not None]
-            top_players = sorted(pts_players, key=lambda kv: kv[1].get("tier", 3))[:5]
+            # Show any player that has at least one DK prop line, sorted by tier
+            top_players = sorted(
+                props.items(), key=lambda kv: (kv[1].get("tier", 3), kv[0])
+            )[:8]
             prop_lines = []
+            _PREVIEW_STATS = [
+                ("pts",    "Pts"),
+                ("reb",    "Reb"),
+                ("ast",    "Ast"),
+                ("threes", "3PM"),
+                ("pra",    "PRA"),
+                ("stl",    "Stl"),
+                ("blk",    "Blk"),
+            ]
             for pname, pd in top_players:
-                is_q  = pd.get("status", "active") == "questionable"
-                q_tag = " ⚠️Q" if is_q else ""
-                pts_line = pd.get("pts")
-                pts_o = fmt_odds(pd.get("pts_over", -110))
-                pts_u = fmt_odds(pd.get("pts_under", -110))
-                prop_lines.append(
-                    f"**{pname}**{q_tag}  pts {pts_line}  ({pts_o} / {pts_u})"
-                )
+                is_q   = pd.get("status", "active") == "questionable"
+                q_tag  = "⚠️ " if is_q else ""
+                parts: List[str] = []
+                for skey, slbl in _PREVIEW_STATS:
+                    val = pd.get(skey)
+                    if val is not None:
+                        o = fmt_odds(pd.get(f"{skey}_over",  -110))
+                        u = fmt_odds(pd.get(f"{skey}_under", -110))
+                        parts.append(f"{slbl} **{val}** ({o}/{u})")
+                if parts:
+                    prop_lines.append(
+                        f"{q_tag}**{pname}** — " + "  ·  ".join(parts[:3])
+                    )
             if prop_lines:
                 embed.add_field(
-                    name="🎯 Top Props (Pts)",
+                    name="🎯 DraftKings Player Props",
                     value="\n".join(prop_lines),
                     inline=False,
                 )
@@ -1528,6 +1580,8 @@ class ParlayBuilderView(discord.ui.View):
         )
 
         options: List[discord.SelectOption] = []
+        _PS_STATS = [("pts","Pts"),("reb","Reb"),("ast","Ast"),("threes","3PM"),("pra","PRA"),("stl","Stl"),("blk","Blk")]
+
         def _ps(pdata: dict, key: str) -> str:
             v = pdata.get(key)
             return str(v) if v is not None else "—"
@@ -1537,10 +1591,8 @@ class ParlayBuilderView(discord.ui.View):
             is_q   = pdata.get("status") == "questionable"
             emoji  = "⭐" if tier == 1 else ("🔵" if tier == 2 else "⚪")
             label  = (f"⚠️ {pname} (Q)" if is_q else pname)[:100]
-            desc   = (
-                f"O/U Pts {_ps(pdata,'pts')} | Reb {_ps(pdata,'reb')} | "
-                f"Ast {_ps(pdata,'ast')} | PRA {_ps(pdata,'pra')}"
-            )[:100]
+            parts  = [f"{sl} {_ps(pdata, sk)}" for sk, sl in _PS_STATS if pdata.get(sk) is not None]
+            desc   = ("  ".join(parts[:5]) + (" ⚠️Q" if is_q else ""))[:100]
             options.append(discord.SelectOption(
                 label=label, description=desc, value=pname, emoji=emoji,
             ))
@@ -1562,10 +1614,9 @@ class ParlayBuilderView(discord.ui.View):
         props = (g.get("player_props") or {})
         pname = self.building_player or ""
         pdata = props.get(pname, {})
-        stat_labels = {"pts": "Points", "reb": "Rebounds", "ast": "Assists", "pra": "Pts+Reb+Ast"}
         is_q = pdata.get("status") == "questionable"
         options: List[discord.SelectOption] = []
-        for stat, label in stat_labels.items():
+        for stat, label in PROP_STAT_LABELS.items():
             line_val = pdata.get(stat)
             if line_val is None:
                 continue
