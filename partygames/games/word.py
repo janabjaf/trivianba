@@ -383,12 +383,12 @@ class EscapeRoomRace(BaseGame):
 
             correct_answer = puzzle["answer"].lower()
             answerers = []
-            end_time = asyncio.get_event_loop().time() + 60
+            end_time = asyncio.get_running_loop().time() + 60
 
-            while asyncio.get_event_loop().time() < end_time and len(answerers) < 2:
+            while asyncio.get_running_loop().time() < end_time and len(answerers) < 2:
                 if self.is_stopped():
                     return
-                remaining = end_time - asyncio.get_event_loop().time()
+                remaining = end_time - asyncio.get_running_loop().time()
                 msg = await self.listen_for_answer(
                     check=lambda m: m.channel == self.channel and m.author in self.players
                                    and m.author not in answerers
@@ -624,12 +624,12 @@ class Wavelength(BaseGame):
             await self.channel.send(embed=guess_e)
 
             guesses: Dict[discord.Member, int] = {}
-            end_time = asyncio.get_event_loop().time() + 20
+            end_time = asyncio.get_running_loop().time() + 20
 
-            while asyncio.get_event_loop().time() < end_time:
+            while asyncio.get_running_loop().time() < end_time:
                 if self.is_stopped():
                     return
-                remaining = end_time - asyncio.get_event_loop().time()
+                remaining = end_time - asyncio.get_running_loop().time()
                 msg = await self.listen_for_answer(
                     check=lambda m: (
                         m.channel == self.channel
@@ -736,12 +736,12 @@ class Taboo(BaseGame):
             await self.channel.send(embed=round_e)
 
             guessed = False
-            end_time = asyncio.get_event_loop().time() + 60
+            end_time = asyncio.get_running_loop().time() + 60
 
-            while asyncio.get_event_loop().time() < end_time and not guessed:
+            while asyncio.get_running_loop().time() < end_time and not guessed:
                 if self.is_stopped():
                     return
-                remaining = end_time - asyncio.get_event_loop().time()
+                remaining = end_time - asyncio.get_running_loop().time()
                 msg = await self.listen_for_answer(
                     check=lambda m: m.channel == self.channel and m.author != player and m.author in self.players,
                     timeout=min(remaining, 5.0),

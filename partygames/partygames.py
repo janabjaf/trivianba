@@ -132,8 +132,11 @@ class PartyGames(red_commands.Cog):
             )
         )
 
-        asyncio.create_task(
+        task = asyncio.create_task(
             start_game(game_instance, ctx.channel, self)
+        )
+        task.add_done_callback(
+            lambda t: t.exception() if not t.cancelled() and t.done() else None
         )
 
     # ── /games group ──────────────────────────────────────────────────────────

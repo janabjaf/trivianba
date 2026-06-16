@@ -82,7 +82,7 @@ class TriviaClash(BaseGame):
 
             q_embed = discord.Embed(
                 title=f"🎓 Question {q_num} / 10 — [{q['category']}]",
-                description=f"**{q['question']}**",
+                description=f"**{q['q']}**",
                 color=discord.Color.blurple(),
             )
             if "options" in q:
@@ -269,11 +269,11 @@ class PriceIsRight(BaseGame):
             )
             await self.channel.send(embed=item_e)
 
-            end_time = asyncio.get_event_loop().time() + 30
-            while asyncio.get_event_loop().time() < end_time:
+            end_time = asyncio.get_running_loop().time() + 30
+            while asyncio.get_running_loop().time() < end_time:
                 if self.is_stopped():
                     return
-                remaining = end_time - asyncio.get_event_loop().time()
+                remaining = end_time - asyncio.get_running_loop().time()
                 msg = await self.listen_for_answer(
                     check=lambda m: (
                         m.channel == self.channel
@@ -833,8 +833,8 @@ class TwoTruthsAndALie(BaseGame):
                 view=view,
             )
 
-            end_time = asyncio.get_event_loop().time() + 60
-            while asyncio.get_event_loop().time() < end_time and player not in submissions:
+            end_time = asyncio.get_running_loop().time() + 60
+            while asyncio.get_running_loop().time() < end_time and player not in submissions:
                 if self.is_stopped():
                     return
                 await asyncio.sleep(1)

@@ -48,46 +48,70 @@ async def start_game(
 ) -> None:
     """
     Runs the full game lifecycle: lobby → game → cleanup.
-    Handles cancellation and errors gracefully.
+    Always cleans up active_games on exit, regardless of how the game ends.
     """
     game.channel = channel
     game.cog = cog
 
-    info = game.GAME_INFO
-    started = await run_lobby(game, channel, cog)
-
-    if not started:
-        # Clean up from active games
-        cog.active_games.pop(channel.id, None)
-        return
-
-    # Announce game start
-    start_embed = discord.Embed(
-        title=f"{info['emoji']}  {info['name']} — Starting!",
-        description=f"**{len(game.players)} players** locked in:\n"
-                    + " • ".join(p.display_name for p in game.players)
-                    + "\n\nGet ready…",
-        color=discord.Color.green(),
-    )
-    await channel.send(embed=start_embed)
-    await asyncio.sleep(3)
-
-    game.running = True
     try:
-        await game.run()
+        info = game.GAME_INFO
+        started = await run_lobby(game, channel, cog)
+
+        if not started:
+            return
+
+        # Safety guard — players could have left between run_lobby returning True and here
+        if len(game.players) < info["min_players"]:
+            await channel.send(
+                embed=discord.Embed(
+                    title="❌ Not Enough Players",
+                    description="Not enough players remain. Game cancelled.",
+                    color=discord.Color.red(),
+                )
+            )
+            return
+
+        start_embed = discord.Embed(
+            title=f"{info['emoji']}  {info['name']} — Starting!",
+            description=f"**{len(game.players)} players** locked in:\n"
+                        + " • ".join(p.display_name for p in game.players)
+                        + "\n\nGet ready…",
+            color=discord.Color.green(),
+        )
+        await channel.send(embed=start_embed)
+        await asyncio.sleep(3)
+
+        game.running = True
+        try:
+            await game.run()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            try:
+                await channel.send(
+                    embed=discord.Embed(
+                        title="⚠️ Game Error",
+                        description=f"An unexpected error occurred: `{type(e).__name__}: {e}`\nThe game has ended.",
+                        color=discord.Color.red(),
+                    )
+                )
+            except Exception:
+                pass
+        finally:
+            game.running = False
+
     except asyncio.CancelledError:
         pass
     except Exception as e:
         try:
             await channel.send(
                 embed=discord.Embed(
-                    title="⚠️ Game Error",
-                    description=f"An unexpected error occurred: `{type(e).__name__}`\nThe game has ended.",
+                    title="⚠️ Game Setup Error",
+                    description=f"Failed to start the game: `{type(e).__name__}: {e}`",
                     color=discord.Color.red(),
                 )
             )
         except Exception:
             pass
     finally:
-        game.running = False
         cog.active_games.pop(channel.id, None)

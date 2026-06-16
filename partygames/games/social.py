@@ -1084,10 +1084,10 @@ class AuctionHeist(BaseGame):
             await self.channel.send(embed=art_e)
 
             bids: Dict[discord.Member, int] = {}
-            end_time = asyncio.get_event_loop().time() + 30
+            end_time = asyncio.get_running_loop().time() + 30
 
-            while asyncio.get_event_loop().time() < end_time:
-                remaining = end_time - asyncio.get_event_loop().time()
+            while asyncio.get_running_loop().time() < end_time:
+                remaining = end_time - asyncio.get_running_loop().time()
                 msg = await self.listen_for_answer(
                     check=lambda m: m.channel == self.channel and m.author in self.players
                                    and m.content.strip().replace(",", "").isdigit(),
@@ -1280,13 +1280,13 @@ class Assassin(BaseGame):
         await self.channel.send(embed=intro)
 
         eliminated: List[discord.Member] = []
-        end_time = asyncio.get_event_loop().time() + 600  # 10 minutes
+        end_time = asyncio.get_running_loop().time() + 600  # 10 minutes
 
-        while len(alive) > 1 and asyncio.get_event_loop().time() < end_time:
+        while len(alive) > 1 and asyncio.get_running_loop().time() < end_time:
             if self.is_stopped():
                 return
 
-            remaining_time = end_time - asyncio.get_event_loop().time()
+            remaining_time = end_time - asyncio.get_running_loop().time()
             msg = await self.listen_for_answer(
                 check=lambda m: m.channel == self.channel and m.author in alive and code_word in m.content.lower(),
                 timeout=min(remaining_time, 30),
