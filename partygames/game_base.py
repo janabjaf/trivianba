@@ -133,7 +133,7 @@ class LobbyView(discord.ui.View):
             f"✅ You joined **{g.GAME_INFO['name']}**! ({len(g.players)}/{g.GAME_INFO['max_players']} players)",
             ephemeral=True,
         )
-        await self._refresh()
+        await self.refresh_lobby()
 
     @discord.ui.button(label="🚪  Leave", style=discord.ButtonStyle.red, row=0)
     async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -143,9 +143,9 @@ class LobbyView(discord.ui.View):
             return
         g.players.remove(interaction.user)
         await interaction.response.send_message("You left the game.", ephemeral=True)
-        await self._refresh()
+        await self.refresh_lobby()
 
-    async def _refresh(self):
+    async def refresh_lobby(self):
         if self.message:
             try:
                 await self.message.edit(embed=self.game.make_lobby_embed())
