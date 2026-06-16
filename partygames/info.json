@@ -1,0 +1,15 @@
+{
+    "name": "PartyGames",
+    "short": "35+ party games for Discord — social deduction, trivia, word games, and more.",
+    "description": "Host fun party games right in your Discord server! Features 35+ fully playable games including social deduction, creative writing, word puzzles, and trivia. Use /play to pick a game, a lobby auto-opens, players join, and the game starts in 30 seconds.\n\nIncludes: Identity Theft, Werewolf, Spyfall, Alibi, Fake Artist, Murder Mystery, Auction Heist, Kingmaker, Assassin, Movie Pitch, Chain Reaction, Time Traveler, Hot Take, Emoji Story, Story Time, Debate Club, Quiplash, Personality Swap, Word Bomb, Alphabet Chain, Hangman, Escape Room, 20 Questions, Wavelength, Taboo, Codenames, Trivia Clash, Would You Rather, Price Is Right, Hot Seat, Gladiator Draft, Math Duel, Bingo, Two Truths and a Lie, and Gladiator Tournament.",
+    "end_user_data_statement": "This cog does not store any end user data permanently. All game state is held in memory and cleared when games end.",
+    "hidden": false,
+    "disabled": false,
+    "min_bot_version": "3.5.0",
+    "max_bot_version": "3.5.99",
+    "min_python_version": [3, 8, 0],
+    "requirements": [],
+    "tags": ["fun", "games", "party", "social", "trivia", "werewolf", "jackbox"],
+    "install_msg": "Thanks for installing **PartyGames**!\n\n**Setup:**\n1. Set roles that can start games: `/games setrole @YourRole`\n2. Start a game: `/play` → pick a game from the list\n\n**Admin commands:** `/games end`, `/games setrole`, `/games removerole`, `/games listroles`, `/games status`",
+    "author": ["jaffar21"]
+}
