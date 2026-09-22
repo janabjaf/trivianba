@@ -1,11 +1,11 @@
 {
     "author": ["jaffar21"],
     "name": "NBAFantasy",
-    "short": "Play NBA Fantasy directly in Discord.",
-    "description": "A fully-featured NBA Fantasy cog for Discord where users can draft players, manage their rosters, and compete in leagues.",
-    "install_msg": "Thank you for installing the NBA Fantasy cog. Please make sure to load it using `[p]load nbafantasy`.",
-    "tags": ["nba", "fantasy", "sports", "basketball"],
-    "requirements": [],
+    "short": "Play NBAdex Fantasy — an ESPN-style NBA fantasy league — directly in Discord.",
+    "description": "A fully-featured NBAdex Fantasy cog for Discord: snake drafts, free agency, trades, positional lineups, customizable scoring, live NBA stats/injuries from ESPN, and admin tools. Revamped and ready for the 2026-27 NBA season.",
+    "install_msg": "Thank you for installing NBAdex Fantasy! Load it with `[p]load nbafantasy`, then run `[p]fantasy setup` to turn it on and `[p]fantasy guide` for the full player guide.",
+    "tags": ["nba", "fantasy", "sports", "basketball", "espn", "nbadex"],
+    "requirements": ["requests"],
     "min_bot_version": "3.5.22",
     "end_user_data_statement": "This cog stores discord user IDs to keep track of their fantasy teams and league participation."
 }
