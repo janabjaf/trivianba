@@ -5,6 +5,7 @@ import time
 import datetime
 import requests
 import math
+import re
 from collections import Counter
 
 # ---------------------------------------------------------------------------
@@ -1167,12 +1168,41 @@ class NBAFantasy(commands.Cog):
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/131.0.0.0 Safari/537.36"
-            )
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.espn.com/",
+            "Origin": "https://www.espn.com",
         })
 
+    # The stats provider mirrors most `/apis/site/v2/...` paths on both hosts
+    # below. One host occasionally 403s a given request (rate limiting / edge
+    # node weirdness) while the other serves it fine, so every call to a
+    # mirrored path tries them in order with a couple of retries before
+    # giving up.
+    _STATS_SITE_HOSTS = ("https://site.web.api.espn.com", "https://site.api.espn.com")
+
+    def _get_json_with_fallback(self, path, retries_per_host=2):
+        last_exc = None
+        for host in self._STATS_SITE_HOSTS:
+            url = host + path
+            for attempt in range(retries_per_host):
+                try:
+                    r = self._session.get(url, timeout=30)
+                    if r.status_code in (403, 429, 500, 502, 503) and attempt < retries_per_host - 1:
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                    r.raise_for_status()
+                    return r.json()
+                except Exception as e:
+                    last_exc = e
+                    if attempt < retries_per_host - 1:
+                        time.sleep(1.0)
+        raise last_exc
+
     @staticmethod
-    def _current_espn_season():
-        """ESPN labels a season by the calendar year it ENDS in.
+    def _current_season():
+        """The stats provider labels a season by the calendar year it ENDS in.
         The 2026-27 NBA season (tips off Oct 2026, ends Jun 2027) is season=2027.
         From August onward we treat the *upcoming* season as current so the cog
         is ready for drafts that happen before the season tips off."""
@@ -1185,16 +1215,13 @@ class NBAFantasy(commands.Cog):
         injury/status data on a best-effort basis. A stats/injury fetch failure
         should never wipe out the roster-derived player pool."""
 
-        season = self._current_espn_season()
+        season = self._current_season()
 
         def fetch_rosters():
             """Pull every NBA team, then that team's current roster."""
-            teams_url = (
-                "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams?limit=50"
+            data = self._get_json_with_fallback(
+                "/apis/site/v2/sports/basketball/nba/teams?limit=50"
             )
-            r = self._session.get(teams_url, timeout=30)
-            r.raise_for_status()
-            data = r.json()
 
             team_entries = (
                 data.get("sports", [{}])[0]
@@ -1210,13 +1237,9 @@ class NBAFantasy(commands.Cog):
                 if not team_id:
                     continue
                 try:
-                    ru = (
-                        f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/"
-                        f"teams/{team_id}/roster"
+                    rdata = self._get_json_with_fallback(
+                        f"/apis/site/v2/sports/basketball/nba/teams/{team_id}/roster"
                     )
-                    rr = self._session.get(ru, timeout=30)
-                    rr.raise_for_status()
-                    rdata = rr.json()
                     for ath in rdata.get("athletes", []):
                         try:
                             pid = int(ath.get("id", 0))
@@ -1252,32 +1275,36 @@ class NBAFantasy(commands.Cog):
             cat_maps = {}
 
             while page <= max_pages:
-                try:
-                    r = self._session.get(f"{base}&page={page}", timeout=30)
-                    r.raise_for_status()
-                    data = r.json()
-                    if page == 1:
-                        max_pages = data.get("pagination", {}).get("pages", 1) or 1
-                        for cat in data.get("categories", []):
-                            cat_maps[cat["name"]] = {n: i for i, n in enumerate(cat.get("names", []))}
-                    all_athletes.extend(data.get("athletes", []))
-                    page += 1
-                    time.sleep(1)
-                except Exception as e:
-                    print(f"[NBAdex Fantasy] Stats page {page} failed (non-fatal): {e}")
+                page_ok = False
+                for attempt in range(2):
+                    try:
+                        r = self._session.get(f"{base}&page={page}", timeout=30)
+                        if r.status_code in (403, 429, 500, 502, 503) and attempt == 0:
+                            time.sleep(1.5)
+                            continue
+                        r.raise_for_status()
+                        data = r.json()
+                        if page == 1:
+                            max_pages = data.get("pagination", {}).get("pages", 1) or 1
+                            for cat in data.get("categories", []):
+                                cat_maps[cat["name"]] = {n: i for i, n in enumerate(cat.get("names", []))}
+                        all_athletes.extend(data.get("athletes", []))
+                        page_ok = True
+                        break
+                    except Exception as e:
+                        print(f"[NBAdex Fantasy] Stats page {page} attempt {attempt + 1} failed (non-fatal): {e}")
+                if not page_ok:
                     break
+                page += 1
+                time.sleep(1)
 
             return all_athletes, cat_maps
 
         def fetch_injuries():
             injuries = {}
             try:
-                inj = self._session.get(
-                    "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries",
-                    timeout=30,
-                )
-                inj.raise_for_status()
-                for team_inj in inj.json().get("injuries", []):
+                data = self._get_json_with_fallback("/apis/site/v2/sports/basketball/nba/injuries")
+                for team_inj in data.get("injuries", []):
                     for inj_item in team_inj.get("injuries", []):
                         ath = inj_item.get("athlete", {})
                         if "id" in ath:
@@ -1563,7 +1590,7 @@ class NBAFantasy(commands.Cog):
         """Show the full guide on how to play NBAdex Fantasy."""
         embed = discord.Embed(
             title="🏀 NBAdex Fantasy — Player Guide",
-            description="An ESPN Fantasy-style NBA league, played entirely in Discord. Season: **2026-27**.",
+            description="A fantasy-style NBA league, played entirely in Discord. Season: **2026-27**.",
             color=discord.Color.green(),
         )
         embed.add_field(
@@ -1590,7 +1617,7 @@ class NBAFantasy(commands.Cog):
             value=(
                 "Once the draft ends (or if your league skips drafting), use "
                 "`[p]fantasy freeagents` to browse and add any unowned player — first come, "
-                "first served, just like ESPN's continuous free agency."
+                "first served, continuous free agency."
             ),
             inline=False,
         )
@@ -1598,8 +1625,8 @@ class NBAFantasy(commands.Cog):
             name="4️⃣ Managing Your Team",
             value=(
                 "`[p]fantasy team` shows your roster with dropdowns to **drop** a player or "
-                "**assign** them to a starting slot (PG/SG/SF/PF/C/G/F/UTIL). Slots fill up just "
-                "like ESPN — once a slot type is full you can't stack another player into it, "
+                "**assign** them to a starting slot (PG/SG/SF/PF/C/G/F/UTIL). Slots fill up — "
+                "once a slot type is full you can't stack another player into it, "
                 "they'll sit on the bench instead."
             ),
             inline=False,
@@ -1652,7 +1679,7 @@ class NBAFantasy(commands.Cog):
         rosters = await self.config.guild(ctx.guild).rosters()
         draft_state = await self.config.guild(ctx.guild).draft_state()
         err = self.last_fetch_error
-        season = self._current_espn_season()
+        season = self._current_season()
 
         color = discord.Color.green() if is_active else discord.Color.red()
         embed = discord.Embed(
@@ -1679,9 +1706,10 @@ class NBAFantasy(commands.Cog):
                 inline=False,
             )
 
+        pool_status = f"⚠️ Last update failed ({self._public_error_message_from_str(err)})" if err else "✅ OK"
         embed.add_field(
             name="Player Pool",
-            value=f"{'⚠️ Last fetch failed: ' + err if err else '✅ OK'} ({len(self.players_cache)} players cached)",
+            value=f"{pool_status} ({len(self.players_cache)} players cached)",
             inline=False,
         )
         await ctx.send(embed=embed)
@@ -1696,6 +1724,7 @@ class NBAFantasy(commands.Cog):
         await ctx.send("🏀 **NBAdex Fantasy** is now active! Users can `[p]fantasy join`.")
 
     @fantasy.command(name="settings")
+    @commands.admin_or_permissions(manage_guild=True)
     async def fantasy_settings(self, ctx):
         """View current league settings."""
         slots = await self.config.guild(ctx.guild).team_slots()
@@ -2080,6 +2109,38 @@ class NBAFantasy(commands.Cog):
         msg = await ctx.send(embed=embed, view=view)
         view.message = msg
 
+    @staticmethod
+    def _public_error_message(e):
+        """A short, source-agnostic error summary safe to show in Discord —
+        never leaks the underlying data provider's hostname/URL. Full detail
+        still goes to the console log for whoever hosts the bot."""
+        if isinstance(e, requests.exceptions.Timeout):
+            return "the request timed out"
+        if isinstance(e, requests.exceptions.ConnectionError):
+            return "a connection error occurred"
+        if isinstance(e, requests.exceptions.HTTPError):
+            resp = getattr(e, "response", None)
+            code = resp.status_code if resp is not None else "unknown"
+            return f"the stats provider returned an HTTP {code} error"
+        return "an unexpected error occurred while fetching data"
+
+    @staticmethod
+    def _public_error_message_from_str(s):
+        """Same idea as _public_error_message, but for an error that's
+        already been stringified (and so lost its exception type) — used
+        when displaying self.last_fetch_error, which is stored as text."""
+        if not s:
+            return "an unknown error"
+        low = s.lower()
+        if "timeout" in low or "timed out" in low:
+            return "a timeout"
+        if "connection" in low:
+            return "a connection error"
+        m = re.search(r"\b[45]\d{2}\b", s)
+        if m:
+            return f"an HTTP {m.group(0)} error"
+        return "an unexpected error"
+
     # ── update stats ───────────────────────────────────────────────────────
 
     @fantasy.command(name="update")
@@ -2091,7 +2152,7 @@ class NBAFantasy(commands.Cog):
             await self._fetch_players()
             await self.config.players_cache.set(self.players_cache)
             self.last_fetch_error = None
-            season = self._current_espn_season()
+            season = self._current_season()
             await msg.edit(
                 content=(
                     f"✅ Updated **{len(self.players_cache)}** players for the "
@@ -2099,8 +2160,14 @@ class NBAFantasy(commands.Cog):
                 )
             )
         except Exception as e:
+            print(f"[NBAdex Fantasy] fantasy_update failed: {e}")
             self.last_fetch_error = str(e)
-            await msg.edit(content=f"❌ Fetch failed: {e}. Previous player pool was kept, nothing was lost.")
+            await msg.edit(
+                content=(
+                    f"❌ Fetch failed — {self._public_error_message(e)}. "
+                    "Previous player pool was kept, nothing was lost."
+                )
+            )
 
     # ── forceadd ──────────────────────────────────────────────────────────
 

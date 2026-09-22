@@ -77,6 +77,50 @@ so the visible truncation never silently drops points from a total.
 - The reset confirmation buttons now clear the old "are you sure?" warning
   embed instead of leaving it stacked above the new confirmation text.
 
+### Live fix: ESPN 403 on the team-roster endpoint
+Reported live after deployment: `site.api.espn.com/apis/site/v2/.../teams`
+started returning `403 Forbidden` on some hosting networks. This endpoint
+didn't exist in the original cog — it was only added in this revamp to fix
+the empty-preseason-pool bug — so it was a new single point of failure that
+needed hardening. Fixed by:
+- Trying `site.web.api.espn.com` (the host the stats calls already use
+  successfully) *before* falling back to `site.api.espn.com`, since ESPN
+  mirrors most `/apis/site/v2/...` paths on both hosts.
+- Retrying transient 403/429/5xx responses with backoff before giving up.
+- Adding real browser-style headers (`Referer`, `Origin`, `Accept-Language`)
+  to every request, since some CDN/WAF layers flag requests missing these
+  as bot traffic.
+- Applying the same host-fallback treatment to the injuries endpoint too.
+
+Verified with simulated failures: one host down → recovers via the other;
+both hosts briefly failing → retries before falling through. The existing
+"never wipe the cache on total failure" safety net still applies on top of
+all of this if every attempt is exhausted.
+
+### Branding: ESPN mentions removed from everything user-facing
+- Every Discord-visible string (guide, status, embeds) no longer mentions
+  "ESPN" — it's all just "NBAdex Fantasy" / "the stats provider" now.
+- **Error messages no longer leak the data provider's URL into Discord.**
+  This is exactly the bug from the live 403 report — the raw exception text
+  (which included the full `site.api.espn.com/...` URL) was being posted
+  straight into chat. A new sanitizer now turns that into a short, generic
+  summary ("the stats provider returned an HTTP 403 error") for anything
+  shown in Discord, while the full detail still goes to the console log for
+  whoever hosts the bot.
+- Internal method/variable names renamed to drop "espn" (`_current_season`,
+  `_STATS_SITE_HOSTS`), and comments reworded to say "the stats provider."
+- `info.json`'s tags and description no longer mention ESPN.
+
+**One thing that can't change:** the actual HTTP requests still go to
+`site.api.espn.com` / `site.web.api.espn.com`, because that's genuinely where
+the real NBA rosters/stats/injuries come from — there's no way to fetch real
+data without naming the real host in the request itself. Nobody using the
+bot in Discord will ever see that, though.
+
+### Permissions
+- **`[p]fantasy settings` is now admin-only.** It was previously open to
+  everyone, unlike every other settings-viewing/changing command in the cog.
+
 ### Roster / lineup bugs fixed
 - **Slot overfill prevented.** You could previously assign more players to a
   slot label (e.g. a 4th player into a 3-slot UTIL) than the league allows; the
