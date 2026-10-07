@@ -142,6 +142,72 @@ bot in Discord will ever see that, though.
 - `[p]fantasy setslots` now caps at 15 slots and warns (without deleting data)
   if rosters or a draft already exist when slots are changed mid-season.
 
+### New: Player headshots
+Real NBA player photos now show up across the cog instead of plain text lists:
+- `[p]fantasy player` lookup — big headshot of whichever player you select.
+- `[p]fantasy team` — the large thumbnail is now your **top fantasy-point
+  player's** photo (the manager's own Discord avatar moved to a small icon
+  next to the title instead, so you still see whose team it is).
+- `[p]fantasy freeagents`, `[p]fantasy player`, and `draft board` — the photo
+  of whichever player is currently on top of the visible page, updating as
+  you page through or search.
+- `[p]fantasy standings` — the #1 manager's MVP player's photo.
+- Every transaction log post (FA pickup, drop, draft pick, auto-draft pick,
+  trade accepted) now shows that player's photo.
+- Headshots come from the real photo ESPN's roster data provides when
+  available, and otherwise fall back to the standard ESPN headshot CDN URL
+  pattern, which covers virtually every active player.
+
+### Reliability pass (full code review)
+- **`[p]` prefix bug, fixed everywhere.** Every message the bot actually
+  *sends* — guide, status, team, join, setup, setslots, freeagents, trade
+  accept, newseason, draft setup/start — had the literal text `[p]` hardcoded
+  instead of your server's real prefix. Discord doesn't substitute that on
+  its own (only Red's help formatter does, for a command's docstring), so
+  users were being told to run a command that starts with `[p]`, which
+  doesn't exist. Every one of these now shows your actual prefix.
+- **`draft start` no longer crashes** if you run it again after a draft has
+  already finished (an unguarded index into the pick order caused this).
+- **Auto-draft now survives a bot restart.** If the bot restarts mid-draft
+  while an auto-draft manager is on the clock, a fresh cog load now checks
+  every server's draft state and restarts auto-draft wherever it's needed,
+  instead of leaving that manager waiting forever for something to nudge it.
+- **Hardened the hourly stat refresh against partial failures**, so a bad
+  fetch can no longer silently erase real data:
+  - If some (not all) teams' roster calls fail, those teams' existing players
+    are kept from the last good snapshot instead of ~15 players per failed
+    team vanishing from the pool.
+  - If the stats leaderboard call fails or returns something that looks
+    wrong mid-season, last-known stats are carried forward instead of every
+    player's FP getting zeroed for that refresh (which would have let
+    someone bank a bogus "earned 0 FP" drop or start a new pickup at the
+    wrong baseline).
+  - Same idea for injuries: a failed injuries fetch keeps each player's last
+    known status instead of clearing everyone's OUT flag.
+
+### New: Auto-draft
+- `[p]fantasy autodraft on|off|status` (alias `ad`) — any league member can turn
+  it on. Whenever they're on the clock, the bot drafts the best available
+  player who still fits their positional slots. Turning it **off** works at any
+  time, including mid-draft, and takes effect immediately (even during the
+  short pause before an auto-pick).
+- Picks are announced as `🤖 Pick #N (auto-draft)` and logged to the
+  transaction channel. The bot doesn't ping managers who are on auto-draft.
+- Turning it on while it's already your turn triggers the pick right away.
+- **How "best" is decided:** before the season every player has 0 current FP,
+  so the ranking uses **last season's stats** (fetched once per season and
+  kept); once games are played, whichever of current/last-season is higher
+  wins. Players flagged **OUT** are marked down 60%. Rookies with no prior
+  stats rank low until they produce. The draft board's sort order uses the
+  same ranking, so it's useful in the preseason too.
+- Auto-draft runs through the exact same atomic pick logic as manual picks, so
+  turn order, duplicate protection and roster-fit rules are identical. If it
+  can't find a valid player it switches itself off and tells the channel
+  instead of stalling silently. `draft stop` halts it; `reset`/`newseason`
+  and removing a manager clear the flag.
+- Also fixed: `draft start` crashed with an IndexError if run again after a
+  draft had already finished.
+
 ### New for the 2026-27 rollover
 - **`[p]fantasy newseason`** (admin) — a season-flavored full reset that clears
   rosters/scores/draft history and reminds the bot owner to run
@@ -161,7 +227,7 @@ league messages, standings, `info.json`), while commands/aliases (`[p]fantasy`,
 | Category | Commands |
 |---|---|
 | Getting started | `[p]fantasy setup`, `[p]fantasy join`, `[p]fantasy guide`, `[p]fantasy status` |
-| Draft | `[p]fantasy draft setup`, `draft start`, `draft board`, `draft picks`, `draft stop` |
+| Draft | `[p]fantasy draft setup`, `draft start`, `draft board`, `draft picks`, `draft stop`, `[p]fantasy autodraft` |
 | Free agency | `[p]fantasy freeagents` (`fa`), `[p]fantasy lock` / `unlock` |
 | Team management | `[p]fantasy team [@member]`, drop/assign via dropdowns |
 | Trading | `[p]fantasy trade` |
