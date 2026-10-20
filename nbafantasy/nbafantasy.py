@@ -2209,7 +2209,7 @@ class NBAFantasy(commands.Cog):
             ),
             inline=False,
         )
-        embed.set_footer(text=f"Admins: see {p}fantasy settings and {p}fantasy config for league configuration.")
+        embed.set_footer(text=f"Admins: see {p}fantasy settings and {p}fantasy config for league configuration. Wrong totals? {p}fantasy repair")
         await ctx.send(embed=embed)
 
     @fantasy.command(name="status")
@@ -2789,6 +2789,73 @@ class NBAFantasy(commands.Cog):
                     "Previous player pool was kept, nothing was lost."
                 )
             )
+
+    # ── repair (fix scores corrupted by the stale-stats incident) ─────────
+
+    @fantasy.command(name="repair", aliases=["rebaseline"])
+    @commands.admin_or_permissions(manage_guild=True)
+    async def fantasy_repair(self, ctx, option: str = None):
+        """Admin: fix bad FP caused by players being added while stats were wrong.
+
+        `[p]fantasy repair`         — lowers any player's starting point that is
+                                      higher than their current total (a player can
+                                      never have *negative* earned FP).
+        `[p]fantasy repair banked`  — also resets every manager's banked FP to 0.
+                                      Only allowed before any real games have been
+                                      counted, so legit points can't be wiped.
+        """
+        if not self.players_cache:
+            return await ctx.send("Player data is still loading. Run the update first, then try again.")
+        wipe_banked = bool(option) and option.lower() in ("banked", "bank", "all")
+        if option and not wipe_banked:
+            return await ctx.send(f"Use `{ctx.clean_prefix}fantasy repair` or `{ctx.clean_prefix}fantasy repair banked`.")
+
+        scoring = await self.config.guild(ctx.guild).scoring_system()
+        by_id = {p["id"]: p for p in self.players_cache}
+
+        if wipe_banked:
+            games_counted = any(calculate_fp(p, scoring) > 0 for p in self.players_cache)
+            if games_counted:
+                return await ctx.send(
+                    "❌ Real stats are already being counted, so wiping banked FP could erase legit "
+                    f"points. Run plain `{ctx.clean_prefix}fantasy repair` instead (it only fixes "
+                    "impossible negative totals)."
+                )
+
+        fixed = []
+        async with self.config.guild(ctx.guild).rosters() as rosters:
+            for uid, rd in rosters.items():
+                if not isinstance(rd, dict):
+                    continue
+                for pid, joined in list(rd.items()):
+                    player = by_id.get(int(pid))
+                    if not player:
+                        continue
+                    current = calculate_fp(player, scoring)
+                    if joined > current + 0.05:
+                        rd[pid] = current
+                        fixed.append((uid, player["name"]))
+
+        wiped = 0
+        if wipe_banked:
+            async with self.config.guild(ctx.guild).scores() as scores:
+                for uid in scores:
+                    if scores[uid]:
+                        scores[uid] = 0.0
+                        wiped += 1
+
+        lines = [f"✅ Repair complete. Fixed **{len(fixed)}** player starting point(s)."]
+        if wipe_banked:
+            lines.append(f"Reset banked FP for **{wiped}** manager(s).")
+        else:
+            scores = await self.config.guild(ctx.guild).scores()
+            odd = [uid for uid, v in scores.items() if v]
+            if odd:
+                lines.append(
+                    f"ℹ️ {len(odd)} manager(s) still have banked FP. If the season hasn't produced real "
+                    f"points yet, run `{ctx.clean_prefix}fantasy repair banked` to reset it."
+                )
+        await ctx.send("\n".join(lines))
 
     # ── forceadd ──────────────────────────────────────────────────────────
 

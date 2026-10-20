@@ -41,6 +41,8 @@ about your draft, rosters, or standings positions is lost.)
 - **Scoring edits** reject NaN/infinity/absurd values; draft/free-agent/force-add boards can only be paged by whoever opened them.
 - **Commands are server-only** (no crash if used in DMs); stats/rosters refresh every 30 minutes instead of hourly.
 
+- **`fantasy repair [banked]` (admin):** fixes leftovers from the stale-stats incident. Players added/traded/dropped while the bad numbers were live got inflated starting points (showing as huge *negative* FP) or inflated banked FP. `repair` lowers any impossible starting point to the player's current total; `repair banked` also zeroes banked FP, but only while no real stats exist yet.
+
 ---
 
 # NBAdex Fantasy (`nbafantasy`)
