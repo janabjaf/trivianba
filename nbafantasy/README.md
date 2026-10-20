@@ -1,3 +1,48 @@
+## 🚨 2026-10-19 hotfix: pre-season FP inflation (stale-season-data bug)
+
+**Symptom:** the day after a league drafted, one day before the real 2026-27
+opener, `.fantasy team` suddenly showed massive totals (thousands of FP per
+team, individual players at 700–3000+ FP) with zero games played.
+
+**Root cause:** ESPN's stats leaderboard endpoint doesn't reliably 404/empty
+out when you ask for a brand-new season's id (`season=2027`) before that
+season is fully live on their end — in the window right before/after a new
+season's opening night it can silently serve back **last season's final
+totals** as if they were this season's live stats. A background refresh
+(`.fantasy update`, or the hourly auto-refresh loop) pulled that stale data
+in and it got treated as real, live, current-season production.
+
+This was never a "the season hasn't started yet so give it time" situation —
+it would **not** have fixed itself after the first real game. Each refresh
+would have kept re-serving the same stale numbers until ESPN's backend
+caught up, and real game stats would then have been added on top of the
+bogus totals instead of replacing them.
+
+**Fix:** the stats refresh now cross-checks the "current season" numbers it
+gets back against last season's final totals before trusting them. If most
+overlapping players match almost exactly, that's proof the data isn't live —
+it's discarded and every player is correctly treated as scoreless until real
+games actually happen. (Draft baselines in your league were captured back
+when stats were still correctly at 0, so once you reload this fixed version
+and run `.fantasy update`, everyone's total drops right back to 0 — nothing
+about your draft, rosters, or standings positions is lost.)
+
+**Also fixed in the same pass:**
+- **Trade double-accept race:** validation ran on a snapshot taken *before* the roster lock, so a double-click/retried Accept could process one trade twice and double-bank FP. Validation + swap now happen atomically under one lock; a second accept just reports the trade is already processed.
+- **Admin force-add race:** the "already on another team" check now runs inside the same lock as the write.
+
+- **ESPN-accurate positions (main + secondary):** players now carry ESPN's own fantasy eligibility (e.g. Giannis = PF/C, Grayson Allen = SG/PG) instead of the single coarse roster position. Slot rules follow ESPN: G = PG/SG, F = SF/PF, UTIL = anyone, C = centers only. Old lenient mappings (e.g. a PF fitting the C slot, SG fitting SF) were wrong and are fixed. If the position feed is ever unreachable, the last known positions are kept (or the single roster position is used as a fallback).
+
+- **Rostered players can't vanish:** a player on a fantasy roster who disappears from the NBA feed (cut/waived) is kept in the pool as FA, so he stays visible, droppable, and his points aren't lost.
+- **Free agency blocked during a draft** even if an admin unlocks it; the draft finishing now unlocks FA atomically with the last pick.
+- **`draft forcepick` (alias `skip`):** admin command to auto-pick for whoever is on the clock when a manager is away.
+- **Draft safety:** `draft stop` only acts on a live draft; removing a manager can no longer leave a draft stuck "active" with no picks left; the draft board guards against an out-of-range pick pointer.
+- **Embed limits:** pick history now respects Discord's 6000-character total embed cap on big drafts.
+- **Scoring edits** reject NaN/infinity/absurd values; draft/free-agent/force-add boards can only be paged by whoever opened them.
+- **Commands are server-only** (no crash if used in DMs); stats/rosters refresh every 30 minutes instead of hourly.
+
+---
+
 # NBAdex Fantasy (`nbafantasy`)
 
 An ESPN Fantasy-style NBA league that runs entirely in Discord — draft, free agency,

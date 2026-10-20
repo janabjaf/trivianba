@@ -1,6 +1,7 @@
 import discord
 from redbot.core import commands, Config
 import asyncio
+import json
 import time
 import datetime
 import requests
@@ -18,16 +19,47 @@ from collections import Counter
 # Constants
 # ---------------------------------------------------------------------------
 
+# Fallback eligibility when we only know a player's single roster position
+# (matches ESPN: G = PG/SG, F = SF/PF, UTIL takes anyone).
 VALID_SLOTS = {
     "PG":   ["PG", "G", "UTIL"],
-    "SG":   ["SG", "G", "UTIL", "SF"],
-    "SF":   ["SF", "F", "UTIL", "SG", "PF"],
-    "PF":   ["PF", "F", "UTIL", "SF", "C"],
-    "C":    ["C", "UTIL", "PF", "F"],
+    "SG":   ["SG", "G", "UTIL"],
+    "SF":   ["SF", "F", "UTIL"],
+    "PF":   ["PF", "F", "UTIL"],
+    "C":    ["C", "UTIL"],
     "G":    ["PG", "SG", "G", "UTIL"],
-    "F":    ["SF", "PF", "F", "UTIL", "C"],
+    "F":    ["SF", "PF", "F", "UTIL"],
     "UTIL": ["UTIL"],
 }
+
+# ESPN fantasy basketball lineup-slot ids -> our slot names.
+ESPN_SLOT_NAMES = {0: "PG", 1: "SG", 2: "SF", 3: "PF", 4: "C", 5: "G", 6: "F", 11: "UTIL"}
+ESPN_POSITION_NAMES = {1: "PG", 2: "SG", 3: "SF", 4: "PF", 5: "C"}
+
+
+def eligible_slots(player):
+    """Lineup slots this player may occupy. Uses ESPN's own per-player
+    eligibility (main + secondary positions) when we have it."""
+    elig = player.get("elig")
+    if elig:
+        return list(elig)
+    return VALID_SLOTS.get(player.get("pos", "UTIL"), ["UTIL"])
+
+
+def build_position_info(default_pos_id, slot_ids):
+    """Turn ESPN's defaultPositionId + eligibleSlots into (label, elig_slots).
+    Label lists the main position first, then secondary, e.g. 'PF/C'."""
+    elig = [ESPN_SLOT_NAMES[i] for i in sorted(set(slot_ids)) if i in ESPN_SLOT_NAMES]
+    # Slot ids 0-4 are the five base positions (PG, SG, SF, PF, C); the
+    # player's *main* position comes separately as defaultPositionId (1-5).
+    base = [ESPN_SLOT_NAMES[i] for i in sorted(set(slot_ids)) if 0 <= i <= 4]
+    main = ESPN_POSITION_NAMES.get(default_pos_id)
+    ordered = ([main] if main in base else []) + [n for n in base if n != main]
+    label = "/".join(ordered) or None
+    if "UTIL" not in elig:
+        elig.append("UTIL")
+    return label, elig
+
 
 STAT_LABELS = {
     "pts": "Points (PTS)",
@@ -49,7 +81,7 @@ def can_fit_roster(players, slots):
     """Backtracking check: can all players fit into the available slots?"""
     if len(players) > len(slots):
         return False
-    reqs = [set(VALID_SLOTS.get(p.get("pos", "UTIL"), ["UTIL"])) for p in players]
+    reqs = [set(eligible_slots(p)) for p in players]
 
     def solve(idx, avail):
         if idx == len(players):
@@ -187,6 +219,11 @@ class ScoringValueModal(discord.ui.Modal, title="Set Scoring Value"):
             return await interaction.response.send_message(
                 "❌ Invalid number. Please enter a decimal value like `1.5`.", ephemeral=True
             )
+        if not math.isfinite(new_val) or abs(new_val) > 100:
+            return await interaction.response.send_message(
+                "❌ Please enter a normal number between -100 and 100.", ephemeral=True
+            )
+        new_val = round(new_val, 2)
         async with self.cog.config.guild(self.ctx.guild).scoring_system() as scoring:
             scoring[self.stat] = new_val
         await interaction.response.send_message(
@@ -319,19 +356,24 @@ class PlayerListPagination(discord.ui.View):
     def _is_owner(self, interaction):
         return interaction.user.id == self.ctx.author.id
 
+    def _nav_restricted(self):
+        # Browsing the public player lookup is open to everyone; boards that
+        # act on a specific manager's behalf are only for whoever opened them.
+        return self.action_type in ("fa", "draft", "forceadd")
+
     async def search_callback(self, interaction: discord.Interaction):
-        if self.action_type == "fa" and not self._is_owner(interaction):
+        if self._nav_restricted() and not self._is_owner(interaction):
             return await interaction.response.send_message("This is not your menu.", ephemeral=True)
         await interaction.response.send_modal(SearchModal(self))
 
     async def prev_callback(self, interaction: discord.Interaction):
-        if self.action_type == "fa" and not self._is_owner(interaction):
+        if self._nav_restricted() and not self._is_owner(interaction):
             return await interaction.response.send_message("This is not your menu.", ephemeral=True)
         self.current_page -= 1
         await self.update_view(interaction)
 
     async def next_callback(self, interaction: discord.Interaction):
-        if self.action_type == "fa" and not self._is_owner(interaction):
+        if self._nav_restricted() and not self._is_owner(interaction):
             return await interaction.response.send_message("This is not your menu.", ephemeral=True)
         self.current_page += 1
         await self.update_view(interaction)
@@ -367,8 +409,7 @@ class SlotSelectionView(discord.ui.View):
         self.ctx = ctx
         self.player = player
 
-        pos = player.get("pos", "UTIL")
-        allowed = set(VALID_SLOTS.get(pos, ["UTIL"]))
+        allowed = set(eligible_slots(player))
         candidates = set(slots).intersection(allowed)
         if open_slots is not None:
             # Only offer slot types that actually have a free spot right now.
@@ -715,41 +756,48 @@ class TradeAcceptView(discord.ui.View):
                 "❌ Trades are disabled while a draft is in progress.", ephemeral=True
             )
 
-        rosters = await self.cog.config.guild(guild).rosters()
         scoring = await self.cog.config.guild(guild).scoring_system()
         slots = await self.cog.config.guild(guild).team_slots()
 
         p_uid = str(self.proposer.id)
         t_uid = str(self.target.id)
 
-        if p_uid not in rosters or t_uid not in rosters:
-            return await interaction.followup.send("A manager is no longer in the league.", ephemeral=True)
-        if str(self.give_id) not in rosters[p_uid] or str(self.receive_id) not in rosters[t_uid]:
-            return await interaction.followup.send(
-                "One or both players are no longer on their respective rosters!", ephemeral=True
-            )
-
-        # Roster fit check after swap
-        p_after_ids = [int(pid) for pid in rosters[p_uid].keys() if pid != str(self.give_id)] + [self.receive_id]
-        t_after_ids = [int(pid) for pid in rosters[t_uid].keys() if pid != str(self.receive_id)] + [self.give_id]
-        p_after = [p for p in self.cog.players_cache if p["id"] in p_after_ids]
-        t_after = [p for p in self.cog.players_cache if p["id"] in t_after_ids]
-
-        if not can_fit_roster(p_after, slots):
-            return await interaction.followup.send(
-                f"❌ Trade invalid: {self.proposer.display_name} cannot fit the received player into their slots.", ephemeral=True
-            )
-        if not can_fit_roster(t_after, slots):
-            return await interaction.followup.send(
-                "❌ Trade invalid: Your positional slots cannot accommodate the received player.", ephemeral=True
-            )
-
         give_player = next((p for p in self.cog.players_cache if p["id"] == self.give_id), None)
         receive_player = next((p for p in self.cog.players_cache if p["id"] == self.receive_id), None)
 
+        # Everything that reads *and* mutates the roster state has to happen
+        # under one lock. Previously the "is this trade still valid" checks
+        # ran on a snapshot fetched before the lock, then the actual swap
+        # happened in a separate locked block — so a double-click (or a
+        # retried/duplicated interaction, which Discord can send) could race
+        # two acceptances through the checks at once and double-bank FP for
+        # both managers while silently re-swapping already-swapped players.
         async with self.cog.config.guild(guild).rosters() as r:
-            p_joined = r[p_uid].pop(str(self.give_id), 0)
-            t_joined = r[t_uid].pop(str(self.receive_id), 0)
+            if p_uid not in r or t_uid not in r:
+                return await interaction.followup.send("A manager is no longer in the league.", ephemeral=True)
+            if str(self.give_id) not in r[p_uid] or str(self.receive_id) not in r[t_uid]:
+                return await interaction.followup.send(
+                    "This trade has already been processed (or one of the players has since "
+                    "been dropped/traded elsewhere) — nothing more to do here.", ephemeral=True
+                )
+
+            # Roster fit check after swap
+            p_after_ids = [int(pid) for pid in r[p_uid].keys() if pid != str(self.give_id)] + [self.receive_id]
+            t_after_ids = [int(pid) for pid in r[t_uid].keys() if pid != str(self.receive_id)] + [self.give_id]
+            p_after = [p for p in self.cog.players_cache if p["id"] in p_after_ids]
+            t_after = [p for p in self.cog.players_cache if p["id"] in t_after_ids]
+
+            if not can_fit_roster(p_after, slots):
+                return await interaction.followup.send(
+                    f"❌ Trade invalid: {self.proposer.display_name} cannot fit the received player into their slots.", ephemeral=True
+                )
+            if not can_fit_roster(t_after, slots):
+                return await interaction.followup.send(
+                    "❌ Trade invalid: Your positional slots cannot accommodate the received player.", ephemeral=True
+                )
+
+            p_joined = r[p_uid].pop(str(self.give_id))
+            t_joined = r[t_uid].pop(str(self.receive_id))
 
             # Swap players and set new FP baseline
             r[p_uid][str(self.receive_id)] = calculate_fp(receive_player, scoring) if receive_player else 0
@@ -842,6 +890,14 @@ class AdminRemoveMemberView(discord.ui.View):
             )
             ds["order"] = [uid for uid in old_order if uid != uid_str]
             ds["current_pick"] = max(0, current_pick - removed_before_pointer)
+            if ds.get("is_active") and ds["current_pick"] >= len(ds["order"]):
+                ds["is_active"] = False   # nothing left to draft
+                ended_draft = True
+            else:
+                ended_draft = False
+
+        if ended_draft:
+            await self.cog.config.guild(interaction.guild).fa_locked.set(False)
 
         name = member.display_name if member else f"User {target_id}"
         safe_disable(self)
@@ -938,15 +994,14 @@ class AdminForceAddStep2(PlayerListPagination):
         if not player:
             return await interaction.response.send_message("Player not found.", ephemeral=True)
 
-        rosters = await self.cog.config.guild(interaction.guild).rosters()
-        for rd in rosters.values():
-            if str(player_id) in rd:
-                return await interaction.response.send_message(
-                    f"**{player['name']}** is already on another team!", ephemeral=True
-                )
-
         scoring = await self.cog.config.guild(interaction.guild).scoring_system()
         async with self.cog.config.guild(interaction.guild).rosters() as r:
+            # Check-and-write under one lock so two adds can't both succeed.
+            for rd in r.values():
+                if str(player_id) in rd:
+                    return await interaction.response.send_message(
+                        f"**{player['name']}** is already on another team!", ephemeral=True
+                    )
             if self.target_uid not in r:
                 r[self.target_uid] = {}
             r[self.target_uid][str(player_id)] = calculate_fp(player, scoring)
@@ -994,16 +1049,6 @@ class AdminForceDropStep1(discord.ui.View):
         scoring = await self.cog.config.guild(interaction.guild).scoring_system()
         team_pids = [int(pid) for pid in rosters[uid_str].keys()]
         team_players = [p for p in self.cog.players_cache if p["id"] in team_pids]
-
-        options = []
-        for p in team_players[:25]:
-            joined_fp = rosters[uid_str].get(str(p["id"]), 0)
-            earned = calculate_fp(p, scoring) - joined_fp
-            options.append(discord.SelectOption(
-                label=f"{p['name']} ({p['pos']})",
-                description=f"{p['team']} | Earned: {round(earned, 1)} FP",
-                value=str(p["id"]),
-            ))
 
         embed = discord.Embed(
             title=f"Force Drop — {member.display_name if member else uid_str}'s Roster",
@@ -1248,7 +1293,7 @@ class NBAFantasy(commands.Cog):
                 await self._fetch_players()
                 await self.config.players_cache.set(self.players_cache)
                 self.last_fetch_error = None
-                await asyncio.sleep(3600)
+                await asyncio.sleep(1800)
             except Exception as e:
                 self.last_fetch_error = str(e)
                 print(f"[NBAdex Fantasy] Fetch error: {e}")
@@ -1399,6 +1444,43 @@ class NBAFantasy(commands.Cog):
 
             return all_athletes, cat_maps, complete
 
+        def fetch_positions(season_year):
+            """ESPN's own fantasy position data: each player's main position
+            plus every secondary position they're eligible at (what ESPN
+            shows as e.g. 'PF/C'). Returns {player_id: (label, slots)} or
+            None on failure — in which case we fall back to the single
+            roster position."""
+            url = (
+                "https://lm-api-reads.fantasy.espn.com/apis/v3/games/fba/seasons/"
+                f"{season_year}/players?scoringPeriodId=0&view=players_wl"
+            )
+            filt = json.dumps({"players": {"limit": 2000, "sortPercOwned": {"sortPriority": 1, "sortAsc": False}}})
+            for attempt in range(2):
+                try:
+                    r = self._session.get(url, headers={"x-fantasy-filter": filt}, timeout=30)
+                    r.raise_for_status()
+                    data = r.json()
+                    if isinstance(data, dict):
+                        data = data.get("players", [])
+                    out = {}
+                    for entry in data:
+                        pl = entry.get("player", entry) if isinstance(entry, dict) else {}
+                        try:
+                            pid = int(pl.get("id", 0))
+                        except (ValueError, TypeError):
+                            continue
+                        slot_ids = pl.get("eligibleSlots") or []
+                        if not pid or not slot_ids:
+                            continue
+                        label, elig = build_position_info(pl.get("defaultPositionId"), slot_ids)
+                        if label:
+                            out[pid] = (label, elig)
+                    return out or None
+                except Exception as e:
+                    print(f"[NBAdex Fantasy] Position data attempt {attempt + 1} failed (non-fatal): {e}")
+                    time.sleep(1.5)
+            return None
+
         def fetch_injuries():
             injuries = {}
             try:
@@ -1431,6 +1513,7 @@ class NBAFantasy(commands.Cog):
                 raise RuntimeError("Could not retrieve any NBA team rosters.")
             all_athletes, cat_maps, stats_complete = fetch_stats(season)
             injuries = fetch_injuries()
+            positions = fetch_positions(season)
 
             prev_data = {}
             if need_prev:
@@ -1446,13 +1529,14 @@ class NBAFantasy(commands.Cog):
                 except Exception as e:
                     print(f"[NBAdex Fantasy] Previous-season stats failed (non-fatal): {e}")
             return (roster_players, failed_teams, all_athletes, cat_maps,
-                    stats_complete, injuries, prev_data)
+                    stats_complete, injuries, prev_data, positions)
 
         loop = asyncio.get_running_loop()
         (roster_players, failed_teams, all_athletes, cat_maps,
-         stats_complete, injuries, prev_data) = await loop.run_in_executor(None, fetch_all)
+         stats_complete, injuries, prev_data, positions) = await loop.run_in_executor(None, fetch_all)
 
         old_by_id = {p["id"]: p for p in self.players_cache if isinstance(p, dict) and "id" in p}
+        old_by_id_all = dict(old_by_id)  # survives the stale-stats reset below
 
         # If some teams' roster calls failed, keep those teams' players from the
         # last good snapshot instead of letting ~15 players per team vanish
@@ -1460,11 +1544,76 @@ class NBAFantasy(commands.Cog):
         if failed_teams:
             for pid, old in old_by_id.items():
                 if pid not in roster_players and old.get("team") in failed_teams:
-                    roster_players[pid] = {k: old[k] for k in ("id", "name", "team", "pos", "headshot") if k in old}
+                    roster_players[pid] = {k: old[k] for k in ("id", "name", "team", "pos", "elig", "headshot") if k in old}
+
+        # A player who is on someone's fantasy roster must never silently
+        # vanish from the pool (cut/waived/retired, or missing from a roster
+        # feed): he'd disappear from the team view, still count against the
+        # roster limit, and be impossible to drop. Keep him, marked FA.
+        try:
+            all_guild_data = await self.config.all_guilds()
+            rostered_ids = {
+                int(pid)
+                for g in all_guild_data.values()
+                for rd in (g.get("rosters") or {}).values() if isinstance(rd, dict)
+                for pid in rd
+            }
+        except Exception:
+            rostered_ids = set()
+        for pid in rostered_ids:
+            if pid not in roster_players and pid in old_by_id:
+                old = old_by_id[pid]
+                kept = {k: old[k] for k in ("id", "name", "pos", "elig", "headshot") if k in old}
+                kept["team"] = "FA"
+                roster_players[pid] = kept
 
         if prev_data:
             self.prev_stats = {"season": season - 1, "data": prev_data}
             await self.config.prev_stats.set(self.prev_stats)
+
+        # Guard against ESPN silently serving *last* season's final totals as
+        # if they were this season's live stats. This happens in the window
+        # right before/after a new season's season-id goes live on their end
+        # (e.g. the day before opening night): requesting season=<new year>
+        # doesn't 404, it just quietly falls back to the latest season they
+        # actually have data for. The symptom is every rostered player
+        # instantly showing a full season's worth of FP with zero games
+        # played. Detect it by comparing the "current season" numbers we just
+        # got against last season's final numbers — if most overlapping
+        # players match almost exactly, this isn't live data at all.
+        prev_compare = prev_data if prev_data else self.prev_stats.get("data", {})
+        if prev_compare and all_athletes:
+            matches = 0
+            checked = 0
+            for p in all_athletes:
+                ath = p.get("athlete", {})
+                try:
+                    pid = int(ath.get("id", 0))
+                except (ValueError, TypeError):
+                    continue
+                prev_line = prev_compare.get(str(pid))
+                if not prev_line:
+                    continue
+                cur_line = parse_stat_line(p, cat_maps)
+                if not any(cur_line.get(k, 0) for k in STAT_KEYS):
+                    continue  # a genuinely scoreless player tells us nothing
+                checked += 1
+                if all(abs(cur_line.get(k, 0.0) - prev_line.get(k, 0.0)) < 0.05 for k in STAT_KEYS):
+                    matches += 1
+            if checked >= 5 and matches / checked >= 0.9:
+                print(
+                    f"[NBAdex Fantasy] Current-season stats fetch looks identical to "
+                    f"last season's final totals ({matches}/{checked} players matched) "
+                    f"— this season's stats aren't live yet. Ignoring it and treating "
+                    f"the current season as scoreless so far."
+                )
+                all_athletes = []
+                stats_complete = True
+                # Hard reset: this is not a flaky/incomplete fetch, it's proof the
+                # "stats" we had cached from any earlier bad refresh were also
+                # stale duplicates of last season. Don't carry those forward —
+                # every player genuinely has 0 current-season FP right now.
+                old_by_id = {}
 
         # Overlay season stats onto the roster-derived pool.
         stats_seen = set()
@@ -1526,6 +1675,14 @@ class NBAFantasy(commands.Cog):
             pdata["out"] = is_out
             pdata["status_label"] = status_label
 
+            # ESPN main/secondary positions (fall back to what we knew before,
+            # then to the single roster position).
+            if positions and pid in positions:
+                pdata["pos"], pdata["elig"] = positions[pid]
+            elif pid in old_by_id_all and old_by_id_all[pid].get("elig"):
+                pdata["pos"] = old_by_id_all[pid].get("pos", pdata.get("pos", "UTIL"))
+                pdata["elig"] = old_by_id_all[pid]["elig"]
+
             prev = self.prev_stats.get("data", {}).get(str(pid))
             if prev:
                 pdata["prev"] = prev
@@ -1557,6 +1714,11 @@ class NBAFantasy(commands.Cog):
         fa_locked = await self.config.guild(interaction.guild).fa_locked()
         if fa_locked:
             return await interaction.response.send_message("🔒 Free Agency is locked.", ephemeral=True)
+        ds_now = await self.config.guild(interaction.guild).draft_state()
+        if ds_now.get("is_active"):
+            return await interaction.response.send_message(
+                "🚫 Free Agency can't be used while the draft is in progress.", ephemeral=True
+            )
 
         uid_str = str(interaction.user.id)
         scoring = await self.config.guild(interaction.guild).scoring_system()
@@ -1661,6 +1823,7 @@ class NBAFantasy(commands.Cog):
             next_pick = ds["current_pick"]
             if next_pick >= len(order):
                 ds["is_active"] = False
+                await self.config.guild(guild).fa_locked.set(False)
 
             return True, {
                 "pick_number": current_pick + 1,
@@ -1947,6 +2110,7 @@ class NBAFantasy(commands.Cog):
     # ======================================================================
 
     @commands.group(name="fantasy", aliases=["nbafantasy", "nbaf"])
+    @commands.guild_only()
     async def fantasy(self, ctx):
         """Advanced NBAdex Fantasy League commands."""
         if ctx.invoked_subcommand is None:
@@ -1978,7 +2142,8 @@ class NBAFantasy(commands.Cog):
                 f"then `{p}fantasy draft start` kicks it off (this auto-locks Free Agency).\n"
                 f"On your turn, use `{p}fantasy draft board` and pick from the dropdown.\n"
                 f"`{p}fantasy draft picks` shows the full pick history. Free Agency auto-unlocks "
-                "the moment the last pick is made.\n"
+                "the moment the last pick is made. If someone is away, an admin can run "
+                f"`{p}fantasy draft forcepick` to auto-pick for them.\n"
                 f"🤖 **Auto-draft:** `{p}fantasy autodraft on` lets the bot pick the best available "
                 "player who fits your roster whenever you're on the clock. Turn it off anytime with "
                 f"`{p}fantasy autodraft off` — even mid-draft."
@@ -2000,7 +2165,10 @@ class NBAFantasy(commands.Cog):
                 f"`{p}fantasy team` shows your roster with dropdowns to **drop** a player or "
                 f"**assign** them to a starting slot (PG/SG/SF/PF/C/G/F/UTIL). Slots fill up — "
                 "once a slot type is full you can't stack another player into it, "
-                "they'll sit on the bench instead."
+                "they'll sit on the bench instead.\n"
+                "Positions follow the official fantasy basketball rules: each player shows main/secondary position (e.g. **PF/C**) "
+                "and can fill any slot they're eligible for — **G** takes PG/SG, **F** takes SF/PF, "
+                "**UTIL** takes anyone."
             ),
             inline=False,
         )
@@ -2064,9 +2232,9 @@ class NBAFantasy(commands.Cog):
         embed.add_field(name="Free Agency", value="🔒 Locked" if fa_locked else "🔓 Open", inline=True)
         embed.add_field(name="Teams Joined", value=str(len(rosters)), inline=True)
 
-        if draft_state["is_active"]:
-            pick = draft_state["current_pick"]
-            order = draft_state["order"]
+        if draft_state.get("is_active"):
+            pick = draft_state.get("current_pick", 0)
+            order = draft_state.get("order", [])
             on_clock_id = order[pick] if pick < len(order) else None
             on_clock_member = ctx.guild.get_member(int(on_clock_id)) if on_clock_id else None
             on_clock = on_clock_member.display_name if on_clock_member else (f"<@{on_clock_id}>" if on_clock_id else "Unknown")
@@ -2126,7 +2294,7 @@ class NBAFantasy(commands.Cog):
         slots = [s.upper() for s in slots]
         bad = [s for s in slots if s not in valid]
         if bad:
-            return await ctx.send(f"Invalid slot(s): {', '.join(bad)}. Valid: {', '.join(valid)}")
+            return await ctx.send(f"Invalid slot(s): {', '.join(bad)}. Valid: {', '.join(sorted(valid))}")
         if len(slots) > 12:
             return await ctx.send(
                 "Please use 12 slots or fewer — more than that won't display cleanly in a team roster embed."
@@ -2313,7 +2481,7 @@ class NBAFantasy(commands.Cog):
         for p in team_players:
             pid_str = str(p["id"])
             slot = user_asgn.get(pid_str)
-            if slot and slot_counts[slot] > 0:
+            if slot and slot_counts[slot] > 0 and slot in eligible_slots(p):
                 assigned_display.append((slot, p))
                 slot_counts[slot] -= 1
                 assigned_pids.add(pid_str)
@@ -2433,7 +2601,8 @@ class NBAFantasy(commands.Cog):
         for uid_str, player_dict in rosters.items():
             if not isinstance(player_dict, dict):
                 continue
-            team_players = [p for p in self.players_cache if p["id"] in [int(pid) for pid in player_dict.keys()]]
+            owned_ids = {int(pid) for pid in player_dict.keys()}
+            team_players = [p for p in self.players_cache if p["id"] in owned_ids]
             roster_fp = sum(calculate_fp(p, scoring) - player_dict.get(str(p["id"]), 0) for p in team_players)
             total = scores.get(uid_str, 0.0) + roster_fp
             best = max(team_players, key=lambda p: calculate_fp(p, scoring) - player_dict.get(str(p["id"]), 0), default=None)
@@ -2767,9 +2936,56 @@ class NBAFantasy(commands.Cog):
     async def draft_stop(self, ctx):
         """Stop (cancel) the draft early."""
         async with self.config.guild(ctx.guild).draft_state() as ds:
+            was_active = bool(ds.get("is_active"))
             ds["is_active"] = False
+        if not was_active:
+            return await ctx.send("There's no draft in progress to stop.")
         await self.config.guild(ctx.guild).fa_locked.set(False)
-        await ctx.send("🛑 Draft has been stopped. Free Agency is now **open**.")
+        await ctx.send(
+            "🛑 Draft has been stopped. Free Agency is now **open**. "
+            f"You can resume where you left off with `{ctx.clean_prefix}fantasy draft start`."
+        )
+
+    @fantasy_draft.command(name="forcepick", aliases=["skip"])
+    @commands.admin_or_permissions(manage_guild=True)
+    async def draft_forcepick(self, ctx):
+        """Admin: auto-pick the best available player for whoever is on the clock
+        (use this when a manager is away and holding up the draft)."""
+        ds = await self.config.guild(ctx.guild).draft_state()
+        if not ds.get("is_active"):
+            return await ctx.send("The draft is not active.")
+        order = ds.get("order", [])
+        pick = ds.get("current_pick", 0)
+        if pick >= len(order):
+            return await ctx.send("The draft has no picks left.")
+        uid = order[pick]
+        member = ctx.guild.get_member(int(uid))
+        mention = member.mention if member else f"<@{uid}>"
+
+        player = await self._pick_best_available(ctx.guild, uid)
+        if player is None:
+            return await ctx.send(
+                f"❌ No available player fits {mention}'s roster slots. "
+                f"Fix their roster with `{ctx.clean_prefix}fantasy forcedrop` or stop the draft."
+            )
+        ok, result = await self._commit_draft_pick(ctx.guild, uid, player)
+        if not ok:
+            return await ctx.send(f"❌ Couldn't make the pick: {result}")
+
+        log_embed = discord.Embed(title="Transaction: Draft Pick (Admin Auto)", color=discord.Color.blue())
+        if player.get("headshot"):
+            log_embed.set_thumbnail(url=player["headshot"])
+        log_embed.add_field(name="User", value=mention, inline=True)
+        log_embed.add_field(name="Player", value=f"{player['name']} ({player['pos']})", inline=True)
+        log_embed.add_field(name="Pick #", value=str(result["pick_number"]), inline=True)
+        await self.log_transaction(ctx.guild, log_embed)
+
+        await ctx.send(
+            f"⏭️ **Pick #{result['pick_number']} (admin auto-pick):** {mention} is given "
+            f"**{player['name']}** ({player['pos']}, {player['team']})."
+        )
+        await self._post_pick_followup(ctx.guild, ctx.channel, result["next_pick"], result["order"])
+        self._kick_autodraft(ctx.guild, ctx.channel)
 
     @fantasy_draft.command(name="board")
     async def draft_board(self, ctx):
@@ -2787,6 +3003,8 @@ class NBAFantasy(commands.Cog):
 
         order = state["order"]
         current_pick = state["current_pick"]
+        if current_pick >= len(order):
+            return await ctx.send("The draft has no picks left.")
         on_clock_uid = order[current_pick]
 
         rosters = await self.config.guild(ctx.guild).rosters()
@@ -2845,9 +3063,18 @@ class NBAFantasy(commands.Cog):
         if chunk:
             chunks.append(chunk)
 
+        # Discord also caps a whole embed at 6000 characters, which a large
+        # draft's history can exceed long before the 25-field limit — keep
+        # only the most recent chunks that fit.
         overflow_note = None
-        if len(chunks) > 24:
-            chunks = chunks[-24:]
+        kept, total_chars = [], 0
+        for c in reversed(chunks):
+            if len(kept) >= 24 or total_chars + len(c) > 4800:
+                break
+            kept.insert(0, c)
+            total_chars += len(c)
+        if len(kept) < len(chunks):
+            chunks = kept
             overflow_note = f"*(showing the most recent picks — {len(picks)} total picks made)*"
 
         for c in chunks:
