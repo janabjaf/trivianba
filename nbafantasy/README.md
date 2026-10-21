@@ -47,6 +47,8 @@ about your draft, rosters, or standings positions is lost.)
 
 - **Table + box scores never double count:** when both sources have data, each stat takes the *higher* of the two (never the sum). A correct table agrees with the box scores; a lagging table is filled in by box scores; a table that's ahead wins. Any individual player line identical to last season's totals is ignored even if the rest of the table has already switched to the new season.
 
+- **Box-score lookups fixed:** ESPN rejects multi-day scoreboard ranges, which silently stopped any game from being counted. It now queries one day at a time, remembers how far it has scanned, keeps a pending list for finished games whose box score isn't posted yet, and `fantasy status` shows a **Games Counted** line so you can see it working.
+
 ---
 
 # NBAdex Fantasy (`nbafantasy`)

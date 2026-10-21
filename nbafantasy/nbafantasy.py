@@ -1498,23 +1498,33 @@ class NBAFantasy(commands.Cog):
             This is independent of the stats leaderboard, which can keep
             serving last season's numbers for a while after a new season
             opens. Only FINAL regular-season games are counted, each exactly
-            once (tracked by event id)."""
+            once (tracked by event id). The scoreboard is queried one day at
+            a time (date *ranges* are rejected by the provider)."""
             if not isinstance(log, dict) or log.get("season") != season_year:
                 log = {"season": season_year, "processed": [], "totals": {}}
             log = copy.deepcopy(log)
             processed = set(log.get("processed", []))
+            pending = [e for e in log.get("pending", []) if e not in processed]
             totals = log.get("totals", {})
 
-            start = datetime.date(season_year - 1, 10, 1)
-            end = datetime.datetime.utcnow().date() + datetime.timedelta(days=1)
-            finished = []
-            day = start
+            today = datetime.datetime.utcnow().date()
+            season_start = datetime.date(season_year - 1, 10, 1)
+            scanned = None
+            try:
+                if log.get("scanned_through"):
+                    scanned = datetime.date.fromisoformat(log["scanned_through"])
+            except (ValueError, TypeError):
+                scanned = None
+            # Re-scan the last couple of days every time (games that were
+            # still in progress last scan have finished since).
+            day = max(season_start, (scanned - datetime.timedelta(days=2)) if scanned else season_start)
+            end = today + datetime.timedelta(days=1)
+            scan_ok = True
             while day <= end:
-                win_end = min(day + datetime.timedelta(days=6), end)
                 try:
                     data = self._get_json_with_fallback(
                         "/apis/site/v2/sports/basketball/nba/scoreboard"
-                        f"?dates={day.strftime('%Y%m%d')}-{win_end.strftime('%Y%m%d')}&limit=500"
+                        f"?dates={day.strftime('%Y%m%d')}&limit=500"
                     )
                     for ev in data.get("events", []) or []:
                         st = ((ev.get("status") or {}).get("type") or {})
@@ -1525,16 +1535,21 @@ class NBAFantasy(commands.Cog):
                         if ev_type is not None and ev_type != 2:
                             processed.add(eid)   # preseason etc. — never counts
                             continue
-                        finished.append(eid)
+                        if eid not in pending:
+                            pending.append(eid)
                 except Exception as e:
+                    scan_ok = False
                     print(f"[NBAdex Fantasy] Scoreboard {day} failed (non-fatal): {e}")
-                day = win_end + datetime.timedelta(days=1)
-                time.sleep(0.2)
+                day += datetime.timedelta(days=1)
+                time.sleep(0.15)
 
             added = 0
-            finished = list(dict.fromkeys(finished))   # same game can appear in two date windows
-            for eid in finished[:40]:   # catch up gradually if far behind
+            still_pending = []
+            for eid in pending:
                 if eid in processed:
+                    continue
+                if added >= 40:
+                    still_pending.append(eid)   # catch up gradually if far behind
                     continue
                 try:
                     summary = self._get_json_with_fallback(
@@ -1545,7 +1560,8 @@ class NBAFantasy(commands.Cog):
                         processed.add(eid)
                         continue
                     if not rows:
-                        continue   # box score not posted yet — retry next refresh
+                        still_pending.append(eid)   # box score not posted yet
+                        continue
                     for pid, row in rows.items():
                         t = totals.setdefault(str(pid), {k: 0.0 for k in STAT_KEYS})
                         for k in STAT_KEYS:
@@ -1553,11 +1569,18 @@ class NBAFantasy(commands.Cog):
                     processed.add(eid)
                     added += 1
                 except Exception as e:
+                    still_pending.append(eid)
                     print(f"[NBAdex Fantasy] Box score {eid} failed (non-fatal): {e}")
                 time.sleep(0.3)
 
             log["processed"] = sorted(processed)
+            log["games"] = int(log.get("games", 0)) + added
+            log["pending"] = still_pending
             log["totals"] = totals
+            if scan_ok:
+                log["scanned_through"] = today.isoformat()
+            elif scanned:
+                log["scanned_through"] = scanned.isoformat()
             if added:
                 print(f"[NBAdex Fantasy] Counted {added} newly finished game(s).")
             return log
@@ -2409,6 +2432,9 @@ class NBAFantasy(commands.Cog):
         autodraft = await self.config.guild(ctx.guild).autodraft()
         auto_count = sum(1 for uid in autodraft if uid in rosters)
         embed.add_field(name="Auto-Draft", value=f"🤖 {auto_count} manager(s) on" if auto_count else "None on", inline=True)
+
+        counted = int((self.game_log or {}).get("games", 0)) if (self.game_log or {}).get("season") == season else 0
+        embed.add_field(name="Games Counted", value=f"{counted} finished game(s) tracked", inline=True)
 
         embed.add_field(
             name="Player Pool",
