@@ -43,6 +43,10 @@ about your draft, rosters, or standings positions is lost.)
 
 - **`fantasy repair [banked]` (admin):** fixes leftovers from the stale-stats incident. Players added/traded/dropped while the bad numbers were live got inflated starting points (showing as huge *negative* FP) or inflated banked FP. `repair` lowers any impossible starting point to the player's current total; `repair banked` also zeroes banked FP, but only while no real stats exist yet.
 
+- **Live scoring from box scores:** the season-stats table can keep serving last season's numbers for days after a new season opens (confirmed on opening night 2026-27), so nothing would score. The bot now also builds season totals directly from **finished regular-season games' box scores** (each game counted exactly once, preseason ignored, unfinished games ignored) and uses them whenever the stats table is stale or empty. Points land on the first refresh after ESPN posts a game's box score (every 30 min, or instantly with `update`).
+
+- **Table + box scores never double count:** when both sources have data, each stat takes the *higher* of the two (never the sum). A correct table agrees with the box scores; a lagging table is filled in by box scores; a table that's ahead wins. Any individual player line identical to last season's totals is ignored even if the rest of the table has already switched to the new season.
+
 ---
 
 # NBAdex Fantasy (`nbafantasy`)

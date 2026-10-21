@@ -1,6 +1,7 @@
 import discord
 from redbot.core import commands, Config
 import asyncio
+import copy
 import json
 import time
 import datetime
@@ -166,6 +167,52 @@ def parse_stat_line(athlete_entry, cat_maps):
         "blk": round(max(0.0, blk), 1),
         "tov": round(max(0.0, tov), 1),
     }
+
+
+def parse_boxscore(summary):
+    """Pull per-player PTS/REB/AST/STL/BLK/TOV out of one game's box score.
+    Returns (season_type, {player_id: {stat: value}}). season_type is 2 for the
+    regular season (1 = preseason) when the feed says so, else None."""
+    header = summary.get("header") or {}
+    stype = (header.get("season") or {}).get("type")
+    out = {}
+    for team in (summary.get("boxscore") or {}).get("players", []) or []:
+        groups = team.get("statistics") or []
+        if not groups:
+            continue
+        grp = groups[0]
+        labels = grp.get("labels") or []
+        idx = {lab: i for i, lab in enumerate(labels)}
+        for a in grp.get("athletes", []) or []:
+            if a.get("didNotPlay"):
+                continue
+            stats = a.get("stats") or []
+            if not stats:
+                continue
+            try:
+                pid = int((a.get("athlete") or {}).get("id", 0))
+            except (ValueError, TypeError):
+                continue
+            if not pid:
+                continue
+
+            def g(label):
+                i = idx.get(label)
+                if i is None or i >= len(stats):
+                    return 0.0
+                try:
+                    return float(stats[i])
+                except (ValueError, TypeError):
+                    return 0.0
+
+            row = out.setdefault(pid, {k: 0.0 for k in STAT_KEYS})
+            row["pts"] += g("PTS")
+            row["reb"] += g("REB")
+            row["ast"] += g("AST")
+            row["stl"] += g("STL")
+            row["blk"] += g("BLK")
+            row["tov"] += g("TO")
+    return stype, out
 
 
 def player_status_str(player):
@@ -1253,13 +1300,14 @@ class NBAFantasy(commands.Cog):
             },
             "autodraft": {},   # {user_id_str: True} for managers with auto-draft on
         }
-        default_global = {"players_cache": [], "prev_stats": {}, "cache_season": 0}
+        default_global = {"players_cache": [], "prev_stats": {}, "cache_season": 0, "game_log": {}}
 
         self.config.register_guild(**default_guild)
         self.config.register_global(**default_global)
         self.players_cache = []
         self.prev_stats = {}
         self.cache_season = 0
+        self.game_log = {}
         self.last_fetch_error = None
 
         # Auto-draft engine state (per guild id)
@@ -1287,6 +1335,7 @@ class NBAFantasy(commands.Cog):
         self.players_cache = await self.config.players_cache()
         self.prev_stats = await self.config.prev_stats()
         self.cache_season = await self.config.cache_season()
+        self.game_log = await self.config.game_log()
         await self._resume_drafts()
         while True:
             try:
@@ -1444,6 +1493,75 @@ class NBAFantasy(commands.Cog):
 
             return all_athletes, cat_maps, complete
 
+        def fetch_game_totals(season_year, log):
+            """Season totals built straight from finished games' box scores.
+            This is independent of the stats leaderboard, which can keep
+            serving last season's numbers for a while after a new season
+            opens. Only FINAL regular-season games are counted, each exactly
+            once (tracked by event id)."""
+            if not isinstance(log, dict) or log.get("season") != season_year:
+                log = {"season": season_year, "processed": [], "totals": {}}
+            log = copy.deepcopy(log)
+            processed = set(log.get("processed", []))
+            totals = log.get("totals", {})
+
+            start = datetime.date(season_year - 1, 10, 1)
+            end = datetime.datetime.utcnow().date() + datetime.timedelta(days=1)
+            finished = []
+            day = start
+            while day <= end:
+                win_end = min(day + datetime.timedelta(days=6), end)
+                try:
+                    data = self._get_json_with_fallback(
+                        "/apis/site/v2/sports/basketball/nba/scoreboard"
+                        f"?dates={day.strftime('%Y%m%d')}-{win_end.strftime('%Y%m%d')}&limit=500"
+                    )
+                    for ev in data.get("events", []) or []:
+                        st = ((ev.get("status") or {}).get("type") or {})
+                        eid = str(ev.get("id", ""))
+                        if not eid or eid in processed or not st.get("completed"):
+                            continue
+                        ev_type = (ev.get("season") or {}).get("type")
+                        if ev_type is not None and ev_type != 2:
+                            processed.add(eid)   # preseason etc. — never counts
+                            continue
+                        finished.append(eid)
+                except Exception as e:
+                    print(f"[NBAdex Fantasy] Scoreboard {day} failed (non-fatal): {e}")
+                day = win_end + datetime.timedelta(days=1)
+                time.sleep(0.2)
+
+            added = 0
+            finished = list(dict.fromkeys(finished))   # same game can appear in two date windows
+            for eid in finished[:40]:   # catch up gradually if far behind
+                if eid in processed:
+                    continue
+                try:
+                    summary = self._get_json_with_fallback(
+                        f"/apis/site/v2/sports/basketball/nba/summary?event={eid}"
+                    )
+                    stype, rows = parse_boxscore(summary)
+                    if stype is not None and stype != 2:
+                        processed.add(eid)
+                        continue
+                    if not rows:
+                        continue   # box score not posted yet — retry next refresh
+                    for pid, row in rows.items():
+                        t = totals.setdefault(str(pid), {k: 0.0 for k in STAT_KEYS})
+                        for k in STAT_KEYS:
+                            t[k] = round(t.get(k, 0.0) + row.get(k, 0.0), 1)
+                    processed.add(eid)
+                    added += 1
+                except Exception as e:
+                    print(f"[NBAdex Fantasy] Box score {eid} failed (non-fatal): {e}")
+                time.sleep(0.3)
+
+            log["processed"] = sorted(processed)
+            log["totals"] = totals
+            if added:
+                print(f"[NBAdex Fantasy] Counted {added} newly finished game(s).")
+            return log
+
         def fetch_positions(season_year):
             """ESPN's own fantasy position data: each player's main position
             plus every secondary position they're eligible at (what ESPN
@@ -1514,6 +1632,11 @@ class NBAFantasy(commands.Cog):
             all_athletes, cat_maps, stats_complete = fetch_stats(season)
             injuries = fetch_injuries()
             positions = fetch_positions(season)
+            try:
+                game_log = fetch_game_totals(season, self.game_log)
+            except Exception as e:
+                print(f"[NBAdex Fantasy] Game totals failed (non-fatal): {e}")
+                game_log = None
 
             prev_data = {}
             if need_prev:
@@ -1529,11 +1652,11 @@ class NBAFantasy(commands.Cog):
                 except Exception as e:
                     print(f"[NBAdex Fantasy] Previous-season stats failed (non-fatal): {e}")
             return (roster_players, failed_teams, all_athletes, cat_maps,
-                    stats_complete, injuries, prev_data, positions)
+                    stats_complete, injuries, prev_data, positions, game_log)
 
         loop = asyncio.get_running_loop()
         (roster_players, failed_teams, all_athletes, cat_maps,
-         stats_complete, injuries, prev_data, positions) = await loop.run_in_executor(None, fetch_all)
+         stats_complete, injuries, prev_data, positions, game_log) = await loop.run_in_executor(None, fetch_all)
 
         old_by_id = {p["id"]: p for p in self.players_cache if isinstance(p, dict) and "id" in p}
         old_by_id_all = dict(old_by_id)  # survives the stale-stats reset below
@@ -1581,6 +1704,7 @@ class NBAFantasy(commands.Cog):
         # played. Detect it by comparing the "current season" numbers we just
         # got against last season's final numbers — if most overlapping
         # players match almost exactly, this isn't live data at all.
+        stale_detected = False
         prev_compare = prev_data if prev_data else self.prev_stats.get("data", {})
         if prev_compare and all_athletes:
             matches = 0
@@ -1609,6 +1733,7 @@ class NBAFantasy(commands.Cog):
                 )
                 all_athletes = []
                 stats_complete = True
+                stale_detected = True
                 # Hard reset: this is not a flaky/incomplete fetch, it's proof the
                 # "stats" we had cached from any earlier bad refresh were also
                 # stale duplicates of last season. Don't carry those forward —
@@ -1635,8 +1760,41 @@ class NBAFantasy(commands.Cog):
                     "headshot": espn_headshot_url(ath, pid),
                 }
 
-            roster_players[pid].update(parse_stat_line(p, cat_maps))
+            line = parse_stat_line(p, cat_maps)
+            # Per-player stale check: a line identical to last season's final
+            # totals is last season's data, never this season's — ignore it
+            # even if the rest of the table has already switched over.
+            prev_line = prev_compare.get(str(pid)) if prev_compare else None
+            if (prev_line and any(line.get(k, 0) for k in STAT_KEYS)
+                    and all(abs(line[k] - prev_line.get(k, 0.0)) < 0.05 for k in STAT_KEYS)):
+                continue
+            roster_players[pid].update(line)
             stats_seen.add(pid)
+
+        # When the season-stats table is stale (still last season's numbers) or
+        # empty, count this season from finished games' box scores instead.
+        if game_log is not None:
+            self.game_log = game_log
+            await self.config.game_log.set(game_log)
+        # Merge with the box-score totals. Per stat we take the HIGHER of the
+        # two (never the sum), so when the season-stats table is correct and
+        # complete the two agree, when the table lags behind finished games
+        # the box scores fill the gap, and when the box-score log is still
+        # catching up the table wins. Nothing can ever be counted twice.
+        use_log = False
+        log_totals = (self.game_log or {}).get("totals") or {}
+        if log_totals and (self.game_log or {}).get("season") == season:
+            use_log = True
+            for pid_str, st in log_totals.items():
+                try:
+                    pid = int(pid_str)
+                except (ValueError, TypeError):
+                    continue
+                if pid in roster_players:
+                    for k in STAT_KEYS:
+                        cur = roster_players[pid].get(k, 0.0) if pid in stats_seen else 0.0
+                        roster_players[pid][k] = round(max(cur, st.get(k, 0.0)), 1)
+                    stats_seen.add(pid)
 
         # A failed or suspiciously empty stats fetch must NEVER zero everyone's
         # stats: a manager dropping a player at that moment would bank a huge
@@ -1647,7 +1805,7 @@ class NBAFantasy(commands.Cog):
         old_has_stats = any(
             any(o.get(k, 0) for k in STAT_KEYS) for o in old_by_id.values()
         )
-        stats_reliable = stats_complete and (bool(all_athletes) or not old_has_stats)
+        stats_reliable = stats_complete and (bool(all_athletes) or use_log or not old_has_stats)
         can_inherit = (not stats_reliable) and self.cache_season == season
         if can_inherit:
             print("[NBAdex Fantasy] Stats fetch looked unreliable — keeping last known stats this refresh.")
